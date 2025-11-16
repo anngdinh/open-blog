@@ -1,11 +1,11 @@
 # Open Blog
 
 <div align="center">
-
-<a href="CONTRIBUTING.md#creating-a-pull-request"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
-<a href="https://github.com/prettier/prettier"><img alt="code style: prettier" src="https://img.shields.io/badge/code_style-prettier-ff69b4.svg"></a>
-<a href="#license"><img src="https://img.shields.io/github/license/sourcerer-io/hall-of-fame.svg?colorB=ff0000"></a>
-<a href="https://vitest.dev/"><img src="https://img.shields.io/badge/tested_with-vitest-6E511F.svg" alt="Tested with Vitest"></a>
+    <a href="CONTRIBUTING.md#creating-a-pull-request"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
+    <a href="https://github.com/prettier/prettier"><img alt="code style: prettier" src="https://img.shields.io/badge/code_style-prettier-ff69b4.svg"></a>
+    <a href="#license"><img src="https://img.shields.io/github/license/sourcerer-io/hall-of-fame.svg?colorB=ff0000"></a>
+    <a href="https://vitest.dev/"><img src="https://img.shields.io/badge/tested_with-vitest-6E511F.svg" alt="Tested with Vitest"></a>
+    <a href="https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fdvbtrung2302%2Fopen-blog%2Ftree%2Fmaster"><img src="https://vercel.com/button" alt="Deploy with Vercel"/></a>
 </div>
 
 A minimal, modern blog platform built with Next.js, Tailwind CSS, and MDX. Perfect for creators, developers, and writers
@@ -18,6 +18,11 @@ Just write your blog in Markdown format and ship it to everyone on the internet!
 - **Styling**: [Tailwind CSS](https://tailwindcss.com)
 - **Content**: MDX with metadata
 - **Package Manager**: [pnpm](https://pnpm.io/)
+
+<div align="center">
+    <img src="https://github.com/user-attachments/assets/82d9f7c9-17e9-4754-96e6-d88b52745818" alt="Dark Mode" width="49%">
+    <img src="https://github.com/user-attachments/assets/a7a47347-54aa-4ce0-9c06-0c94b439579e" alt="Light Mode" width="49%">
+</div>
 
 ## Features
 
@@ -124,7 +129,8 @@ pnpm format:check
 
 3. The post will automatically appear on your blog at `/blog/my-first-post/`
 
-> **📚 Check out the [example blog post](/blog/building-blog-with-open-blog/) for a complete step-by-step guide on creating your first post!**
+> **📚 Check out the [example blog post](/blog/building-blog-with-open-blog/) for a complete step-by-step guide on
+creating your first post!**
 
 ### Syntax Highlighting
 
