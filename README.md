@@ -87,6 +87,22 @@ Just write your blog in Markdown format and ship it to everyone on the internet!
 
    Open [http://localhost:3000](http://localhost:3000) to view your blog.
 
+### Docker install
+
+1. Build docker image:
+
+   ```bash
+   docker build -t open-blog .
+   ```
+
+2. Start the open-blog server:
+
+   ```bash
+   docker run -d -p 3000:3000 open-blog
+   ```
+
+   Open [http://localhost:3000](http://localhost:3000) to view your blog.
+
 ## Development Commands
 
 ```bash
