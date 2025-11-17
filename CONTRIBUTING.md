@@ -1,6 +1,7 @@
 # Contributing to Open Blog
 
-Thank you for your interest in contributing to Open Blog! We welcome contributions from everyone. This document provides guidelines and instructions for contributing.
+Thank you for your interest in contributing to Open Blog! We welcome contributions from everyone. This document provides
+guidelines and instructions for contributing.
 
 ## Getting Started
 
@@ -43,11 +44,13 @@ Thank you for your interest in contributing to Open Blog! We welcome contributio
 ### Creating a Branch
 
 Create a feature branch for your changes:
+
 ```bash
 git checkout -b feature/your-feature-name
 ```
 
 Use descriptive branch names:
+
 - `feature/add-dark-mode`
 - `fix/header-styling`
 - `docs/update-readme`
@@ -122,6 +125,7 @@ pnpm start
 - Use descriptive test names
 
 Example:
+
 ```typescript
 it("returns formatted date with long month", () => {
   const result = formatDate("2024-01-15", { month: "long" });
@@ -144,6 +148,7 @@ chore: update dependencies
 ```
 
 Examples:
+
 - `feat: add RSS feed generation`
 - `fix: correct date formatting in blog posts`
 - `test: add tests for feed generation`
@@ -152,10 +157,10 @@ Examples:
 
 ### Before Creating a Pull Request
 
-1. Ensure your branch is up to date with `main`:
+1. Ensure your branch is up to date with `master`:
    ```bash
-   git fetch origin
-   git rebase origin/main
+   git fetch origin master
+   git rebase origin/master
    ```
 
 2. Run tests and linting:
@@ -178,10 +183,10 @@ Examples:
    ```
 
 2. Create a pull request on GitHub with:
-   - Clear title describing the change
-   - Description of what changed and why
-   - Reference any related issues (e.g., `Closes #123`)
-   - Screenshots for UI changes
+    - Clear title describing the change
+    - Description of what changed and why
+    - Reference any related issues (e.g., `Closes #123`)
+    - Screenshots for UI changes
 
 3. Ensure all checks pass (tests, linting, etc.)
 
@@ -220,6 +225,7 @@ open-blog/
 ## Questions?
 
 Feel free to:
+
 - Open an issue with your question
 - Ask in pull request discussions
 - Refer to the CLAUDE.md for project architecture details
