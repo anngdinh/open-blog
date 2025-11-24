@@ -1,0 +1,898 @@
+---
+title: "Clean Architecture in Go"
+description: "Clean Architecture trong Go - Thiết kế ứng dụng sạch và bảo trì"
+date: 2025-11-24
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+export const metadata = generateBlogMetadata({
+  title: "Clean Architecture in Go",
+  description: "Clean Architecture trong Go - Thiết kế ứng dụng sạch và bảo trì",
+  date: "2025-11-24",
+  slug: "clean-architecture"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+# Clean Architecture trong Go - Thiết kế ứng dụng sạch và bảo trì
+
+## Tổng quan
+
+Clean Architecture là một pattern thiết kế được giới thiệu bởi Robert C. Martin (Uncle Bob), giúp tạo ra các ứng dụng có cấu trúc rõ ràng, dễ test, dễ bảo trì và độc lập với frameworks. Trong Go, Clean Architecture được áp dụng rất hiệu quả.
+
+## Nguyên tắc Clean Architecture
+
+### 1. Dependency Rule
+
+- Dependencies chỉ hướng vào trong
+- Inner layers không biết gì về outer layers
+- Business logic không phụ thuộc vào infrastructure
+
+### 2. Separation of Concerns
+
+- Mỗi layer có trách nhiệm riêng biệt
+- Business logic tách biệt khỏi technical details
+- Dễ dàng thay đổi implementation
+
+## Cấu trúc Clean Architecture
+
+```text
+┌─────────────────────────────────────┐
+│           Presentation Layer        │
+│         (HTTP, CLI, gRPC)           │
+├─────────────────────────────────────┤
+│           Business Layer            │
+│        (Use Cases, Entities)        │
+├─────────────────────────────────────┤
+│         Infrastructure Layer        │
+│    (Database, External APIs)        │
+└─────────────────────────────────────┘
+```
+
+## Project Structure
+
+```text
+myapp/
+├── cmd/
+│   └── server/
+│       └── main.go
+├── internal/
+│   ├── domain/
+│   │   ├── entity/
+│   │   └── repository/
+│   ├── usecase/
+│   ├── delivery/
+│   │   ├── http/
+│   │   └── grpc/
+│   └── infrastructure/
+│       ├── database/
+│       └── external/
+├── pkg/
+└── go.mod
+```
+
+## Domain Layer (Entities)
+
+### Entity - Core Business Objects
+
+```go
+// internal/domain/entity/user.go
+package entity
+
+import (
+    "time"
+    "errors"
+)
+
+type User struct {
+    ID        string    `json:"id"`
+    Email     string    `json:"email"`
+    Name      string    `json:"name"`
+    Password  string    `json:"-"`
+    CreatedAt time.Time `json:"created_at"`
+    UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Business rules
+func (u *User) Validate() error {
+    if u.Email == "" {
+        return errors.New("email is required")
+    }
+    
+    if u.Name == "" {
+        return errors.New("name is required")
+    }
+    
+    if len(u.Password) < 6 {
+        return errors.New("password must be at least 6 characters")
+    }
+    
+    return nil
+}
+
+func (u *User) IsValid() bool {
+    return u.Validate() == nil
+}
+```
+
+### Repository Interface
+
+```go
+// internal/domain/repository/user_repository.go
+package repository
+
+import "myapp/internal/domain/entity"
+
+type UserRepository interface {
+    Create(user *entity.User) error
+    GetByID(id string) (*entity.User, error)
+    GetByEmail(email string) (*entity.User, error)
+    Update(user *entity.User) error
+    Delete(id string) error
+    List(limit, offset int) ([]*entity.User, error)
+}
+```
+
+## Use Case Layer (Business Logic)
+
+### Use Case Implementation
+
+```go
+// internal/usecase/user_usecase.go
+package usecase
+
+import (
+    "context"
+    "errors"
+    "time"
+    
+    "myapp/internal/domain/entity"
+    "myapp/internal/domain/repository"
+)
+
+type UserUseCase struct {
+    userRepo repository.UserRepository
+}
+
+func NewUserUseCase(userRepo repository.UserRepository) *UserUseCase {
+    return &UserUseCase{
+        userRepo: userRepo,
+    }
+}
+
+// CreateUser implements business logic for user creation
+func (uc *UserUseCase) CreateUser(ctx context.Context, email, name, password string) (*entity.User, error) {
+    // Check if user already exists
+    existingUser, err := uc.userRepo.GetByEmail(email)
+    if err == nil && existingUser != nil {
+        return nil, errors.New("user already exists")
+    }
+    
+    // Create new user
+    user := &entity.User{
+        ID:        generateID(),
+        Email:     email,
+        Name:      name,
+        Password:  hashPassword(password),
+        CreatedAt: time.Now(),
+        UpdatedAt: time.Now(),
+    }
+    
+    // Validate user
+    if err := user.Validate(); err != nil {
+        return nil, err
+    }
+    
+    // Save to repository
+    if err := uc.userRepo.Create(user); err != nil {
+        return nil, err
+    }
+    
+    return user, nil
+}
+
+// GetUserByID implements business logic for getting user
+func (uc *UserUseCase) GetUserByID(ctx context.Context, id string) (*entity.User, error) {
+    if id == "" {
+        return nil, errors.New("user ID is required")
+    }
+    
+    user, err := uc.userRepo.GetByID(id)
+    if err != nil {
+        return nil, err
+    }
+    
+    if user == nil {
+        return nil, errors.New("user not found")
+    }
+    
+    return user, nil
+}
+
+// UpdateUser implements business logic for updating user
+func (uc *UserUseCase) UpdateUser(ctx context.Context, id, name, email string) (*entity.User, error) {
+    user, err := uc.userRepo.GetByID(id)
+    if err != nil {
+        return nil, err
+    }
+    
+    if user == nil {
+        return nil, errors.New("user not found")
+    }
+    
+    // Update fields
+    if name != "" {
+        user.Name = name
+    }
+    if email != "" {
+        user.Email = email
+    }
+    user.UpdatedAt = time.Now()
+    
+    // Validate updated user
+    if err := user.Validate(); err != nil {
+        return nil, err
+    }
+    
+    // Save changes
+    if err := uc.userRepo.Update(user); err != nil {
+        return nil, err
+    }
+    
+    return user, nil
+}
+
+// ListUsers implements business logic for listing users
+func (uc *UserUseCase) ListUsers(ctx context.Context, limit, offset int) ([]*entity.User, error) {
+    if limit <= 0 {
+        limit = 10 // Default limit
+    }
+    if offset < 0 {
+        offset = 0
+    }
+    
+    return uc.userRepo.List(limit, offset)
+}
+```
+
+## Delivery Layer (Presentation)
+
+### HTTP Handler
+
+```go
+// internal/delivery/http/user_handler.go
+package http
+
+import (
+    "encoding/json"
+    "net/http"
+    "strconv"
+    
+    "myapp/internal/usecase"
+    "myapp/internal/domain/entity"
+)
+
+type UserHandler struct {
+    userUseCase *usecase.UserUseCase
+}
+
+func NewUserHandler(userUseCase *usecase.UserUseCase) *UserHandler {
+    return &UserHandler{
+        userUseCase: userUseCase,
+    }
+}
+
+type CreateUserRequest struct {
+    Email    string `json:"email"`
+    Name     string `json:"name"`
+    Password string `json:"password"`
+}
+
+type CreateUserResponse struct {
+    User *entity.User `json:"user"`
+}
+
+// CreateUser handles HTTP POST /users
+func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+    
+    // Parse request
+    var req CreateUserRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+    
+    // Call use case
+    user, err := h.userUseCase.CreateUser(r.Context(), req.Email, req.Name, req.Password)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    
+    // Return response
+    response := CreateUserResponse{User: user}
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusCreated)
+    json.NewEncoder(w).Encode(response)
+}
+
+// GetUser handles HTTP GET /users/{id}
+func (h *UserHandler) GetUser(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+    
+    // Extract user ID from URL
+    userID := r.URL.Query().Get("id")
+    if userID == "" {
+        http.Error(w, "User ID is required", http.StatusBadRequest)
+        return
+    }
+    
+    // Call use case
+    user, err := h.userUseCase.GetUserByID(r.Context(), userID)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusNotFound)
+        return
+    }
+    
+    // Return response
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(user)
+}
+
+// ListUsers handles HTTP GET /users
+func (h *UserHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+    
+    // Parse query parameters
+    limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+    offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+    
+    // Call use case
+    users, err := h.userUseCase.ListUsers(r.Context(), limit, offset)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    
+    // Return response
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(users)
+}
+```
+
+### Router Setup
+
+```go
+// internal/delivery/http/router.go
+package http
+
+import (
+    "net/http"
+    
+    "myapp/internal/usecase"
+)
+
+func SetupRouter(userUseCase *usecase.UserUseCase) http.Handler {
+    userHandler := NewUserHandler(userUseCase)
+    
+    mux := http.NewServeMux()
+    
+    // User routes
+    mux.HandleFunc("/users", userHandler.CreateUser)
+    mux.HandleFunc("/users/list", userHandler.ListUsers)
+    mux.HandleFunc("/users/get", userHandler.GetUser)
+    
+    return mux
+}
+```
+
+## Infrastructure Layer
+
+### Database Implementation
+
+```go
+// internal/infrastructure/database/postgres_user_repository.go
+package database
+
+import (
+    "database/sql"
+    "time"
+    
+    "myapp/internal/domain/entity"
+    "myapp/internal/domain/repository"
+)
+
+type PostgresUserRepository struct {
+    db *sql.DB
+}
+
+func NewPostgresUserRepository(db *sql.DB) repository.UserRepository {
+    return &PostgresUserRepository{db: db}
+}
+
+func (r *PostgresUserRepository) Create(user *entity.User) error {
+    query := `
+        INSERT INTO users (id, email, name, password, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6)
+    `
+    
+    _, err := r.db.Exec(query, user.ID, user.Email, user.Name, user.Password, 
+                       user.CreatedAt, user.UpdatedAt)
+    return err
+}
+
+func (r *PostgresUserRepository) GetByID(id string) (*entity.User, error) {
+    query := `
+        SELECT id, email, name, password, created_at, updated_at
+        FROM users WHERE id = $1
+    `
+    
+    user := &entity.User{}
+    err := r.db.QueryRow(query, id).Scan(
+        &user.ID, &user.Email, &user.Name, &user.Password,
+        &user.CreatedAt, &user.UpdatedAt,
+    )
+    
+    if err == sql.ErrNoRows {
+        return nil, nil
+    }
+    
+    return user, err
+}
+
+func (r *PostgresUserRepository) GetByEmail(email string) (*entity.User, error) {
+    query := `
+        SELECT id, email, name, password, created_at, updated_at
+        FROM users WHERE email = $1
+    `
+    
+    user := &entity.User{}
+    err := r.db.QueryRow(query, email).Scan(
+        &user.ID, &user.Email, &user.Name, &user.Password,
+        &user.CreatedAt, &user.UpdatedAt,
+    )
+    
+    if err == sql.ErrNoRows {
+        return nil, nil
+    }
+    
+    return user, err
+}
+
+func (r *PostgresUserRepository) Update(user *entity.User) error {
+    query := `
+        UPDATE users 
+        SET email = $1, name = $2, password = $3, updated_at = $4
+        WHERE id = $5
+    `
+    
+    _, err := r.db.Exec(query, user.Email, user.Name, user.Password, 
+                       user.UpdatedAt, user.ID)
+    return err
+}
+
+func (r *PostgresUserRepository) Delete(id string) error {
+    query := `DELETE FROM users WHERE id = $1`
+    _, err := r.db.Exec(query, id)
+    return err
+}
+
+func (r *PostgresUserRepository) List(limit, offset int) ([]*entity.User, error) {
+    query := `
+        SELECT id, email, name, password, created_at, updated_at
+        FROM users 
+        ORDER BY created_at DESC
+        LIMIT $1 OFFSET $2
+    `
+    
+    rows, err := r.db.Query(query, limit, offset)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    
+    var users []*entity.User
+    for rows.Next() {
+        user := &entity.User{}
+        err := rows.Scan(
+            &user.ID, &user.Email, &user.Name, &user.Password,
+            &user.CreatedAt, &user.UpdatedAt,
+        )
+        if err != nil {
+            return nil, err
+        }
+        users = append(users, user)
+    }
+    
+    return users, nil
+}
+```
+
+### Database Connection
+
+```go
+// internal/infrastructure/database/connection.go
+package database
+
+import (
+    "database/sql"
+    _ "github.com/lib/pq"
+)
+
+func NewPostgresConnection(dsn string) (*sql.DB, error) {
+    db, err := sql.Open("postgres", dsn)
+    if err != nil {
+        return nil, err
+    }
+    
+    if err := db.Ping(); err != nil {
+        return nil, err
+    }
+    
+    return db, nil
+}
+```
+
+## Dependency Injection
+
+### Wire Setup
+
+```go
+// internal/wire.go
+package internal
+
+import (
+    "myapp/internal/delivery/http"
+    "myapp/internal/infrastructure/database"
+    "myapp/internal/usecase"
+    
+    "github.com/google/wire"
+)
+
+func InitializeAPI(db *database.PostgresUserRepository) (*http.UserHandler, error) {
+    wire.Build(
+        usecase.NewUserUseCase,
+        http.NewUserHandler,
+    )
+    return &http.UserHandler{}, nil
+}
+```
+
+## Main Application
+
+```go
+// cmd/server/main.go
+package main
+
+import (
+    "log"
+    "net/http"
+    
+    "myapp/internal/delivery/http"
+    "myapp/internal/infrastructure/database"
+    "myapp/internal/usecase"
+)
+
+func main() {
+    // Initialize database
+    db, err := database.NewPostgresConnection("postgres://user:pass@localhost/dbname?sslmode=disable")
+    if err != nil {
+        log.Fatal("Failed to connect to database:", err)
+    }
+    defer db.Close()
+    
+    // Initialize repository
+    userRepo := database.NewPostgresUserRepository(db)
+    
+    // Initialize use case
+    userUseCase := usecase.NewUserUseCase(userRepo)
+    
+    // Initialize handler
+    userHandler := http.NewUserHandler(userUseCase)
+    
+    // Setup router
+    router := http.SetupRouter(userUseCase)
+    
+    // Start server
+    log.Println("Server starting on :8080")
+    log.Fatal(http.ListenAndServe(":8080", router))
+}
+```
+
+## Testing
+
+### Use Case Testing
+
+```go
+// internal/usecase/user_usecase_test.go
+package usecase
+
+import (
+    "context"
+    "testing"
+    
+    "myapp/internal/domain/entity"
+    "myapp/internal/domain/repository"
+)
+
+// Mock repository for testing
+type MockUserRepository struct {
+    users map[string]*entity.User
+}
+
+func NewMockUserRepository() repository.UserRepository {
+    return &MockUserRepository{
+        users: make(map[string]*entity.User),
+    }
+}
+
+func (m *MockUserRepository) Create(user *entity.User) error {
+    m.users[user.ID] = user
+    return nil
+}
+
+func (m *MockUserRepository) GetByID(id string) (*entity.User, error) {
+    user, exists := m.users[id]
+    if !exists {
+        return nil, nil
+    }
+    return user, nil
+}
+
+func (m *MockUserRepository) GetByEmail(email string) (*entity.User, error) {
+    for _, user := range m.users {
+        if user.Email == email {
+            return user, nil
+        }
+    }
+    return nil, nil
+}
+
+func (m *MockUserRepository) Update(user *entity.User) error {
+    m.users[user.ID] = user
+    return nil
+}
+
+func (m *MockUserRepository) Delete(id string) error {
+    delete(m.users, id)
+    return nil
+}
+
+func (m *MockUserRepository) List(limit, offset int) ([]*entity.User, error) {
+    var users []*entity.User
+    count := 0
+    for _, user := range m.users {
+        if count >= offset && len(users) < limit {
+            users = append(users, user)
+        }
+        count++
+    }
+    return users, nil
+}
+
+func TestUserUseCase_CreateUser(t *testing.T) {
+    // Arrange
+    mockRepo := NewMockUserRepository()
+    useCase := NewUserUseCase(mockRepo)
+    ctx := context.Background()
+    
+    // Act
+    user, err := useCase.CreateUser(ctx, "test@example.com", "Test User", "password123")
+    
+    // Assert
+    if err != nil {
+        t.Errorf("Expected no error, got %v", err)
+    }
+    
+    if user == nil {
+        t.Error("Expected user to be created")
+    }
+    
+    if user.Email != "test@example.com" {
+        t.Errorf("Expected email 'test@example.com', got %s", user.Email)
+    }
+}
+
+func TestUserUseCase_CreateUser_DuplicateEmail(t *testing.T) {
+    // Arrange
+    mockRepo := NewMockUserRepository()
+    useCase := NewUserUseCase(mockRepo)
+    ctx := context.Background()
+    
+    // Create first user
+    _, err := useCase.CreateUser(ctx, "test@example.com", "Test User", "password123")
+    if err != nil {
+        t.Fatal(err)
+    }
+    
+    // Act - Try to create user with same email
+    _, err = useCase.CreateUser(ctx, "test@example.com", "Another User", "password456")
+    
+    // Assert
+    if err == nil {
+        t.Error("Expected error for duplicate email")
+    }
+    
+    if err.Error() != "user already exists" {
+        t.Errorf("Expected 'user already exists' error, got %v", err)
+    }
+}
+```
+
+### Handler Testing
+
+```go
+// internal/delivery/http/user_handler_test.go
+package http
+
+import (
+    "bytes"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "testing"
+    
+    "myapp/internal/usecase"
+)
+
+func TestUserHandler_CreateUser(t *testing.T) {
+    // Arrange
+    mockRepo := NewMockUserRepository()
+    useCase := usecase.NewUserUseCase(mockRepo)
+    handler := NewUserHandler(useCase)
+    
+    requestBody := CreateUserRequest{
+        Email:    "test@example.com",
+        Name:     "Test User",
+        Password: "password123",
+    }
+    
+    body, _ := json.Marshal(requestBody)
+    req := httptest.NewRequest("POST", "/users", bytes.NewBuffer(body))
+    w := httptest.NewRecorder()
+    
+    // Act
+    handler.CreateUser(w, req)
+    
+    // Assert
+    if w.Code != http.StatusCreated {
+        t.Errorf("Expected status %d, got %d", http.StatusCreated, w.Code)
+    }
+    
+    var response CreateUserResponse
+    json.Unmarshal(w.Body.Bytes(), &response)
+    
+    if response.User == nil {
+        t.Error("Expected user in response")
+    }
+    
+    if response.User.Email != "test@example.com" {
+        t.Errorf("Expected email 'test@example.com', got %s", response.User.Email)
+    }
+}
+```
+
+## Best Practices
+
+### 1. Interface Segregation
+
+```go
+// Define small, focused interfaces
+type UserReader interface {
+    GetByID(id string) (*entity.User, error)
+    GetByEmail(email string) (*entity.User, error)
+}
+
+type UserWriter interface {
+    Create(user *entity.User) error
+    Update(user *entity.User) error
+    Delete(id string) error
+}
+
+type UserRepository interface {
+    UserReader
+    UserWriter
+    List(limit, offset int) ([]*entity.User, error)
+}
+```
+
+### 2. Error Handling
+
+```go
+// Define custom errors
+var (
+    ErrUserNotFound = errors.New("user not found")
+    ErrUserExists   = errors.New("user already exists")
+    ErrInvalidInput = errors.New("invalid input")
+)
+
+// Use error wrapping
+func (uc *UserUseCase) GetUserByID(ctx context.Context, id string) (*entity.User, error) {
+    user, err := uc.userRepo.GetByID(id)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get user: %w", err)
+    }
+    
+    if user == nil {
+        return nil, ErrUserNotFound
+    }
+    
+    return user, nil
+}
+```
+
+### 3. Context Usage
+
+```go
+// Pass context through all layers
+func (uc *UserUseCase) CreateUser(ctx context.Context, email, name, password string) (*entity.User, error) {
+    // Check for cancellation
+    select {
+    case <-ctx.Done():
+        return nil, ctx.Err()
+    default:
+    }
+    
+    // Business logic...
+    return user, nil
+}
+```
+
+### 4. Validation
+
+```go
+// Use validation tags
+type CreateUserRequest struct {
+    Email    string `json:"email" validate:"required,email"`
+    Name     string `json:"name" validate:"required,min=2,max=50"`
+    Password string `json:"password" validate:"required,min=6"`
+}
+
+// Validate in handler
+func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
+    var req CreateUserRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+    
+    if err := validator.New().Struct(req); err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    
+    // Continue with use case...
+}
+```
+
+## Kết luận
+
+- **Clean Architecture** giúp tạo ra code có cấu trúc rõ ràng và dễ bảo trì
+- **Dependency Rule** đảm bảo business logic không phụ thuộc vào infrastructure
+- **Separation of Concerns** giúp mỗi layer có trách nhiệm riêng biệt
+- **Testing** dễ dàng với dependency injection và mocking
+- **Scalability** và **Maintainability** được cải thiện đáng kể
+
+Clean Architecture là pattern không thể thiếu cho các ứng dụng Go enterprise-level.
