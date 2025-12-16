@@ -1,0 +1,1006 @@
+---
+title: "Deep Dive: Goroutines, Threads, and Processes in Go"
+description: "A comprehensive exploration of Go's concurrency model - Understanding goroutines, OS threads, processes, and the Go scheduler"
+date: 2025-12-16
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+export const metadata = generateBlogMetadata({
+  title: "Deep Dive: Goroutines, Threads, and Processes in Go",
+  description: "A comprehensive exploration of Go's concurrency model - Understanding goroutines, OS threads, processes, and the Go scheduler",
+  date: "2025-12-16",
+  slug: "golang-goroutines-deep-dive"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+# Deep Dive: Goroutines, Threads, and Processes in Go
+
+## Introduction
+
+Go's concurrency model is one of its most powerful features, built around the concept of goroutines. To truly understand goroutines, we need to explore how they relate to operating system threads and processes. This deep dive examines the architecture, implementation, and practical implications of Go's concurrency primitives.
+
+## Understanding the Hierarchy: Process → Thread → Goroutine
+
+### Processes: The Foundation
+
+A process is an instance of a program in execution. It represents a complete, independent execution environment with:
+
+- **Memory Space**: Each process has its own virtual address space
+- **System Resources**: File descriptors, network connections, signal handlers
+- **Security Context**: User ID, group ID, capabilities
+- **Execution State**: Program counter, registers, stack
+
+```go
+// Example: Creating a new process in Go
+package main
+
+import (
+    "fmt"
+    "os"
+    "os/exec"
+)
+
+func main() {
+    cmd := exec.Command("ls", "-la")
+    cmd.Stdout = os.Stdout
+    cmd.Stderr = os.Stderr
+
+    // This creates a new OS process
+    err := cmd.Run()
+    if err != nil {
+        fmt.Printf("Error: %v\n", err)
+    }
+}
+```
+
+**Key Characteristics:**
+
+- Heavy-weight: Creating a process involves significant overhead
+- Isolation: Processes are isolated from each other by default
+- Communication: Inter-process communication (IPC) requires special mechanisms (pipes, sockets, shared memory)
+
+### Threads: Lightweight Execution Units
+
+Threads are the smallest unit of execution that the OS scheduler manages. Multiple threads within a process share:
+
+- **Memory Space**: All threads can access the same memory
+- **File Descriptors**: Open files are shared
+- **Signal Handlers**: Process-wide signal handling
+
+But each thread maintains its own:
+
+- Stack
+- Program counter
+- Register set
+- Thread-local storage
+
+```go
+// Go doesn't directly expose OS thread creation, but we can observe thread behavior
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "sync"
+)
+
+func main() {
+    // Get the number of OS threads
+    fmt.Printf("Initial threads: %d\n", runtime.NumGoroutine())
+
+    // Force Go to use multiple OS threads
+    runtime.GOMAXPROCS(4)
+
+    var wg sync.WaitGroup
+    for i := 0; i < 10; i++ {
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+            // This might run on different OS threads
+            fmt.Printf("Goroutine %d on thread\n", id)
+        }(i)
+    }
+    wg.Wait()
+}
+```
+
+### Goroutines: Go's Innovation
+
+Goroutines are lightweight threads managed by the Go runtime, not the OS. They're multiplexed onto OS threads by Go's scheduler.
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "time"
+)
+
+func expensiveOperation(id int) {
+    // Simulate work
+    time.Sleep(100 * time.Millisecond)
+    fmt.Printf("Goroutine %d completed\n", id)
+}
+
+func main() {
+    // A goroutine starts with just 2KB of stack space
+    fmt.Printf("Number of CPUs: %d\n", runtime.NumCPU())
+    fmt.Printf("GOMAXPROCS: %d\n", runtime.GOMAXPROCS(0))
+
+    // Launch 1000 goroutines - try this with OS threads!
+    for i := 0; i < 1000; i++ {
+        go expensiveOperation(i)
+    }
+
+    time.Sleep(2 * time.Second)
+    fmt.Printf("Number of goroutines: %d\n", runtime.NumGoroutine())
+}
+```
+
+## The Go Scheduler: M:N Threading Model
+
+Go implements an M:N threading model where M goroutines are multiplexed onto N OS threads.
+
+### Core Components
+
+1. **G (Goroutine)**: The goroutine itself, containing:
+   - Stack (starts at 2KB, can grow/shrink)
+   - Instruction pointer
+   - Other metadata for scheduling
+
+2. **M (Machine)**: An OS thread that executes goroutines
+   - Each M is created by the runtime
+   - Limited by GOMAXPROCS
+
+3. **P (Processor)**: A scheduling context
+   - Holds the run queue of goroutines
+   - Required for an M to execute goroutines
+   - Number determined by GOMAXPROCS
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "sync"
+    "time"
+)
+
+func monitorRuntime() {
+    for {
+        fmt.Printf("Goroutines: %d | Threads: %d | GOMAXPROCS: %d\n",
+            runtime.NumGoroutine(),
+            runtime.NumCPU(),
+            runtime.GOMAXPROCS(0))
+        time.Sleep(1 * time.Second)
+    }
+}
+
+func cpuIntensive(wg *sync.WaitGroup, id int) {
+    defer wg.Done()
+
+    // Simulate CPU-intensive work
+    sum := 0
+    for i := 0; i < 1000000000; i++ {
+        sum += i
+    }
+    fmt.Printf("Goroutine %d finished with sum %d\n", id, sum)
+}
+
+func main() {
+    runtime.GOMAXPROCS(2) // Limit to 2 OS threads
+
+    go monitorRuntime()
+
+    var wg sync.WaitGroup
+
+    // Launch 10 CPU-intensive goroutines
+    for i := 0; i < 10; i++ {
+        wg.Add(1)
+        go cpuIntensive(&wg, i)
+    }
+
+    wg.Wait()
+}
+```
+
+### Scheduling Algorithm
+
+Go uses a **work-stealing scheduler** with the following characteristics:
+
+1. **Local Run Queue**: Each P has its own local run queue (capacity 256)
+2. **Global Run Queue**: Overflow and new goroutines may go here
+3. **Work Stealing**: When a P's local queue is empty, it can steal from other Ps
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "sync"
+    "time"
+)
+
+func demonstrateScheduling() {
+    runtime.GOMAXPROCS(2) // 2 Ps available
+
+    var wg sync.WaitGroup
+
+    // Create goroutines that will be distributed across Ps
+    for i := 0; i < 20; i++ {
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+
+            // Get current P
+            fmt.Printf("Goroutine %d starting\n", id)
+
+            // Do some work
+            time.Sleep(10 * time.Millisecond)
+
+            // Yield to scheduler
+            runtime.Gosched()
+
+            fmt.Printf("Goroutine %d resuming\n", id)
+        }(i)
+    }
+
+    wg.Wait()
+}
+
+func main() {
+    demonstrateScheduling()
+}
+```
+
+## Preemption and Cooperation
+
+### Cooperative Scheduling (Pre-Go 1.14)
+
+Originally, Go used cooperative scheduling where goroutines yielded control at specific points:
+
+- Channel operations
+- System calls
+- Function calls (stack growth check)
+- `runtime.Gosched()`
+
+### Asynchronous Preemption (Go 1.14+)
+
+Modern Go implements asynchronous preemption using signals:
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "time"
+)
+
+func infiniteLoop(id int) {
+    i := 0
+    // Pre-1.14: This would block other goroutines on the same P
+    // Post-1.14: This gets preempted
+    for {
+        i++
+        if i%1000000000 == 0 {
+            fmt.Printf("Goroutine %d: iteration %d\n", id, i)
+        }
+    }
+}
+
+func main() {
+    runtime.GOMAXPROCS(1) // Force all goroutines on one P
+
+    // Launch multiple infinite loops
+    for i := 0; i < 3; i++ {
+        go infiniteLoop(i)
+    }
+
+    // Monitor that all goroutines get execution time
+    for i := 0; i < 10; i++ {
+        time.Sleep(1 * time.Second)
+        fmt.Printf("Main: %d seconds elapsed, %d goroutines\n",
+            i+1, runtime.NumGoroutine())
+    }
+}
+```
+
+## Memory Model and Synchronization
+
+### Stack Management
+
+Goroutines start with a small stack (2KB) that grows and shrinks dynamically:
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime"
+)
+
+func recursiveFunction(depth int, maxDepth int) {
+    if depth >= maxDepth {
+        var m runtime.MemStats
+        runtime.ReadMemStats(&m)
+        fmt.Printf("Stack size at depth %d: ~%d KB\n",
+            depth, m.StackSys/1024)
+        return
+    }
+
+    // Local variable to consume stack space
+    var array [1024]byte
+    _ = array
+
+    recursiveFunction(depth+1, maxDepth)
+}
+
+func main() {
+    // Observe stack growth
+    recursiveFunction(0, 100)
+    recursiveFunction(0, 1000)
+    recursiveFunction(0, 10000)
+}
+```
+
+### Channel-Based Synchronization
+
+Channels are Go's primary synchronization primitive:
+
+```go
+package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func producer(ch chan<- int) {
+    for i := 0; i < 10; i++ {
+        ch <- i
+        time.Sleep(100 * time.Millisecond)
+    }
+    close(ch)
+}
+
+func consumer(id int, ch <-chan int, done chan<- bool) {
+    for val := range ch {
+        fmt.Printf("Consumer %d received: %d\n", id, val)
+    }
+    done <- true
+}
+
+func main() {
+    dataChannel := make(chan int, 3) // Buffered channel
+    doneChannel := make(chan bool, 2)
+
+    // Start producer
+    go producer(dataChannel)
+
+    // Start multiple consumers
+    go consumer(1, dataChannel, doneChannel)
+    go consumer(2, dataChannel, doneChannel)
+
+    // Wait for consumers to finish
+    <-doneChannel
+    <-doneChannel
+}
+```
+
+## Performance Characteristics
+
+### Goroutine vs Thread Creation Benchmark
+
+```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "testing"
+    "time"
+)
+
+func BenchmarkGoroutineCreation(b *testing.B) {
+    for i := 0; i < b.N; i++ {
+        var wg sync.WaitGroup
+        wg.Add(1)
+        go func() {
+            wg.Done()
+        }()
+        wg.Wait()
+    }
+}
+
+func measureGoroutineOverhead() {
+    start := time.Now()
+
+    var wg sync.WaitGroup
+    numGoroutines := 100000
+
+    for i := 0; i < numGoroutines; i++ {
+        wg.Add(1)
+        go func(id int) {
+            // Minimal work
+            _ = id
+            wg.Done()
+        }(i)
+    }
+
+    wg.Wait()
+    elapsed := time.Since(start)
+
+    fmt.Printf("Created %d goroutines in %v\n", numGoroutines, elapsed)
+    fmt.Printf("Average time per goroutine: %v\n",
+        elapsed/time.Duration(numGoroutines))
+}
+
+func main() {
+    measureGoroutineOverhead()
+}
+```
+
+### Context Switching Comparison
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "sync"
+    "time"
+)
+
+func contextSwitchTest(numGoroutines int, iterations int) {
+    runtime.GOMAXPROCS(1) // Force context switching
+
+    ch := make(chan struct{})
+    var wg sync.WaitGroup
+
+    start := time.Now()
+
+    for i := 0; i < numGoroutines; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for j := 0; j < iterations; j++ {
+                ch <- struct{}{}
+            }
+        }()
+    }
+
+    go func() {
+        for i := 0; i < numGoroutines*iterations; i++ {
+            <-ch
+        }
+    }()
+
+    wg.Wait()
+    elapsed := time.Since(start)
+
+    totalSwitches := numGoroutines * iterations
+    fmt.Printf("Total context switches: %d\n", totalSwitches)
+    fmt.Printf("Total time: %v\n", elapsed)
+    fmt.Printf("Average time per switch: %v\n",
+        elapsed/time.Duration(totalSwitches))
+}
+
+func main() {
+    contextSwitchTest(100, 1000)
+}
+```
+
+## Common Patterns and Best Practices
+
+### Worker Pool Pattern
+
+```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+type Job struct {
+    ID   int
+    Data string
+}
+
+type Result struct {
+    JobID  int
+    Output string
+}
+
+func worker(id int, jobs <-chan Job, results chan<- Result) {
+    for job := range jobs {
+        // Simulate processing
+        time.Sleep(100 * time.Millisecond)
+        results <- Result{
+            JobID:  job.ID,
+            Output: fmt.Sprintf("Processed by worker %d: %s", id, job.Data),
+        }
+    }
+}
+
+func main() {
+    numWorkers := 5
+    numJobs := 20
+
+    jobs := make(chan Job, numJobs)
+    results := make(chan Result, numJobs)
+
+    // Start workers
+    var wg sync.WaitGroup
+    for w := 0; w < numWorkers; w++ {
+        wg.Add(1)
+        go func(workerID int) {
+            defer wg.Done()
+            worker(workerID, jobs, results)
+        }(w)
+    }
+
+    // Send jobs
+    for j := 0; j < numJobs; j++ {
+        jobs <- Job{ID: j, Data: fmt.Sprintf("data-%d", j)}
+    }
+    close(jobs)
+
+    // Collect results
+    go func() {
+        wg.Wait()
+        close(results)
+    }()
+
+    for result := range results {
+        fmt.Printf("Result: %+v\n", result)
+    }
+}
+```
+
+### Fan-Out/Fan-In Pattern
+
+```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+func producer(id int, ch chan<- int) {
+    for i := 0; i < 5; i++ {
+        ch <- id*10 + i
+        time.Sleep(100 * time.Millisecond)
+    }
+}
+
+func fanOut(in <-chan int, workerCount int) []<-chan int {
+    channels := make([]<-chan int, workerCount)
+
+    for i := 0; i < workerCount; i++ {
+        ch := make(chan int)
+        channels[i] = ch
+
+        go func(workerCh chan<- int) {
+            for val := range in {
+                // Process and forward
+                workerCh <- val * val
+            }
+            close(workerCh)
+        }(ch)
+    }
+
+    return channels
+}
+
+func fanIn(channels ...<-chan int) <-chan int {
+    out := make(chan int)
+    var wg sync.WaitGroup
+
+    for _, ch := range channels {
+        wg.Add(1)
+        go func(c <-chan int) {
+            defer wg.Done()
+            for val := range c {
+                out <- val
+            }
+        }(ch)
+    }
+
+    go func() {
+        wg.Wait()
+        close(out)
+    }()
+
+    return out
+}
+
+func main() {
+    input := make(chan int)
+
+    // Start producer
+    go func() {
+        producer(1, input)
+        close(input)
+    }()
+
+    // Fan out to 3 workers
+    workers := fanOut(input, 3)
+
+    // Fan in results
+    results := fanIn(workers...)
+
+    // Collect results
+    for result := range results {
+        fmt.Printf("Result: %d\n", result)
+    }
+}
+```
+
+## Debugging and Profiling
+
+### Runtime Statistics
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "runtime/debug"
+    "time"
+)
+
+func printRuntimeStats() {
+    var m runtime.MemStats
+    runtime.ReadMemStats(&m)
+
+    fmt.Printf("\n=== Runtime Statistics ===\n")
+    fmt.Printf("Goroutines: %d\n", runtime.NumGoroutine())
+    fmt.Printf("OS Threads: %d\n", runtime.GOMAXPROCS(0))
+    fmt.Printf("Memory Allocated: %d MB\n", m.Alloc/1024/1024)
+    fmt.Printf("Memory System: %d MB\n", m.Sys/1024/1024)
+    fmt.Printf("GC Runs: %d\n", m.NumGC)
+    fmt.Printf("Stack in use: %d KB\n", m.StackInuse/1024)
+}
+
+func main() {
+    // Set GC percentage
+    debug.SetGCPercent(100)
+
+    // Monitor runtime stats
+    ticker := time.NewTicker(2 * time.Second)
+    defer ticker.Stop()
+
+    go func() {
+        for range ticker.C {
+            printRuntimeStats()
+        }
+    }()
+
+    // Create some goroutines
+    for i := 0; i < 100; i++ {
+        go func(id int) {
+            time.Sleep(10 * time.Second)
+        }(i)
+    }
+
+    time.Sleep(15 * time.Second)
+}
+```
+
+### Detecting Goroutine Leaks
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "time"
+)
+
+func leakyFunction() {
+    ch := make(chan int) // Unbuffered channel
+
+    go func() {
+        val := <-ch // This will block forever
+        fmt.Printf("Received: %d\n", val)
+    }()
+
+    // Forgot to send to channel or close it
+    // The goroutine will leak
+}
+
+func detectLeak() {
+    initial := runtime.NumGoroutine()
+    fmt.Printf("Initial goroutines: %d\n", initial)
+
+    for i := 0; i < 10; i++ {
+        leakyFunction()
+    }
+
+    time.Sleep(1 * time.Second)
+
+    final := runtime.NumGoroutine()
+    fmt.Printf("Final goroutines: %d\n", final)
+    fmt.Printf("Leaked goroutines: %d\n", final-initial)
+}
+
+func fixedFunction() {
+    ch := make(chan int, 1) // Buffered channel
+
+    go func() {
+        select {
+        case val := <-ch:
+            fmt.Printf("Received: %d\n", val)
+        case <-time.After(1 * time.Second):
+            fmt.Println("Timeout - no leak")
+            return
+        }
+    }()
+}
+
+func main() {
+    detectLeak()
+
+    // Show fixed version
+    fmt.Println("\n=== Fixed Version ===")
+    initial := runtime.NumGoroutine()
+
+    for i := 0; i < 10; i++ {
+        fixedFunction()
+    }
+
+    time.Sleep(2 * time.Second)
+    final := runtime.NumGoroutine()
+    fmt.Printf("No leak: %d goroutines (started with %d)\n", final, initial)
+}
+```
+
+## Advanced Topics
+
+### System Calls and Blocking
+
+When a goroutine makes a blocking system call, Go's runtime handles it specially:
+
+```go
+package main
+
+import (
+    "fmt"
+    "net"
+    "runtime"
+    "time"
+)
+
+func blockingIO() {
+    // This will cause the M to be parked
+    conn, err := net.Dial("tcp", "example.com:80")
+    if err != nil {
+        fmt.Printf("Error: %v\n", err)
+        return
+    }
+    defer conn.Close()
+
+    // Write to connection
+    conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
+
+    // Read response
+    buffer := make([]byte, 1024)
+    conn.Read(buffer)
+}
+
+func main() {
+    runtime.GOMAXPROCS(2)
+
+    fmt.Printf("Starting with %d OS threads\n", runtime.GOMAXPROCS(0))
+
+    // Launch multiple goroutines doing blocking I/O
+    for i := 0; i < 10; i++ {
+        go blockingIO()
+    }
+
+    // Monitor thread creation
+    for i := 0; i < 5; i++ {
+        time.Sleep(1 * time.Second)
+        fmt.Printf("Goroutines: %d\n", runtime.NumGoroutine())
+    }
+}
+```
+
+### CGO and System Thread Binding
+
+```go
+package main
+
+/*
+#include <pthread.h>
+#include <stdio.h>
+
+void print_thread_id() {
+    pthread_t tid = pthread_self();
+    printf("C thread ID: %lu\n", (unsigned long)tid);
+}
+*/
+import "C"
+import (
+    "fmt"
+    "runtime"
+)
+
+func main() {
+    runtime.LockOSThread() // Bind goroutine to OS thread
+    defer runtime.UnlockOSThread()
+
+    fmt.Println("Goroutine locked to OS thread")
+    C.print_thread_id()
+
+    // This goroutine will always run on the same OS thread
+    for i := 0; i < 5; i++ {
+        fmt.Printf("Iteration %d\n", i)
+        C.print_thread_id()
+    }
+}
+```
+
+## Performance Optimization Strategies
+
+### 1. Proper GOMAXPROCS Setting
+
+```go
+package main
+
+import (
+    "fmt"
+    "runtime"
+    "sync"
+    "time"
+)
+
+func cpuBoundWork(id int, wg *sync.WaitGroup) {
+    defer wg.Done()
+
+    // CPU-intensive work
+    sum := 0
+    for i := 0; i < 1000000000; i++ {
+        sum += i
+    }
+}
+
+func benchmark(maxProcs int) time.Duration {
+    runtime.GOMAXPROCS(maxProcs)
+
+    var wg sync.WaitGroup
+    start := time.Now()
+
+    numGoroutines := 100
+    for i := 0; i < numGoroutines; i++ {
+        wg.Add(1)
+        go cpuBoundWork(i, &wg)
+    }
+
+    wg.Wait()
+    return time.Since(start)
+}
+
+func main() {
+    numCPU := runtime.NumCPU()
+    fmt.Printf("Number of CPUs: %d\n\n", numCPU)
+
+    for i := 1; i <= numCPU*2; i++ {
+        duration := benchmark(i)
+        fmt.Printf("GOMAXPROCS=%d: %v\n", i, duration)
+    }
+}
+```
+
+### 2. Goroutine Pool Management
+
+```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+type Pool struct {
+    work chan func()
+    wg   sync.WaitGroup
+}
+
+func NewPool(size int) *Pool {
+    pool := &Pool{
+        work: make(chan func(), 100),
+    }
+
+    pool.wg.Add(size)
+    for i := 0; i < size; i++ {
+        go pool.worker()
+    }
+
+    return pool
+}
+
+func (p *Pool) worker() {
+    defer p.wg.Done()
+    for task := range p.work {
+        task()
+    }
+}
+
+func (p *Pool) Submit(task func()) {
+    p.work <- task
+}
+
+func (p *Pool) Close() {
+    close(p.work)
+    p.wg.Wait()
+}
+
+func main() {
+    pool := NewPool(10) // Limit concurrent goroutines
+
+    // Submit many tasks
+    for i := 0; i < 1000; i++ {
+        id := i
+        pool.Submit(func() {
+            time.Sleep(10 * time.Millisecond)
+            fmt.Printf("Task %d completed\n", id)
+        })
+    }
+
+    pool.Close()
+}
+```
+
+## Conclusion
+
+Go's concurrency model, built on goroutines, represents a significant advancement in concurrent programming. By abstracting OS threads and implementing an efficient M:N scheduler, Go enables developers to write highly concurrent programs without the traditional complexity and overhead.
+
+Key takeaways:
+
+- **Goroutines are cheap**: 2KB initial stack vs MB for OS threads
+- **Scheduling is sophisticated**: Work-stealing, preemption, and dynamic stack management
+- **Communication over sharing**: Channels provide safe communication between goroutines
+- **Runtime does heavy lifting**: Automatic management of threads and scheduling
+
+The combination of lightweight goroutines, channels for communication, and a sophisticated runtime makes Go particularly well-suited for:
+
+- Network servers handling thousands of connections
+- Parallel data processing pipelines
+- Microservices and distributed systems
+- Real-time systems with predictable latency requirements
+
+Understanding the underlying mechanics of goroutines, threads, and processes allows developers to write more efficient concurrent programs and debug complex synchronization issues effectively.
+
+## References and Further Reading
+
+- [The Go Memory Model](https://go.dev/ref/mem)
+- [Go Scheduler Design Document](https://docs.google.com/document/d/1TTj4T2JO42uD5ID9e89oa0sLKhJYD0Y_kqxDv3I3XMw)
+- [Effective Go - Concurrency](https://go.dev/doc/effective_go#concurrency)
+- [Go Concurrency Patterns](https://go.dev/blog/pipelines)
+- [Dmitry Vyukov's Scheduler Notes](https://docs.google.com/document/d/1ETuA2IOmnaQ4j81AtTGT40Y4_Jr6_IDASEKg0t0dBR8)
