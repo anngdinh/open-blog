@@ -1,0 +1,439 @@
+---
+title: "MetalLB: Giải pháp Load Balancer cho Kubernetes On-Premise"
+description: "Hướng dẫn chi tiết về MetalLB - công cụ cung cấp Load Balancer cho Kubernetes trong môi trường bare metal"
+date: 2025-12-31
+---
+
+## MetalLB là gì?
+
+MetalLB là một giải pháp load balancer mã nguồn mở được thiết kế đặc biệt cho các cụm Kubernetes chạy trên bare metal. Trong khi các nhà cung cấp đám mây như AWS, GCP hay Azure tự động cung cấp load balancer khi bạn tạo Service type LoadBalancer, môi trường on-premise không có tính năng này. MetalLB ra đời để lấp đầy khoảng trống đó.
+
+<div style={{display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '2rem', margin: '2rem 0', flexWrap: 'wrap'}}>
+  <img
+    src="https://raw.githubusercontent.com/cncf/artwork/main/projects/metallb/horizontal/color/metallb-horizontal-color.png"
+    alt="MetalLB Logo"
+    style={{maxWidth: '280px', height: 'auto'}}
+  />
+  <img
+    src="https://raw.githubusercontent.com/cncf/artwork/main/other/cncf/horizontal/color/cncf-color.png"
+    alt="CNCF Logo"
+    style={{maxWidth: '180px', height: 'auto'}}
+  />
+</div>
+
+> 💡 MetalLB là một dự án sandbox của Cloud Native Computing Foundation (CNCF)
+
+## Tại sao cần MetalLB?
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="https://raw.githubusercontent.com/kubernetes/kubernetes/master/logo/logo.png"
+    alt="Kubernetes"
+    style={{maxWidth: '100px', height: 'auto'}}
+  />
+</div>
+
+### Vấn đề với Kubernetes On-Premise
+
+Khi triển khai Kubernetes on-premise, bạn có ba loại Service:
+- **ClusterIP**: Chỉ truy cập được trong cluster
+- **NodePort**: Expose service qua port của node (30000-32767)
+- **LoadBalancer**: Không hoạt động nếu không có cloud provider
+
+MetalLB giải quyết vấn đề này bằng cách cung cấp network load balancer cho môi trường bare metal.
+
+## Cách MetalLB hoạt động
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="https://raw.githubusercontent.com/cncf/artwork/main/projects/metallb/stacked/color/metallb-stacked-color.png"
+    alt="MetalLB Architecture"
+    style={{maxWidth: '200px', height: 'auto'}}
+  />
+</div>
+
+MetalLB hoạt động theo hai chế độ chính:
+
+### 1. Layer 2 Mode (ARP/NDP)
+
+> 📖 **ARP (Address Resolution Protocol)**: Giao thức được sử dụng để ánh xạ địa chỉ IP với địa chỉ MAC trong mạng local. NDP (Neighbor Discovery Protocol) là phiên bản của ARP cho IPv6.
+
+```text
+┌────────┐         ┌──────────────┐       ┌──────────────┐      ┌─────────┐
+│ Client │         │Switch/Router │       │Node1 (Leader)│      │  Node2  │
+└────┬───┘         └──────┬───────┘       └──────┬───────┘      └────┬────┘
+     │                    │                      │                   │
+     │  Who has IP?       │                      │                   │
+     │------------------->│                      │                   │
+     │                    │   ARP Request        │                   │
+     │                    │--------------------->│                   │
+     │                    │                      │                   │
+     │                    │   I have that IP!    │                   │
+     │                    │<---------------------|                   │
+     │                    │                      │                   │
+     │  Traffic           │                      │                   │
+     │------------------------------------------>│                   │
+     │                    │                      │                   │
+     │                    │                      │ Forward to Pod    │
+     │                    │                      │------------------>│
+     │                    │                      │                   │
+     │                    │                   [X Node1 Fails]        │
+     │                    │                                          │
+     │                    │   Gratuitous ARP                         │
+     │                    │<-----------------------------------------│
+     │                    │  "I now have that IP"                    │
+     │                    │                                          │
+     │  Traffic           │                                          │
+     │-------------------------------------------------------------->│
+     │                    │                                          │
+```
+
+Trong chế độ này:
+- Một node được chọn làm leader cho mỗi service
+- Node leader sẽ phản hồi các ARP request cho IP của service
+- Tất cả traffic sẽ đi qua node leader
+- Khi node leader fail, một node khác sẽ tiếp quản
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: production-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 192.168.1.240-192.168.1.250
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: l2-advert
+  namespace: metallb-system
+```
+
+### 2. BGP Mode
+
+> 📖 **BGP (Border Gateway Protocol)**: Giao thức định tuyến được sử dụng để trao đổi thông tin định tuyến giữa các autonomous systems (AS) trên Internet. BGP cho phép các router quảng bá các route đến các mạng cụ thể.
+
+```text
+                    ┌─────────────────────┐
+                    │  Client Traffic     │
+                    └──────┬──────────────┘
+                           |
+                    ┌──────▼──────────────┐
+                    │  BGP Router         │
+                    │  (AS 64501)         │
+                    └──────┬──────────────┘
+                           │
+         ┌─────────────────┼─────────────────┐
+         │                 │                 │
+    ┌────▼──────┐    ┌───-─▼─────┐    ┌────--▼────┐
+    │  Node 1   │    │  Node 2   │    │  Node 3   │
+    │  Speaker  │    │  Speaker  │    │  Speaker  │
+    │ AS 64500  │    │ AS 64500  │    │ AS 64500  │
+    └─────┬─────┘    └─────┬─────┘    └─────┬─────┘
+          │                │                │
+    ┌─────▼─────┐    ┌─────▼─────┐    ┌─────▼─────┐
+    │  Service  │    │  Service  │    │  Service  │
+    │   Pods    │    │   Pods    │    │   Pods    │
+    └───────────┘    └───────────┘    └───────────┘
+
+BGP advertises:
+192.168.1.240 via Node1
+192.168.1.240 via Node2
+192.168.1.240 via Node3
+```
+
+Chế độ BGP phức tạp hơn nhưng mạnh mẽ hơn:
+- MetalLB thiết lập BGP session với router
+- Quảng bá route đến service IP
+- Cho phép load balancing thực sự (ECMP - Equal Cost Multi-Path)
+- Hỗ trợ multi-path networking
+
+> 📖 **ECMP (Equal Cost Multi-Path)**: Kỹ thuật định tuyến cho phép sử dụng nhiều đường đi có chi phí bằng nhau đến cùng một đích. Traffic sẽ được phân phối đều qua các đường đi này để tăng băng thông và độ tin cậy.
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: BGPPeer
+metadata:
+  name: sample-peer
+  namespace: metallb-system
+spec:
+  myASN: 64500
+  peerASN: 64501
+  peerAddress: 10.0.0.1
+---
+apiVersion: metallb.io/v1beta1
+kind: BGPAdvertisement
+metadata:
+  name: bgp-advert
+  namespace: metallb-system
+```
+
+## Cài đặt MetalLB
+
+### Architecture Overview
+
+```text
+┌─────────────────────────────────────────────────┐
+│            MetalLB System Components            │
+├─────────────────────────────────────────────────┤
+│                                                 │
+│  ┌───────────────────────────────────────────┐  │
+│  │         Controller (Deployment)           │  │
+│  │  • IP address allocation                  │  │
+│  │  • Service watching                       │  │
+│  │  • Configuration management               │  │
+│  │  • Pool assignment                        │  │
+│  └───────────────────────────────────────────┘  │
+│                                                 │
+│  ┌───────────────────────────────────────────┐  │
+│  │      Speaker (DaemonSet - per node)       │  │
+│  │  • ARP/NDP responses (L2 mode)            │  │
+│  │  • BGP peering (BGP mode)                 │  │
+│  │  • Traffic announcement                   │  │
+│  │  • Leader election                        │  │
+│  └───────────────────────────────────────────┘  │
+│                                                 │
+│  ┌───────────────────────────────────────────┐  │
+│  │        Configuration (CRDs)               │  │
+│  │  • IPAddressPool: IP ranges               │  │
+│  │  • L2Advertisement: L2 mode config        │  │
+│  │  • BGPPeer: BGP neighbors                 │  │
+│  │  • BGPAdvertisement: BGP policies         │  │
+│  └───────────────────────────────────────────┘  │
+│                                                 │
+└─────────────────────────────────────────────────┘
+```
+
+### Bước 1: Cài đặt bằng Manifest
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.3/config/manifests/metallb-native.yaml
+```
+
+### Bước 2: Cấu hình IP Pool
+
+> 📖 **IP Pool**: Tập hợp các địa chỉ IP được dành riêng cho MetalLB sử dụng. MetalLB sẽ cấp phát IP từ pool này cho các LoadBalancer Services.
+
+Tạo file `metallb-config.yaml`:
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: first-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 192.168.1.240-192.168.1.250
+  - 192.168.1.252/32
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: example
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - first-pool
+```
+
+Apply cấu hình:
+```bash
+kubectl apply -f metallb-config.yaml
+```
+
+## Ví dụ sử dụng
+
+### Deploy một ứng dụng với LoadBalancer
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:latest
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: nginx
+  ports:
+  - port: 80
+    targetPort: 80
+```
+
+Sau khi apply, kiểm tra service:
+```bash
+kubectl get svc nginx-service
+```
+
+Bạn sẽ thấy EXTERNAL-IP được gán từ pool đã cấu hình.
+
+## Tính năng nâng cao
+
+### 1. Address Pool Selection
+
+Chỉ định pool cụ thể cho service:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-service
+  annotations:
+    metallb.universe.tf/address-pool: production-pool
+spec:
+  type: LoadBalancer
+  selector:
+    app: nginx
+  ports:
+  - port: 80
+```
+
+### 2. IP Sharing
+
+> 📖 **IP Sharing**: Tính năng cho phép nhiều Kubernetes Services sử dụng chung một external IP address, miễn là chúng sử dụng các port khác nhau. Điều này giúp tiết kiệm IP addresses trong môi trường có giới hạn IP.
+
+Nhiều service có thể share cùng một IP:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: service1
+  annotations:
+    metallb.universe.tf/allow-shared-ip: "shared-ip-key"
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.1.240
+  ports:
+  - port: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service2
+  annotations:
+    metallb.universe.tf/allow-shared-ip: "shared-ip-key"
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.1.240
+  ports:
+  - port: 443
+```
+
+### 3. Static IP Assignment
+
+Gán IP cố định cho service:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-static
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.1.245
+  selector:
+    app: nginx
+  ports:
+  - port: 80
+```
+
+## Monitoring và Troubleshooting
+
+
+### Kiểm tra trạng thái MetalLB
+
+```bash
+# Kiểm tra pods
+kubectl get pods -n metallb-system
+
+# Xem logs controller
+kubectl logs -n metallb-system deployment/controller
+
+# Xem logs speaker
+kubectl logs -n metallb-system daemonset/speaker
+```
+
+### Metrics
+
+MetalLB expose Prometheus metrics:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: metallb-metrics
+  namespace: metallb-system
+spec:
+  ports:
+  - name: metrics
+    port: 7472
+  selector:
+    app: metallb
+    component: controller
+```
+
+## Best Practices
+
+### 1. IP Address Planning
+- Dành riêng một dải IP cho MetalLB
+- Không overlap với DHCP range
+- Document IP allocation
+
+### 2. High Availability
+- Sử dụng nhiều replica cho speaker pods
+- Cấu hình node selector phù hợp
+- Monitor health của các nodes
+
+### 3. Security
+- Giới hạn quyền truy cập vào namespace metallb-system
+- Sử dụng Network Policies nếu cần
+- Regular update MetalLB version
+
+### 4. Performance
+- Trong L2 mode, traffic tập trung vào một node
+- BGP mode phân tán traffic tốt hơn
+- Monitor network bandwidth
+
+## So sánh với các giải pháp khác
+
+| Tính năng | MetalLB | HAProxy | NGINX Ingress |
+|-----------|---------|---------|---------------|
+| Layer | L3/L4 | L4/L7 | L7 |
+| Protocol | TCP/UDP | TCP/HTTP | HTTP/HTTPS |
+| Setup | Đơn giản | Trung bình | Đơn giản |
+| HA | Built-in | Manual | Controller HA |
+| Use Case | LoadBalancer Service | Advanced LB | HTTP(S) routing |
+
+## Kết luận
+
+MetalLB là giải pháp không thể thiếu khi triển khai Kubernetes on-premise. Với khả năng cung cấp LoadBalancer service giống như trên cloud, MetalLB giúp đơn giản hóa việc expose services ra bên ngoài cluster. Dù có một số hạn chế về performance trong L2 mode, MetalLB vẫn là lựa chọn tốt nhất cho hầu hết các use case bare metal Kubernetes.
+
+### Tài nguyên tham khảo
+
+- [MetalLB Documentation](https://metallb.universe.tf/)
+- [Kubernetes Service Types](https://kubernetes.io/docs/concepts/services-networking/service/)
+- [BGP Protocol Overview](https://www.cloudflare.com/learning/security/glossary/what-is-bgp/)
+- [ARP Protocol Explained](https://www.fortinet.com/resources/cyberglossary/what-is-arp)
