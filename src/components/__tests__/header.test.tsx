@@ -3,10 +3,18 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 
 import Header from "../header";
+import type { AnchorHTMLAttributes, ReactNode } from "react";
 
 // Mock the next-view-transitions Link component
 vi.mock("next-view-transitions", () => ({
-  Link: ({ children, href, ...props }: any) => (
+  Link: ({
+    children,
+    href,
+    ...props
+  }: AnchorHTMLAttributes<HTMLAnchorElement> & {
+    href: string;
+    children: ReactNode;
+  }) => (
     <a href={href} {...props}>
       {children}
     </a>

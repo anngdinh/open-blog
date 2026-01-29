@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 import { generateFeed } from "../feed";
 import type { MDXFileData } from "../blog";
