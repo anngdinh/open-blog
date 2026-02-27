@@ -1,0 +1,332 @@
+---
+title: "Configure TLS Certificate with HAProxy Ingress and Cert-Manager"
+description: "Step-by-step guide to set up automatic TLS certificates using Cert-Manager, HAProxy Ingress, and HTTP-01 challenge with Let's Encrypt on Kubernetes"
+date: 2026-02-27
+---
+
+## Overview
+
+This guide explains how to set up automatic TLS certificates using:
+
+- **Cert-Manager**: Automates certificate issuance from Let's Encrypt
+- **HAProxy Ingress**: Routes external traffic to your services
+- **HTTP-01 Challenge**: Validates domain ownership
+
+## Prerequisites
+
+- Kubernetes cluster
+- Helm installed
+- A domain pointing to your cluster's public IP (using nip.io or real domain)
+
+## Step 0: Install HAProxy Ingress Controller with Helm
+
+Create a values file for HAProxy configuration:
+
+```yaml
+# haproxy-values.yaml
+controller:
+  kind: DaemonSet
+  logging:
+    level: info
+    traffic:
+      address: stdout
+      facility: daemon
+      format: raw
+  service:
+    externalTrafficPolicy: "Local"
+    annotations:
+      vks.vngcloud.vn/enable-proxy-protocol: "*"
+    enablePorts:
+      admin: false
+      http: true
+      https: true
+      quic: false
+      stat: false
+    enabled: true
+    ports:
+      admin: 6060
+      http: 80
+      https: 443
+      stat: 1024
+    type: LoadBalancer
+  config:
+    proxy-protocol: 0.0.0.0/0
+    src-ip-header: True-Client-IP
+    use-proxy-protocol: "true"
+```
+
+```bash
+# Add HAProxy Technologies Helm repository
+helm repo add haproxytech https://haproxytech.github.io/helm-charts
+helm repo update
+
+# Install HAProxy Ingress Controller with custom values
+helm install haproxy-kubernetes-ingress haproxytech/kubernetes-ingress \
+  --namespace haproxy-controller \
+  --create-namespace \
+  -f haproxy-values.yaml
+```
+
+Verify installation:
+
+```bash
+kubectl get pods -n haproxy-controller
+kubectl get svc -n haproxy-controller
+```
+
+Get the public IP (hostname or IP):
+
+```bash
+# For nip.io or similar
+kubectl get svc -n haproxy-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+# Or if using direct IP
+kubectl get svc -n haproxy-controller -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+# Or get from node
+kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}'
+```
+
+## Architecture
+
+```
+User Request → HAProxy Ingress → Your Service
+                   ↓
+            Cert-Manager → ACME HTTP-01 Challenge → Let's Encrypt
+```
+
+## Step 1: Install Cert-Manager
+
+```bash
+# Add Jetstack Helm repository
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+
+# Install cert-manager
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --version v1.16.1 \
+  --set crds.enabled=true
+```
+
+Verify installation:
+
+```bash
+kubectl get pods -n cert-manager
+```
+
+## Step 2: Create ClusterIssuer
+
+Create a ClusterIssuer for Let's Encrypt production:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: your-email@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - http01:
+        ingress:
+          ingressClassName: haproxy
+```
+
+Apply:
+
+```bash
+kubectl apply -f clusterissuer.yaml
+```
+
+## Step 3: Create Your Service
+
+Create deployment and service using kubectl commands:
+
+```bash
+# Create deployment
+kubectl create deployment echo-server --image=mccutchen/go-httpbin
+
+# Expose deployment as ClusterIP service
+kubectl expose deployment echo-server --name=clusterip --port=80 --target-port=8080 --type=ClusterIP
+```
+
+## Step 4: Create Ingress with TLS
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: echo-server-ingress
+  namespace: default
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    acme.cert-manager.io/http01-edit-in-place: "true"
+    haproxy.org/ssl-redirect: "false"
+    haproxy.org/ssl-redirect-port: "443"
+spec:
+  ingressClassName: haproxy
+  rules:
+  - host: echo-server.YOUR_IP.nip.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: clusterip
+            port:
+              number: 80
+  tls:
+  - hosts:
+    - echo-server.YOUR_IP.nip.io
+    secretName: echo-server-tls
+```
+
+Apply:
+
+```bash
+kubectl apply -f ingress.yaml
+```
+
+## Step 5: Verify Certificate
+
+Check certificate status:
+
+```bash
+kubectl get certificate
+```
+
+Expected output:
+
+```
+NAME              READY   SECRET            AGE
+echo-server-tls   True    echo-server-tls   2m
+```
+
+Verify certificate details:
+
+```bash
+kubectl get secret echo-server-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject -issuer -dates
+```
+
+Expected:
+
+```
+subject=CN = echo-server.YOUR_IP.nip.io
+issuer=C = US, O = Let's Encrypt, CN = R13
+```
+
+Test HTTPS access:
+
+```bash
+curl -k https://echo-server.YOUR_IP.nip.io/
+```
+
+## Troubleshooting
+
+### Issue: Challenge fails with timeout or 503
+
+**Symptom:**
+
+```
+Waiting for HTTP-01 challenge propagation: wrong status code '503'
+```
+
+**Cause:** Network connectivity issue between HAProxy controller and cert-manager solver pods (different namespaces).
+
+**Solution:**
+
+1. Check if HAProxy can reach the solver pod:
+
+   ```bash
+   # From haproxy namespace, test connection to solver
+   kubectl run debug --image=busybox -n haproxy-controller --rm -it -- wget -qO- http://<solver-pod-ip>:8089/
+   ```
+
+2. Check firewall rules - ensure traffic is allowed between namespaces
+
+3. Check HAProxy logs:
+
+   ```bash
+   kubectl logs -n haproxy-controller deploy/haproxy-kubernetes-ingress --tail=50
+   ```
+
+### Issue: Certificate shows "cert-manager.local" as issuer
+
+**Symptom:**
+
+```
+issuer=CN = cert-manager.local
+```
+
+**Cause:** HTTP-01 challenge failed, cert-manager issued a temporary certificate.
+
+**Solution:**
+
+1. Delete the certificate and secret:
+
+   ```bash
+   kubectl delete certificate echo-server-tls
+   kubectl delete secret echo-server-tls
+   ```
+
+2. Check challenge status:
+
+   ```bash
+   kubectl get challenge -n default
+   ```
+
+3. Review cert-manager logs:
+
+   ```bash
+   kubectl logs -n cert-manager deploy/cert-manager --tail=100
+   ```
+
+### Issue: Different IP after LoadBalancer recreation
+
+**Symptom:** Domain points to old IP.
+
+**Solution:** Always use the current public IP when creating ingress:
+
+```yaml
+host: echo-server.YOUR_CURRENT_IP.nip.io
+```
+
+## Important Notes
+
+1. **Namespace Consideration**: If your HAProxy controller is in a different namespace than your app, ensure network policies allow communication between namespaces.
+
+2. **HTTP-01 vs DNS-01**:
+   - HTTP-01: Requires port 80 to be accessible, doesn't work with some LoadBalancers
+   - DNS-01: Requires DNS provider API access, more reliable for internal/restricted networks
+
+3. **Rate Limiting**: Let's Encrypt has rate limits. Use staging for testing:
+
+   ```yaml
+   server: https://acme-staging-v02.api.letsencrypt.org/directory
+   ```
+
+4. **HAProxy Annotations**:
+   - `haproxy.org/ssl-redirect: "false"` - Disable automatic HTTP to HTTPS redirect
+   - `haproxy.org/ssl-redirect-port: "443"` - Specify HTTPS port
+
+## Quick Reference
+
+| Command | Description |
+|---------|-------------|
+| `kubectl get certificate` | List all certificates |
+| `kubectl describe certificate echo-server-tls` | Get certificate details |
+| `kubectl get challenge` | List ACME challenges |
+| `kubectl get order` | List ACME orders |
+| `kubectl logs -n cert-manager deploy/cert-manager` | View cert-manager logs |
+| `kubectl get pods -n haproxy-controller` | Check HAProxy pods |
+| `kubectl logs -n haproxy-controller deploy/haproxy-kubernetes-ingress` | Check HAProxy logs |
+
+## References
+
+- [Cert-Manager Documentation](https://cert-manager.io/docs/)
+- [HAProxy Ingress Controller](https://www.haproxy.com/documentation/kubernetes/latest/installation/)
+- [Let's Encrypt Rate Limits](https://letsencrypt.org/docs/rate-limits/)
