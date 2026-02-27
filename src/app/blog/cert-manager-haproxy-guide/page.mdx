@@ -118,7 +118,8 @@ kubectl get pods -n cert-manager
 
 Create a ClusterIssuer for Let's Encrypt production:
 
-```yaml
+```bash
+kubectl apply -f - <<EOF
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
@@ -133,12 +134,7 @@ spec:
     - http01:
         ingress:
           ingressClassName: haproxy
-```
-
-Apply:
-
-```bash
-kubectl apply -f clusterissuer.yaml
+EOF
 ```
 
 ## Step 3: Create Your Service
@@ -155,7 +151,8 @@ kubectl expose deployment echo-server --name=clusterip --port=80 --target-port=8
 
 ## Step 4: Create Ingress with TLS
 
-```yaml
+```bash
+kubectl apply -f - <<EOF
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -183,12 +180,7 @@ spec:
   - hosts:
     - echo-server.YOUR_IP.nip.io
     secretName: echo-server-tls
-```
-
-Apply:
-
-```bash
-kubectl apply -f ingress.yaml
+EOF
 ```
 
 ## Step 5: Verify Certificate
