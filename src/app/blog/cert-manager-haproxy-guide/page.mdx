@@ -322,3 +322,93 @@ host: echo-server.YOUR_CURRENT_IP.nip.io
 - [Cert-Manager Documentation](https://cert-manager.io/docs/)
 - [HAProxy Ingress Controller](https://www.haproxy.com/documentation/kubernetes/latest/installation/)
 - [Let's Encrypt Rate Limits](https://letsencrypt.org/docs/rate-limits/)
+
+---
+
+## HAProxy Ingress Basic Auth Guide
+
+This guide explains how to configure basic authentication for HAProxy Kubernetes Ingress Controller.
+
+### Prerequisites
+
+- HAProxy Kubernetes Ingress Controller installed (version 3.x)
+- kubectl access to your cluster
+
+### Step 1: Generate Password Hash
+
+Use `openssl` to generate an MD5 hash of your password:
+
+```bash
+openssl passwd -1 MySecurePass123
+# Output: $1$q5qyFtK8$Wnn1Xpzr1oZraDf7i6Zmp.
+```
+
+### Step 2: Create Secret
+
+Create a Kubernetes secret with the following format:
+
+- **Key**: username (e.g., `admin`)
+- **Value**: password hash (from step 1, without the `username:` prefix)
+
+```bash
+kubectl create secret generic basic-auth \
+  --from-literal=admin='$1$q5qyFtK8$Wnn1Xpzr1oZraDf7i6Zmp.' \
+  -n <namespace>
+```
+
+Place the secret in the same namespace as your ingress, or note the namespace for step 3.
+
+### Step 3: Configure Ingress
+
+Add the following annotations to your ingress:
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  namespace: <namespace>
+  annotations:
+    haproxy.org/auth-type: basic-auth
+    haproxy.org/auth-secret: <namespace>/basic-auth
+spec:
+  ingressClassName: haproxy
+  # ... rest of your ingress config
+EOF
+```
+
+#### Important Notes
+
+1. **Annotation prefix**: Use `haproxy.org/` (not `ingress.kubernetes.io/`)
+2. **Auth type value**: Use `basic-auth` (not `basic`)
+3. **Secret format**: The secret key should be the username, and the value should be the password hash (not `username:hash`)
+4. **Secret location**: The secret must be in the same namespace as the ingress, or use `namespace/secret-name` format
+
+### Step 4: Verify
+
+Test the configuration:
+
+```bash
+# Should return 401 (unauthorized)
+curl -I https://your-domain.com/
+
+# Should return 200 (authorized)
+curl -u admin:MySecurePass123 https://your-domain.com/
+```
+
+### Troubleshooting
+
+#### Still getting 401 after correct credentials?
+
+- Ensure the secret key is the username (not `auth` or anything else)
+- Use `openssl passwd -1` to generate the hash (not `htpasswd` - they may produce different formats)
+- Verify the ingress has the correct annotations with `kubectl describe ingress <name>`
+
+#### Common mistakes
+
+| Wrong | Correct |
+|-------|---------|
+| `ingress.kubernetes.io/auth-type: basic` | `haproxy.org/auth-type: basic-auth` |
+| Key: `auth`, Value: `user:hash` | Key: `username`, Value: `hash` |
+| Secret in different namespace without prefix | Same namespace or `namespace/secret-name` |
