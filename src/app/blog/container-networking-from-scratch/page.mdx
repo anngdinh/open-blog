@@ -1,0 +1,717 @@
+---
+title: "Container Networking from Scratch: Hands-On Guide"
+description: "Tìm hiểu container networking từ đầu bằng cách tự tay xây dựng từ veth pair, bridge, NAT đến CNI plugin - hiểu sâu cách Kubernetes kết nối các Pod"
+date: 2026-04-04
+---
+
+## Giới thiệu
+
+Bạn đã bao giờ tự hỏi: **Làm thế nào các container trong Kubernetes có thể giao tiếp với nhau?** Đằng sau mỗi Pod IP, mỗi Service ClusterIP là một hệ thống networking phức tạp được xây dựng từ những building blocks cơ bản của Linux.
+
+Trong bài viết này, chúng ta sẽ **tự tay xây dựng** container networking từ đầu, bắt đầu từ những khái niệm đơn giản nhất và dần dần tiến đến cách Kubernetes thực sự hoạt động. Mỗi phần đều có code chạy được - bạn hoàn toàn có thể thực hành trên một máy Linux bất kỳ.
+
+```text
+Lộ trình học:
+
+1. veth pair          ──  Kết nối 2 network namespace
+2. Multiple ns        ──  Routing giữa nhiều container
+3. Bridge             ──  Mô hình mạng Docker
+4. NAT & Port forward ──  Expose service ra ngoài
+5. CNI Plugin         ──  Cách Kubernetes tự động hóa tất cả
+6. Docker thực tế     ──  Áp dụng vào container thật
+```
+
+## Kiến thức nền tảng
+
+Trước khi bắt đầu, hãy nắm vững 3 khái niệm cốt lõi:
+
+> **Network Namespace**: Là cơ chế isolation của Linux kernel, cho phép mỗi namespace có bộ network interfaces, routing table, và iptables rules riêng biệt. Mỗi container trong Docker/Kubernetes chạy trong một network namespace riêng.
+
+> **veth pair (Virtual Ethernet)**: Là một cặp interface ảo hoạt động như một đường ống - packet gửi vào một đầu sẽ xuất hiện ở đầu kia. Đây là cách duy nhất để kết nối hai network namespace.
+
+> **Bridge**: Là một switch ảo Layer 2, cho phép nhiều interface kết nối vào và giao tiếp với nhau. Docker sử dụng bridge (`docker0`) để kết nối các container.
+
+## 1. veth pair - Kết nối root namespace với container
+
+Bắt đầu từ trường hợp đơn giản nhất: kết nối root namespace (host) với một network namespace (container).
+
+```text
+┌─────────────────────────────────────────────────────┐
+│                 Root Namespace (Host)               │
+│                                                     │
+│    veth0 (10.0.0.201/24)                            │
+│      │                                              │
+│      │  veth pair                                   │
+│      │                                              │
+│  ┌───┼──────────────────────────────────────────┐   │
+│  │   │         Network Namespace: netns1        │   │
+│  │   │                                          │   │
+│  │  veth1 (10.0.0.101/24)                       │   │
+│  │                                              │   │
+│  └──────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+```
+
+```bash
+# Tạo network namespace (tương đương tạo một "container" về mặt network)
+ip netns add netns1
+
+# Tạo veth pair: veth0 <-> veth1
+ip link add veth0 type veth peer name veth1
+
+# Chuyển veth1 vào namespace netns1
+ip link set veth1 netns netns1
+
+# Cấu hình IP cho phía host (root namespace)
+ip addr add 10.0.0.201/24 dev veth0
+ip link set veth0 up
+
+# Cấu hình IP cho phía container (namespace netns1)
+ip netns exec netns1 ip addr add 10.0.0.101/24 dev veth1
+ip netns exec netns1 ip link set veth1 up
+```
+
+Test kết nối:
+
+```bash
+# Host -> Container
+ping 10.0.0.101
+
+# Container -> Host
+ip netns exec netns1 ping 10.0.0.201
+```
+
+Cả hai chiều đều ping thành công vì chúng nằm trong cùng subnet `10.0.0.0/24`.
+
+```bash
+# Cleanup
+ip netns del netns1
+```
+
+**Takeaway**: veth pair là building block cơ bản nhất - một đường ống kết nối hai network namespace.
+
+## 2. Multiple Namespaces - Routing giữa các container
+
+Thực tế, một host chạy nhiều container. Làm thế nào để chúng giao tiếp với nhau?
+
+```text
+┌───────────────────────────────────────────────────────────┐
+│                    Root Namespace (Host)                  │
+│                                                           │
+│  veth0 (10.0.0.201/24)          veth2 (10.0.1.201/24)     │
+│    │                              │                       │
+│    │ veth pair                    │ veth pair             │
+│    │                              │                       │
+│  ┌─┼───────────────────┐   ┌──────┼──────────────────┐    │
+│  │ │    netns1         │   │      │      netns2      │    │
+│  │ │                   │   │      │                  │    │
+│  │ veth1               │   │     veth3               │    │
+│  │ (10.0.0.101/24)     │   │     (10.0.1.101/24)     │    │
+│  └─────────────────────┘   └─────────────────────────┘    │
+└───────────────────────────────────────────────────────────┘
+```
+
+```bash
+# Tạo 2 namespace
+ip netns add netns1
+ip netns add netns2
+
+# Tạo 2 veth pair
+ip link add veth0 type veth peer name veth1
+ip link add veth2 type veth peer name veth3
+
+# Gán veth vào namespace tương ứng
+ip link set veth1 netns netns1
+ip link set veth3 netns netns2
+
+# Cấu hình IP - lưu ý mỗi pair dùng subnet khác nhau
+ip addr add 10.0.0.201/24 dev veth0
+ip addr add 10.0.1.201/24 dev veth2
+ip link set veth0 up
+ip link set veth2 up
+
+# Cấu hình namespace 1
+ip netns exec netns1 ip addr add 10.0.0.101/24 dev veth1
+ip netns exec netns1 ip link set veth1 up
+
+# Cấu hình namespace 2
+ip netns exec netns2 ip addr add 10.0.1.101/24 dev veth3
+ip netns exec netns2 ip link set veth3 up
+```
+
+Lúc này host có thể ping đến cả hai namespace:
+
+```bash
+ping 10.0.0.101   # OK - cùng subnet với veth0
+ping 10.0.1.101   # OK - cùng subnet với veth2
+```
+
+Nhưng **netns1 không thể ping netns2** vì chúng ở khác subnet và không có route. Để fix:
+
+```bash
+# Thêm default route cho mỗi namespace, trỏ về host
+ip netns exec netns1 ip route add default via 10.0.0.201 dev veth1
+ip netns exec netns2 ip route add default via 10.0.1.201 dev veth3
+
+# Bật IP forwarding trên host (cho phép host đóng vai trò router)
+sysctl -w net.ipv4.ip_forward=1
+iptables -P FORWARD ACCEPT
+```
+
+Giờ netns1 có thể ping netns2 vì traffic đi: `netns1 → host (forward) → netns2`.
+
+```bash
+ip netns exec netns1 ping 10.0.1.101   # OK!
+ip netns exec netns2 ping 10.0.0.101   # OK!
+```
+
+```bash
+# Cleanup
+ip netns del netns1
+ip netns del netns2
+```
+
+**Vấn đề**: Mô hình này không scale - mỗi container cần một veth pair riêng vào host và một subnet riêng. Giải pháp? **Bridge**.
+
+## 3. Bridge - Mô hình mạng Docker
+
+Bridge (cầu nối) hoạt động như một virtual switch Layer 2. Tất cả container kết nối vào cùng một bridge và chia sẻ một subnet.
+
+```text
+┌──────────────────────────────────────────────────────────┐
+│                    Root Namespace (Host)                 │
+│                                                          │
+│             ┌─────────────────────────┐                  │
+│             │   br0 (10.0.0.1/24)     │                  │
+│             │      Virtual Bridge     │                  │
+│             └──┬──────────────────┬───┘                  │
+│                │                  │                      │
+│    veth0 ──────┘                  └────── veth2          │
+│      │                                     │             │
+│      │ veth pair                           │ veth pair   │
+│      │                                     │             │
+│  ┌───┼──────────────────┐  ┌───────────────┼─────────┐   │
+│  │   │    netns1        │  │               │ netns2  │   │
+│  │  veth1               │  │             veth3       │   │
+│  │  (10.0.0.101/24)     │  │             (10.0.0.102/24) │
+│  └──────────────────────┘  └─────────────────────────┘   │
+└──────────────────────────────────────────────────────────┘
+```
+
+> Đây chính là cách Docker kết nối container! `docker0` bridge chính là br0 trong ví dụ này.
+
+```bash
+# Tạo namespace và veth pair (giống phần trước)
+ip netns add netns1
+ip netns add netns2
+ip link add veth0 type veth peer name veth1
+ip link add veth2 type veth peer name veth3
+ip link set veth1 netns netns1
+ip link set veth3 netns netns2
+
+# Tạo bridge - đây là điểm khác biệt!
+ip link add name br0 type bridge
+ip addr add 10.0.0.1/24 dev br0
+ip link set br0 up
+
+# Kết nối veth vào bridge (thay vì gán IP cho veth phía host)
+ip link set veth0 master br0
+ip link set veth2 master br0
+ip link set veth0 up
+ip link set veth2 up
+
+# Cấu hình namespace 1 - chú ý cùng subnet 10.0.0.0/24
+ip netns exec netns1 ip addr add 10.0.0.101/24 dev veth1
+ip netns exec netns1 ip link set veth1 up
+ip netns exec netns1 ip route add default via 10.0.0.1 dev veth1
+
+# Cấu hình namespace 2
+ip netns exec netns2 ip addr add 10.0.0.102/24 dev veth3
+ip netns exec netns2 ip link set veth3 up
+ip netns exec netns2 ip route add default via 10.0.0.1 dev veth3
+```
+
+Giờ **tất cả đều có thể ping nhau**:
+
+```bash
+# Host <-> Container
+ping 10.0.0.101
+ping 10.0.0.102
+
+# Container <-> Host
+ip netns exec netns1 ping 10.0.0.1
+ip netns exec netns2 ping 10.0.0.1
+
+# Container <-> Container (thông qua bridge, không cần routing!)
+ip netns exec netns1 ping 10.0.0.102
+ip netns exec netns2 ping 10.0.0.101
+```
+
+Nhưng container **chưa thể truy cập internet** vì packet từ `10.0.0.0/24` ra ngoài sẽ bị drop (IP nguồn là private, không routable). Cần thêm **NAT**:
+
+```bash
+# Tìm default interface của host
+gw_dev=$(ip -j route show | jq -r '.[]|select(.dst=="default")|.dev')
+
+# MASQUERADE: thay đổi source IP của packet từ container thành IP của host
+iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o $gw_dev -j MASQUERADE
+```
+
+> **MASQUERADE** là một dạng Source NAT (SNAT) - khi container gửi packet ra internet, kernel sẽ thay source IP (`10.0.0.101`) thành IP của host interface. Khi response quay về, kernel tự động đổi lại destination IP về container. Đây chính xác là cách Docker cho phép container truy cập internet!
+
+```bash
+# Container giờ có thể truy cập internet
+ip netns exec netns1 ping 8.8.8.8
+```
+
+```bash
+# Cleanup
+ip netns del netns1
+ip netns del netns2
+ip link del br0
+gw_dev=$(ip -j route show | jq -r '.[]|select(.dst=="default")|.dev')
+iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o $gw_dev -j MASQUERADE
+```
+
+**Takeaway**: Bridge + NAT = mô hình mạng Docker. Tất cả container cùng subnet, bridge đóng vai trò switch, NAT cho phép truy cập internet.
+
+## 4. Expose Service - Port Forwarding với iptables
+
+Ở phần trước, container đã có thể truy cập internet (outbound). Nhưng làm sao để bên ngoài truy cập vào service trong container (inbound)?
+
+```text
+┌───────────┐       ┌──────────────────────────────────────┐
+│  Client   │       │           Host (192.168.56.12)       │
+│ (External)│       │                                      │
+└─────┬─────┘       │  iptables DNAT:                      │
+      │             │  192.168.56.12:80 → 10.0.0.101:8080  │
+      │ :80         │                                      │
+      └────────────►│    ┌──────────────────────────┐      │
+                    │    │      netns1              │      │
+                    │    │  python3 -m http.server  │      │
+                    │    │  listening on :8080      │      │
+                    │    │  IP: 10.0.0.101          │      │
+                    │    └──────────────────────────┘      │
+                    └──────────────────────────────────────┘
+```
+
+```bash
+# Setup cơ bản: 1 namespace với HTTP server
+ip netns add netns1
+ip link add veth0 type veth peer name veth1
+ip link set veth1 netns netns1
+
+ip addr add 10.0.0.201/24 dev veth0
+ip link set veth0 up
+
+ip netns exec netns1 ip addr add 10.0.0.101/24 dev veth1
+ip netns exec netns1 ip link set veth1 up
+ip netns exec netns1 ip route add default via 10.0.0.201 dev veth1
+
+# Chạy HTTP server trong container
+ip netns exec netns1 python3 -m http.server 8080 &
+```
+
+Từ host, truy cập service hoạt động bình thường:
+
+```bash
+curl 10.0.0.101:8080   # OK
+```
+
+Nhưng từ bên ngoài, cần **DNAT (Destination NAT)** để chuyển tiếp traffic:
+
+```bash
+# Cho phép forwarding
+iptables -P FORWARD ACCEPT
+
+# Rule 1: PREROUTING - cho traffic đến từ bên ngoài
+# Khi packet đến host IP:80, đổi destination thành container IP:8080
+iptables -t nat -A PREROUTING -d 192.168.56.12 -p tcp -m tcp --dport 80 \
+  -j DNAT --to-destination 10.0.0.101:8080
+
+# Rule 2: OUTPUT - cho traffic từ chính host
+# Cần rule riêng vì traffic local không đi qua PREROUTING chain
+iptables -t nat -A OUTPUT -d 192.168.56.12 -p tcp -m tcp --dport 80 \
+  -j DNAT --to-destination 10.0.0.101:8080
+```
+
+> **Tại sao cần 2 rules?** iptables có các chain khác nhau tùy nguồn gốc traffic:
+> - **PREROUTING**: xử lý packet đến từ network bên ngoài
+> - **OUTPUT**: xử lý packet được tạo bởi chính host
+>
+> Đây chính là cách Kubernetes Service type NodePort hoạt động - iptables rules DNAT traffic từ NodePort đến Pod IP.
+
+```bash
+# Cleanup
+ip netns del netns1
+iptables -t nat -D PREROUTING -d 192.168.56.12 -p tcp -m tcp --dport 80 \
+  -j DNAT --to-destination 10.0.0.101:8080
+iptables -t nat -D OUTPUT -d 192.168.56.12 -p tcp -m tcp --dport 80 \
+  -j DNAT --to-destination 10.0.0.101:8080
+```
+
+## 5. CNI Plugin - Cách Kubernetes tự động hóa tất cả
+
+Đến đây bạn đã hiểu cách networking hoạt động ở mức thấp. Nhưng Kubernetes không yêu cầu admin tự tay chạy các lệnh `ip` - thay vào đó, nó sử dụng **CNI (Container Network Interface)**.
+
+### CNI là gì?
+
+CNI là một specification (đặc tả) của CNCF định nghĩa cách container runtime (Docker, containerd, CRI-O) giao tiếp với network plugin. Khi một Pod được tạo:
+
+```text
+┌───────────┐     ┌──────────────┐     ┌─────────────────────────────┐
+│  kubelet  │────►│     CRI      │────►│        CNI Plugin           │
+│           │     │ (containerd) │     │  1. Tạo veth pair           │
+│ "Tạo Pod" │     │              │     │  2. Gán vào bridge/network  │
+│           │     │"Cần network" │     │  3. Cấp IP (IPAM)           │
+│           │     │              │     │  4. Setup routes            │
+└───────────┘     └──────────────┘     └─────────────────────────────┘
+```
+
+CNI chỉ cần implement 2 operations:
+- **ADD**: Thêm network interface cho container
+- **DEL**: Xóa network interface khi container bị xóa
+
+### Thực hành: Gọi CNI plugin trực tiếp
+
+Hãy tự tay sử dụng CNI plugin để cấp network cho một Docker container:
+
+```bash
+# Bước 1: Download CNI plugins
+curl -OL \
+  https://github.com/containernetworking/plugins/releases/download/v1.5.0/cni-plugins-linux-amd64-v1.5.0.tgz
+mkdir cni-bin
+tar -C cni-bin -xzf cni-plugins-linux-amd64-v1.5.0.tgz
+rm -rf cni-plugins-linux-amd64-v1.5.0.tgz
+```
+
+```bash
+# Bước 2: Chạy container KHÔNG có network
+docker run -d --rm --network none --name alpine1 -t nginx:alpine
+
+# Xác nhận container chỉ có loopback
+docker exec alpine1 ip a        # Chỉ có lo
+docker exec alpine1 ip route    # Không có route nào
+```
+
+```bash
+# Bước 3: Tạo CNI config
+cat <<EOF > bridge.conf
+{
+    "cniVersion": "1.0.0",
+    "name": "devops",
+    "type": "bridge",
+    "bridge": "devops0",
+    "isGateway": true,
+    "ipMasq": true,
+    "ipam": {
+        "type": "host-local",
+        "subnet": "10.0.0.0/24",
+        "routes": [
+            { "dst": "0.0.0.0/0" }
+        ],
+        "rangeStart": "10.0.0.2",
+        "rangeEnd": "10.0.0.5",
+        "gateway": "10.0.0.1"
+    },
+    "dns": {
+        "nameservers": [ "1.1.1.1" ]
+    }
+}
+EOF
+```
+
+Config này nói với CNI plugin:
+- **type: bridge** → dùng bridge plugin (giống phần 3 ở trên!)
+- **isGateway: true** → bridge sẽ có IP, đóng vai trò gateway
+- **ipMasq: true** → tự động thêm MASQUERADE rule (giống phần 3!)
+- **ipam.type: host-local** → cấp IP từ pool local trên host
+
+```bash
+# Bước 4: Gọi CNI ADD - thêm network cho container
+container_id=$(docker inspect -f '{{.Id}}' alpine1)
+container_namespace=$(docker inspect alpine1 | jq -r '.[].NetworkSettings.SandboxKey')
+
+CNI_PATH=$(pwd)/cni-bin \
+    CNI_COMMAND=ADD \
+    CNI_CONTAINERID=$container_id \
+    CNI_NETNS=$container_namespace \
+    CNI_IFNAME=eth10 \
+    ./cni-bin/bridge <bridge.conf
+```
+
+CNI plugin trả về JSON mô tả kết quả:
+
+```json
+{
+    "cniVersion": "1.0.0",
+    "interfaces": [
+        { "name": "devops0", "mac": "5a:4e:aa:41:27:78" },
+        { "name": "veth568773e8", "mac": "b2:7f:9c:ad:76:10" },
+        { "name": "eth10", "mac": "4a:82:ea:14:6d:54",
+          "sandbox": "/var/run/docker/netns/f0b18d774f4e" }
+    ],
+    "ips": [
+        { "interface": 2, "address": "10.0.0.2/24", "gateway": "10.0.0.1" }
+    ],
+    "routes": [{ "dst": "0.0.0.0/0" }],
+    "dns": { "nameservers": ["1.1.1.1"] }
+}
+```
+
+Nhìn kỹ - CNI plugin đã tự động thực hiện **tất cả những gì chúng ta làm thủ công** ở các phần trước:
+- Tạo bridge `devops0` (như `br0`)
+- Tạo veth pair (`veth568773e8` ↔ `eth10`)
+- Gán IP `10.0.0.2/24` cho container
+- Setup default route qua gateway `10.0.0.1`
+
+```bash
+# Xác nhận trên host
+ip a show devops0
+# devops0: <BROADCAST,MULTICAST,UP> ... inet 10.0.0.1/24 ...
+
+# Xác nhận trong container
+docker exec alpine1 ip a show eth10
+# eth10: ... inet 10.0.0.2/24 ...
+
+docker exec alpine1 ip route show
+# default via 10.0.0.1 dev eth10
+
+# NAT rules được tạo tự động
+iptables -S -t nat | grep 10.0.0
+# -A POSTROUTING ... -s 10.0.0.0/24 ... -j MASQUERADE
+```
+
+```bash
+# Container giờ có internet!
+docker exec alpine1 ping 1.1.1.1
+```
+
+```bash
+# Cleanup: Gọi CNI DEL
+CNI_PATH=$(pwd)/cni-bin \
+    CNI_COMMAND=DEL \
+    CNI_CONTAINERID=$container_id \
+    CNI_NETNS=$container_namespace \
+    CNI_IFNAME=eth10 \
+    ./cni-bin/bridge <bridge.conf
+
+docker rm -f alpine1
+```
+
+**Takeaway**: CNI plugin tự động hóa toàn bộ quy trình mà chúng ta đã học: tạo bridge, veth pair, gán IP, setup routing, và NAT. Kubernetes gọi CNI plugin mỗi khi tạo/xóa Pod.
+
+## 6. Docker Container Networking - Kỹ thuật nâng cao
+
+Trong phần cuối này, chúng ta sẽ thực hiện hai kỹ thuật networking nâng cao mà các CNI plugin thực tế (như AWS VPC CNI) sử dụng.
+
+### 6.1 Manual networking cho Docker container
+
+Docker ẩn network namespace của container - `ip netns` không hiển thị chúng. Cần tạo symlink thủ công:
+
+```bash
+# Chạy container không có network
+docker run -d --rm --network none --name alpine1 -t nginx:alpine
+container_id=$(docker inspect -f '{{.Id}}' alpine1)
+
+# Tạo symlink để ip netns "thấy" namespace của container
+pid=$(docker inspect -f '{{.State.Pid}}' ${container_id})
+mkdir -p /var/run/netns/
+ln -sfT /proc/$pid/ns/net /var/run/netns/$container_id
+```
+
+> **Tại sao `ip netns` không thấy Docker namespace?**
+> `ip netns` chỉ liệt kê các namespace có symlink trong `/var/run/netns/`. Docker tạo namespace nhưng không tạo symlink này. Tạo symlink thủ công để có thể sử dụng các tool như `ip netns exec`.
+
+```bash
+# Tạo veth pair và cấu hình
+ip link add veth0 type veth peer name veth1
+ip link set veth1 netns $container_id
+
+# Cấu hình IP cho container
+ip netns exec $container_id ip addr add 11.0.0.99/24 dev veth1
+ip netns exec $container_id ip link set veth1 up
+ip netns exec $container_id ip route add 0.0.0.0/0 dev veth1 \
+  proto kernel scope link src 11.0.0.99
+
+# Cấu hình phía host
+ip link set veth0 up
+ip route add 11.0.0.99 dev veth0 scope link
+
+# Bật IP forwarding
+sysctl -w net.ipv4.ip_forward=1
+iptables -P FORWARD ACCEPT
+```
+
+Lúc này host có thể ping container, nhưng container **không thể ping host** vì thiếu ARP entry:
+
+```bash
+# Container không biết MAC address của gateway
+ip netns exec $container_id arp -n   # Empty!
+
+# Lấy IP và MAC của host interface
+host_ip=$(ip -4 addr show veth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+# Hoặc dùng IP thực của host, ví dụ: host_ip=10.0.0.17
+host_mac=$(cat /sys/class/net/veth0/address)
+
+# Thêm static ARP entry
+ip netns exec $container_id arp -s $host_ip $host_mac
+
+# Giờ đã hoạt động
+ip netns exec $container_id ping $host_ip
+```
+
+> **ARP (Address Resolution Protocol)**: Khi container muốn gửi packet đến một IP, nó cần biết MAC address của next-hop. Thông thường, ARP tự động resolve, nhưng trong setup thủ công cần static entry vì không có ARP proxy.
+
+```bash
+# Cleanup
+docker rm -f alpine1
+ip netns del $container_id
+```
+
+### 6.2 Secondary IP với Link-Local Gateway
+
+Kỹ thuật này được sử dụng bởi **AWS VPC CNI** và **Calico** - thay vì gán subnet cho container, chỉ gán một IP duy nhất (`/32`) và sử dụng link-local address làm gateway.
+
+```text
+┌──────────────────────────────────────────────────────┐
+│                      Host                            │
+│                                                      │
+│  veth0                                               │
+│    │          Route: 10.0.0.5/32 → dev veth0         │
+│    │                                                 │
+│    │  veth pair                                      │
+│    │                                                 │
+│  ┌─┼─────────────────────────────────────────────┐   │
+│  │ │              Container                      │   │
+│  │ veth1 (10.0.0.5/32)                           │   │
+│  │                                               │   │
+│  │ Default route: via 169.254.1.1                │   │
+│  │ Static ARP: 169.254.1.1 → MAC(veth0)          │   │
+│  └───────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────┘
+```
+
+```bash
+ndIP=10.0.0.5
+
+# Setup container
+docker run -d --rm --network none --name alpine1 -t nginx:alpine
+container_id=$(docker inspect -f '{{.Id}}' alpine1)
+pid=$(docker inspect -f '{{.State.Pid}}' ${container_id})
+mkdir -p /var/run/netns/
+ln -sfT /proc/$pid/ns/net /var/run/netns/$container_id
+
+# Tạo veth pair
+ip link add veth0 type veth peer name veth1
+ip link set veth1 netns $container_id
+```
+
+Điểm khác biệt quan trọng - gán IP /32 và dùng link-local gateway:
+
+```bash
+# Gán IP /32 (chỉ 1 IP, không phải subnet)
+ip netns exec $container_id ip addr add $ndIP/32 dev veth1
+
+# Trick: Dùng 169.254.1.1 làm gateway
+# 169.254.x.x là link-local range - không cần thực sự tồn tại!
+# Container chỉ cần biết MAC address của veth0 để gửi packet
+veth0_mac_add=$(cat /sys/class/net/veth0/address)
+ip netns exec $container_id arp -i veth1 -s 169.254.1.1 $veth0_mac_add
+
+# Enable interface và setup routes
+ip netns exec $container_id ip link set veth1 up
+ip netns exec $container_id ip route add 169.254.1.1 dev veth1 scope link
+ip netns exec $container_id ip route add default via 169.254.1.1 dev veth1
+```
+
+> **Tại sao 169.254.1.1?** Đây là địa chỉ link-local - không thuộc bất kỳ subnet nào. Container không cần biết topology mạng, chỉ cần gửi mọi traffic đến MAC address của veth0 phía host. Host sẽ route tiếp. Kỹ thuật này cho phép:
+> - Gán **bất kỳ IP nào** cho container mà không cần subnet matching
+> - **AWS VPC CNI** dùng kỹ thuật này để gán secondary IP của ENI cho Pod
+> - **Calico** cũng dùng kỹ thuật tương tự
+
+```bash
+# Host side: route /32 đến veth0
+ip link set veth0 up
+ip route add $ndIP/32 dev veth0 scope link
+
+# Bật IP forwarding
+sysctl -w net.ipv4.ip_forward=1
+
+# Policy routing (ưu tiên route này)
+ip rule add from all to $ndIP/32 table main prio 512
+
+# NAT cho traffic ra internet (tự động detect default interface)
+gw_dev=$(ip -j route show | jq -r '.[]|select(.dst=="default")|.dev')
+iptables -t nat -A POSTROUTING ! -d 10.0.0.0/16 -s $ndIP/32 -o $gw_dev -j MASQUERADE
+```
+
+```bash
+# Test
+ping $ndIP                              # Host -> Container: OK
+ip netns exec $container_id ping 1.1.1.1  # Container -> Internet: OK
+```
+
+```bash
+# Debug tool hữu ích
+tcpdump -nn -i any icmp -l                              # Trên host
+ip netns exec $container_id tcpdump -nn -i any icmp -l   # Trong container
+```
+
+```bash
+# Cleanup
+docker rm -f alpine1
+ip netns del $container_id
+ip rule del from all to $ndIP/32 table main prio 512
+ip route del $ndIP/32 dev veth0 scope link
+```
+
+## Tổng kết
+
+Qua 6 phần thực hành, chúng ta đã xây dựng container networking từ đầu:
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                    Container Networking Stack               │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  CNI Plugin (Phần 5)                                        │
+│  └── Tự động hóa toàn bộ quy trình bên dưới                 │
+│                                                             │
+│  Port Forwarding / DNAT (Phần 4)                            │
+│  └── Expose service ra bên ngoài (→ K8s NodePort/Service)   │
+│                                                             │
+│  NAT / MASQUERADE (Phần 3)                                  │
+│  └── Cho phép container truy cập internet                   │
+│                                                             │
+│  Bridge (Phần 3)                                            │
+│  └── Virtual switch kết nối các container (→ docker0)       │
+│                                                             │
+│  Routing (Phần 2)                                           │
+│  └── Chuyển tiếp traffic giữa các subnet                    │
+│                                                             │
+│  veth pair (Phần 1)                                         │
+│  └── Kết nối network namespace với host                     │
+│                                                             │
+│  Network Namespace                                          │
+│  └── Isolation cho mỗi container                            │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+| Khái niệm | Trong Kubernetes |
+|---|---|
+| Network namespace | Mỗi Pod có một namespace riêng |
+| veth pair | Kết nối Pod ns với host ns |
+| Bridge | Một số CNI dùng bridge (Flannel, bridge plugin) |
+| NAT/MASQUERADE | Cho phép Pod truy cập internet |
+| DNAT/Port forward | Service NodePort, kube-proxy iptables rules |
+| /32 + link-local gateway | AWS VPC CNI, Calico |
+| CNI plugin | Flannel, Calico, Cilium, AWS VPC CNI |
+
+### Tài nguyên tham khảo
+
+- [CNI Specification](https://www.cni.dev/docs/spec/)
+- [Kubernetes Networking Model](https://kubernetes.io/docs/concepts/cluster-administration/networking/)
+- [CNI Plugins Reference](https://www.cni.dev/plugins/current/)
+- [Benchmark: Kubernetes Network Plugins over 40Gbit/s](https://itnext.io/benchmark-results-of-kubernetes-network-plugins-cni-over-40gbit-s-network-2024-156f085a5e4e)
