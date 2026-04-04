@@ -1,0 +1,410 @@
+---
+title: "Cấu hình TLS Certificate với Nginx Ingress, Cert-Manager và Let's Encrypt"
+description: "Hướng dẫn từng bước cấu hình TLS certificate tự động cho Kubernetes sử dụng Nginx Ingress Controller, Cert-Manager và Let's Encrypt với HTTP-01 challenge"
+date: 2026-04-04
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+export const metadata = generateBlogMetadata({
+  title: "Cấu hình TLS Certificate với Nginx Ingress, Cert-Manager và Let's Encrypt",
+  description: "Hướng dẫn từng bước cấu hình TLS certificate tự động cho Kubernetes sử dụng Nginx Ingress Controller, Cert-Manager và Let's Encrypt với HTTP-01 challenge",
+  date: "2026-04-04",
+  slug: "cert-manager-nginx-letsencrypt"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+## Giới thiệu
+
+Khi deploy ứng dụng lên Kubernetes, một trong những việc quan trọng nhất là đảm bảo traffic giữa client và server được mã hóa qua HTTPS. Thay vì quản lý certificate thủ công (tạo, gia hạn, thay thế), bạn có thể tự động hóa toàn bộ quy trình này với **Cert-Manager** và **Let's Encrypt**.
+
+Bài viết này hướng dẫn bạn cấu hình TLS certificate tự động cho ứng dụng trên Kubernetes, sử dụng Nginx Ingress Controller làm reverse proxy và Let's Encrypt làm Certificate Authority (CA).
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│                       Overview Flow                        │
+│                                                            │
+│  Client --HTTPS--> Nginx Ingress --HTTP--> Service --> Pod │
+│                        |                                   │
+│                        | TLS Certificate                   │
+│                        | (auto by Cert-Manager)            │
+│                        |                                   │
+│                   Cert-Manager                             │
+│                        |                                   │
+│                        v                                   │
+│                  Let's Encrypt                             │
+│              (Certificate Authority)                       │
+└────────────────────────────────────────────────────────────┘
+```
+
+## Kiến thức nền tảng
+
+> **Cert-Manager**: Là một Kubernetes add-on tự động hóa việc quản lý và cấp phát TLS certificate. Cert-Manager hỗ trợ nhiều nguồn certificate khác nhau, bao gồm Let's Encrypt, HashiCorp Vault, và Venafi.
+
+> **Let's Encrypt**: Là một Certificate Authority (CA) miễn phí, tự động và mở, cung cấp TLS certificate cho website. Let's Encrypt sử dụng giao thức ACME để xác minh quyền sở hữu domain.
+
+> **ACME (Automatic Certificate Management Environment)**: Là giao thức cho phép tự động hóa việc xác minh domain và cấp phát certificate. Cert-Manager sử dụng ACME để giao tiếp với Let's Encrypt.
+
+> **HTTP-01 Challenge**: Là một phương thức xác minh domain của ACME. Let's Encrypt sẽ gửi một token đến domain của bạn qua HTTP, và Cert-Manager (thông qua Ingress Controller) sẽ trả lời token này để chứng minh bạn sở hữu domain đó.
+
+> **Issuer**: Là một Kubernetes resource do Cert-Manager cung cấp, đại diện cho một Certificate Authority có khả năng cấp certificate. Issuer hoạt động trong phạm vi một namespace, còn ClusterIssuer hoạt động trên toàn cluster.
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│                  HTTP-01 Challenge Flow                    │
+│                                                            │
+│  1. Cert-Manager creates Certificate Request               │
+│     |                                                      │
+│     v                                                      │
+│  2. Let's Encrypt sends challenge token                    │
+│     |                                                      │
+│     v                                                      │
+│  3. Cert-Manager creates temporary Ingress rule            │
+│     to serve token at /.well-known/acme-challenge/         │
+│     |                                                      │
+│     v                                                      │
+│  4. Let's Encrypt accesses http://domain/.well-known/...   │
+│     and verifies the token                                 │
+│     |                                                      │
+│     v                                                      │
+│  5. Verification success -> Certificate issued             │
+│     and stored in Kubernetes Secret                        │
+└────────────────────────────────────────────────────────────┘
+```
+
+## Yêu cầu trước khi bắt đầu
+
+- Kubernetes cluster đang hoạt động
+- Helm đã được cài đặt
+- Một domain **thật** (Let's Encrypt cần xác minh qua HTTP, nên domain phải trỏ được về cluster)
+- Một địa chỉ email (dùng để đăng ký tài khoản ACME với Let's Encrypt)
+
+## Bước 1: Cài đặt Nginx Ingress Controller
+
+Cài đặt Nginx Ingress Controller bằng Helm:
+
+```bash
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+```
+
+```bash
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx \
+  --create-namespace
+```
+
+Sau khi cài đặt, kiểm tra External IP của Nginx Ingress Controller:
+
+```bash
+kubectl get svc -n ingress-nginx
+```
+
+Bạn sẽ thấy một Service có type `LoadBalancer` với External IP. **Trỏ domain của bạn về IP này** trước khi tiếp tục — Let's Encrypt cần truy cập được domain để xác minh.
+
+> Lưu ý quan trọng: **Nên cấu hình Issuer trước khi tạo Ingress.** Nếu tạo Ingress mà chưa có Issuer sẵn sàng, certificate sẽ ở trạng thái Pending cho đến khi Issuer được tạo và hoạt động.
+
+## Bước 2: Cài đặt Cert-Manager
+
+```bash
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+```
+
+```bash
+helm install \
+  cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --version v1.16.2 \
+  --set crds.enabled=true
+```
+
+Kiểm tra Cert-Manager đã chạy thành công:
+
+```bash
+kubectl get pods -n cert-manager
+```
+
+Bạn sẽ thấy 3 pod đang chạy: `cert-manager`, `cert-manager-cainjector`, và `cert-manager-webhook`.
+
+## Bước 3: Deploy ứng dụng mẫu
+
+Tạo một ứng dụng đơn giản để test:
+
+```bash
+kubectl create deployment echo-server --image=mccutchen/go-httpbin
+kubectl expose deployment echo-server --name=clusterip --port=80 --target-port=8080 --type=ClusterIP
+```
+
+## Bước 4: Test với Staging Environment
+
+Let's Encrypt có giới hạn rate limit khá nghiêm ngặt cho production. Vì vậy, **luôn test với staging environment trước** để đảm bảo mọi thứ hoạt động đúng trước khi chuyển sang production.
+
+### 4.1 Tạo Staging Issuer
+
+```yaml
+# staging-issuer.yaml
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: your-email@example.com
+    privateKeySecretRef:
+      name: letsencrypt-staging
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+```
+
+```bash
+kubectl apply -f staging-issuer.yaml
+```
+
+Kiểm tra Issuer đã sẵn sàng:
+
+```bash
+kubectl describe issuer letsencrypt-staging
+```
+
+Output mong đợi sẽ có:
+
+```text
+Status:
+  Conditions:
+    Message:  The ACME account was registered with the ACME server
+    Reason:   ACMEAccountRegistered
+    Status:   True
+    Type:     Ready
+```
+
+### 4.2 Tạo Ingress với TLS
+
+```yaml
+# ingress-staging.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: go-httpbin
+  annotations:
+    cert-manager.io/issuer: "letsencrypt-staging"
+    acme.cert-manager.io/http01-edit-in-place: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - your-domain.example.com
+    secretName: quickstart-example-tls
+  rules:
+  - host: your-domain.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: clusterip
+            port:
+              number: 80
+```
+
+```bash
+kubectl apply -f ingress-staging.yaml
+```
+
+Có hai annotation quan trọng trong Ingress:
+
+| Annotation | Mục đích |
+|---|---|
+| `cert-manager.io/issuer` | Chỉ định Issuer nào sẽ cấp certificate |
+| `acme.cert-manager.io/http01-edit-in-place` | Cho phép Cert-Manager chỉnh sửa Ingress hiện tại để thêm rule phục vụ ACME challenge, thay vì tạo Ingress mới |
+
+### 4.3 Kiểm tra Certificate
+
+```bash
+kubectl get certificate
+```
+
+Output mong đợi:
+
+```text
+NAME                     READY   SECRET                   AGE
+quickstart-example-tls   True    quickstart-example-tls   1m
+```
+
+Xem chi tiết:
+
+```bash
+kubectl describe certificate quickstart-example-tls
+```
+
+### 4.4 Test bằng cURL
+
+```bash
+curl -kivL -H 'Host: your-domain.example.com' 'http://EXTERNAL_IP'
+```
+
+Thay `your-domain.example.com` bằng domain thật của bạn và `EXTERNAL_IP` bằng IP của Nginx Ingress.
+
+> Lưu ý: Staging certificate sẽ hiển thị là **self-signed** (issuer là "Fake LE Intermediate X1"). Đây là hành vi bình thường — staging environment không cấp certificate trusted bởi browser, nhưng nó cho phép bạn test toàn bộ flow mà không bị rate limit.
+
+### 4.5 Dọn dẹp Staging resources
+
+Sau khi test thành công, xóa các staging resources:
+
+```bash
+kubectl delete ingress go-httpbin
+kubectl delete issuer letsencrypt-staging
+kubectl delete secret quickstart-example-tls
+kubectl delete secret letsencrypt-staging
+```
+
+## Bước 5: Chuyển sang Production
+
+Khi staging test thành công, chuyển sang production chỉ cần thay đổi hai điểm:
+
+### 5.1 Tạo Production Issuer
+
+```yaml
+# production-issuer.yaml
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: your-email@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+```
+
+```bash
+kubectl apply -f production-issuer.yaml
+```
+
+### 5.2 Tạo Production Ingress
+
+Ingress giống hệt staging, chỉ thay annotation issuer:
+
+```yaml
+# ingress-production.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: go-httpbin
+  annotations:
+    cert-manager.io/issuer: "letsencrypt-prod"
+    acme.cert-manager.io/http01-edit-in-place: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - your-domain.example.com
+    secretName: quickstart-example-tls
+  rules:
+  - host: your-domain.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: clusterip
+            port:
+              number: 80
+```
+
+```bash
+kubectl apply -f ingress-production.yaml
+```
+
+Kiểm tra certificate:
+
+```bash
+kubectl get certificate
+kubectl describe certificate quickstart-example-tls
+```
+
+Lần này, certificate sẽ được cấp bởi **Let's Encrypt Authority** thật và browser sẽ hiển thị kết nối HTTPS an toàn.
+
+## So sánh Staging vs Production
+
+| | Staging | Production |
+|---|---|---|
+| ACME Server | `acme-staging-v02.api.letsencrypt.org` | `acme-v02.api.letsencrypt.org` |
+| Rate Limit | Rất cao (không giới hạn thực tế) | [Giới hạn nghiêm ngặt](https://letsencrypt.org/docs/rate-limits/) |
+| Certificate | Fake, self-signed | Trusted bởi tất cả browser |
+| Mục đích | Test flow, debug | Production traffic |
+
+## Tổng kết
+
+Quy trình cấu hình TLS certificate tự động với Cert-Manager:
+
+```text
+┌──────────────────────────────────────────────────────┐
+│                      Summary                         │
+│                                                      │
+│  1. Install Nginx Ingress Controller                 │
+│     └── Point domain to External IP                  │
+│                                                      │
+│  2. Install Cert-Manager                             │
+│     └── CRDs + Controller + Webhook                  │
+│                                                      │
+│  3. Deploy app + ClusterIP Service                   │
+│                                                      │
+│  4. Test Staging                                     │
+│     ├── Create Staging Issuer                        │
+│     ├── Create Ingress with cert-manager annotation  │
+│     ├── Verify certificate -> READY: True            │
+│     └── Clean up staging resources                   │
+│                                                      │
+│  5. Deploy Production                                │
+│     ├── Create Production Issuer                     │
+│     ├── Create Ingress with "letsencrypt-prod"       │
+│     └── Verify certificate trusted by browser        │
+└──────────────────────────────────────────────────────┘
+```
+
+Sau khi hoàn thành, Cert-Manager sẽ tự động gia hạn certificate trước khi hết hạn (mặc định 30 ngày trước expiry), nên bạn không cần can thiệp thủ công nữa.
+
+## Troubleshooting
+
+Một số lỗi thường gặp khi cấu hình:
+
+- **Certificate stuck ở trạng thái "Pending"**: Domain chưa trỏ về External IP của Nginx Ingress, hoặc DNS chưa propagate. Kiểm tra bằng `nslookup your-domain.example.com`.
+- **Challenge failed**: Port 80 bị chặn bởi firewall hoặc security group. Let's Encrypt cần truy cập port 80 để xác minh HTTP-01 challenge.
+- **Issuer không Ready**: Sai email, network không thể kết nối đến ACME server, hoặc cert-manager chưa chạy. Kiểm tra bằng `kubectl describe issuer <name>`.
+- **Certificate cấp nhưng browser vẫn báo không an toàn**: Bạn đang dùng staging issuer — chuyển sang production issuer (`letsencrypt-prod`).
+
+## References
+
+- [Cert-Manager: Nginx Ingress + ACME Tutorial](https://cert-manager.io/docs/tutorials/acme/nginx-ingress/)
+- [Let's Encrypt Documentation](https://letsencrypt.org/docs/)
+- [Cert-Manager Installation Guide](https://cert-manager.io/docs/installation/helm/)
+- [Nginx Ingress Controller Documentation](https://kubernetes.github.io/ingress-nginx/)
+- [VContainer Helm Infra Documentation - Cert-Manager + Let's Encrypt](https://anngdinh.github.io/vcontainer-helm-infra-documentation/helm-charts/vks-fleet/cert-manager-let-encrypt.html)
+
+### Bài viết liên quan
+
+- [Configure TLS Certificate with HAProxy Ingress and Cert-Manager](/blog/cert-manager-haproxy-guide) - Hướng dẫn cấu hình TLS với HAProxy Ingress Controller thay vì Nginx
