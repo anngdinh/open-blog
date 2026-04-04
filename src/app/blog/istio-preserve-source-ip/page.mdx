@@ -1,0 +1,328 @@
+---
+title: "Preserve Source IP Address với Istio Ingress Gateway"
+description: "Hướng dẫn cấu hình Istio Ingress Gateway để giữ nguyên source IP của client khi traffic đi qua Load Balancer vào Kubernetes cluster"
+date: 2026-04-04
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+export const metadata = generateBlogMetadata({
+  title: "Preserve Source IP Address với Istio Ingress Gateway",
+  description: "Hướng dẫn cấu hình Istio Ingress Gateway để giữ nguyên source IP của client khi traffic đi qua Load Balancer vào Kubernetes cluster",
+  date: "2026-04-04",
+  slug: "istio-preserve-source-ip"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/istio-preserve-source-ip/cover.jpg"
+    alt="Data center network infrastructure with illuminated server racks and network cables"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+## Giới thiệu
+
+Khi triển khai ứng dụng trên Kubernetes với Load Balancer phía trước, một vấn đề phổ biến là **source IP của client bị thay thế** bởi IP của Load Balancer hoặc node. Điều này gây khó khăn cho việc logging, rate limiting, geo-restriction, và bất kỳ logic nào phụ thuộc vào IP thật của client.
+
+Bài viết này hướng dẫn cách cấu hình **Istio Ingress Gateway** để preserve (giữ nguyên) source IP address của client, sử dụng **Proxy Protocol** — kỹ thuật cho phép Load Balancer truyền thông tin IP gốc của client đến backend.
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                   The Problem                               │
+│                                                             │
+│  Without Proxy Protocol:                                    │
+│  Client (1.2.3.4) -> LB -> Pod sees LB IP (10.0.0.x)        │
+│                                                             │
+│  With Proxy Protocol:                                       │
+│  Client (1.2.3.4) -> LB -> Pod sees Client IP (1.2.3.4)     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Kiến thức nền tảng
+
+> **Istio**: Là một open-source service mesh cung cấp khả năng quản lý traffic, bảo mật, và observability cho microservices trên Kubernetes. Istio inject một sidecar proxy (Envoy) vào mỗi Pod để kiểm soát traffic.
+
+> **Ingress Gateway**: Là điểm vào (entry point) của traffic từ bên ngoài vào trong Istio service mesh. Nó hoạt động như một reverse proxy, nhận traffic từ Load Balancer và route đến các service bên trong cluster.
+
+> **Proxy Protocol**: Là một network protocol cho phép proxy/load balancer truyền thông tin kết nối ban đầu (source IP, destination IP, port) đến backend server. Thay vì mất thông tin client IP qua NAT, Proxy Protocol thêm một header đặc biệt vào đầu mỗi connection.
+
+> **Gateway (Istio CRD)**: Là Kubernetes custom resource của Istio, định nghĩa cách traffic đi vào mesh. Gateway cấu hình port, protocol, và host mà Ingress Gateway sẽ lắng nghe.
+
+> **VirtualService**: Là Istio custom resource định nghĩa routing rules — traffic từ Gateway sẽ được route đến service nào, dựa trên host, path, headers, v.v.
+
+## Yêu cầu trước khi bắt đầu
+
+- Kubernetes cluster đang hoạt động
+- Helm đã được cài đặt
+- `kubectl` đã kết nối với cluster
+- Một domain hoặc IP để test (có thể dùng host header)
+
+## Bước 1: Cài đặt Istio
+
+Cài đặt Istio sử dụng Helm charts:
+
+```bash
+helm repo add istio https://istio-release.storage.googleapis.com/charts
+helm repo update
+```
+
+Cài đặt Istio base (CRDs):
+
+```bash
+helm install istio-base istio/base -n istio-system --create-namespace --wait
+```
+
+Cài đặt Gateway API CRDs (nếu chưa có):
+
+```bash
+kubectl get crd gateways.gateway.networking.k8s.io &> /dev/null || \
+{ kubectl kustomize "github.com/kubernetes-sigs/gateway-api/config/crd?ref=v1.1.0" | kubectl apply -f -; }
+```
+
+Cài đặt Istiod (control plane) và Ingress Gateway:
+
+```bash
+helm install istiod istio/istiod --namespace istio-system
+helm install istio-ingressgateway istio/gateway -n istio-system
+```
+
+Kiểm tra tất cả components đã chạy:
+
+```bash
+kubectl get pods -n istio-system
+```
+
+## Bước 2: Deploy ứng dụng mẫu
+
+Bật sidecar injection cho namespace `default`:
+
+```bash
+kubectl label namespace default istio-injection=enabled
+```
+
+Tạo một ứng dụng test — `go-httpbin` sẽ trả về thông tin request bao gồm source IP:
+
+```bash
+kubectl create deployment echo-server --image=mccutchen/go-httpbin
+kubectl expose deployment echo-server --name=clusterip --port=80 --target-port=8080 --type=ClusterIP
+```
+
+## Bước 3: Cấu hình Gateway và VirtualService
+
+Tạo file `config.yaml` với Gateway và VirtualService:
+
+```yaml
+# config.yaml
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: clusterip-gateway
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+      - "echo.example.com"
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: clusterip-virtualservice
+spec:
+  hosts:
+  - "echo.example.com"
+  gateways:
+  - clusterip-gateway
+  http:
+  - route:
+      - destination:
+          host: clusterip.default.svc.cluster.local
+          port:
+            number: 80
+```
+
+```bash
+kubectl apply -f config.yaml
+```
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│                      Traffic Flow                          │
+│                                                            │
+│  Client                                                    │
+│    |                                                       │
+│    v                                                       │
+│  Load Balancer (External IP)                               │
+│    |                                                       │
+│    v                                                       │
+│  Istio Ingress Gateway (istio-system)                      │
+│    |  Gateway: match host "echo.example.com"               │
+│    v                                                       │
+│  VirtualService: route to clusterip.default.svc            │
+│    |                                                       │
+│    v                                                       │
+│  echo-server Pod (with Envoy sidecar)                      │
+└────────────────────────────────────────────────────────────┘
+```
+
+## Bước 4: Test và monitor
+
+Mở các terminal riêng để theo dõi logs:
+
+Terminal 1 — Logs của Ingress Gateway:
+
+```bash
+kubectl -n istio-system logs -l app=istio-ingressgateway -f
+```
+
+Terminal 2 — Logs của sidecar proxy (Envoy) trong echo-server:
+
+```bash
+kubectl logs -l app=echo-server -f -c istio-proxy
+```
+
+Terminal 3 — Logs của ứng dụng echo-server:
+
+```bash
+kubectl logs -l app=echo-server -f
+```
+
+Terminal 4 — Gửi request liên tục:
+
+```bash
+watch -n 1 "curl -s -H 'Host: echo.example.com' http://EXTERNAL_IP/headers"
+```
+
+Thay `EXTERNAL_IP` bằng External IP của Istio Ingress Gateway:
+
+```bash
+kubectl get svc -n istio-system istio-ingressgateway
+```
+
+> Lưu ý: Tại thời điểm này, nếu bạn kiểm tra header `X-Forwarded-For` trong response, bạn sẽ thấy IP của **Load Balancer hoặc node** — không phải IP thật của client. Đây là vấn đề chúng ta cần giải quyết.
+
+## Bước 5: Preserve Source IP với Proxy Protocol
+
+Đây là bước quan trọng nhất. Chúng ta cần cấu hình hai thứ:
+
+### 5.1 Bật Proxy Protocol trên Load Balancer
+
+Annotate Istio Ingress Gateway service để bật Proxy Protocol:
+
+```bash
+kubectl annotate service -n istio-system istio-ingressgateway \
+  vks.vngcloud.vn/enable-proxy-protocol="*"
+```
+
+> Lưu ý: Annotation `vks.vngcloud.vn/enable-proxy-protocol` là dành cho VNG Cloud (VKS). Nếu bạn dùng cloud provider khác, annotation sẽ khác. Ví dụ: AWS sử dụng `service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"`.
+
+### 5.2 Cấu hình Envoy để đọc Proxy Protocol header
+
+Patch Istio Ingress Gateway deployment để Envoy biết cách parse Proxy Protocol header:
+
+```bash
+kubectl patch deployment istio-ingressgateway -n istio-system -p \
+  '{"spec":{"template":{"metadata":{"annotations":{"proxy.istio.io/config":"{\"gatewayTopology\":{\"proxyProtocol\":{}}}"}}}}}'
+```
+
+Cấu hình này thêm annotation `proxy.istio.io/config` vào pod template, thông báo cho Envoy proxy rằng traffic đến sẽ có Proxy Protocol header và cần được parse.
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│             With Proxy Protocol Enabled                    │
+│                                                            │
+│  Client (1.2.3.4)                                          │
+│    |                                                       │
+│    v                                                       │
+│  Load Balancer                                             │
+│    | adds PROXY protocol header:                           │
+│    | "PROXY TCP4 1.2.3.4 10.0.0.1 54321 80"                │
+│    v                                                       │
+│  Envoy (Ingress Gateway)                                   │
+│    | parses header -> extracts real client IP              │
+│    | sets X-Forwarded-For: 1.2.3.4                         │
+│    v                                                       │
+│  echo-server sees: X-Forwarded-For: 1.2.3.4                │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 5.3 Xác minh kết quả
+
+Sau khi apply, gửi request và kiểm tra header `X-Forwarded-For`:
+
+```bash
+curl -s -H 'Host: echo.example.com' http://EXTERNAL_IP/headers | grep -i x-forwarded-for
+```
+
+Kết quả mong đợi — bây giờ bạn sẽ thấy IP thật của client thay vì IP của Load Balancer:
+
+```text
+"X-Forwarded-For": "1.2.3.4"
+```
+
+Nếu vẫn thấy IP của Load Balancer, kiểm tra lại xem pod của Ingress Gateway đã restart chưa sau khi patch:
+
+```bash
+kubectl get pods -n istio-system -l app=istio-ingressgateway
+```
+
+## Dọn dẹp
+
+Khi không cần test nữa, xóa tất cả resources:
+
+```bash
+kubectl delete deployment echo-server
+kubectl delete service clusterip
+kubectl delete -f config.yaml
+```
+
+Gỡ cài đặt Istio:
+
+```bash
+helm -n istio-system uninstall istio-ingressgateway
+helm -n istio-system uninstall istiod
+helm -n istio-system uninstall istio-base
+```
+
+## Tổng kết
+
+| Bước | Mục đích |
+|---|---|
+| Cài Istio | Control plane + Ingress Gateway |
+| Deploy app | Ứng dụng test với sidecar injection |
+| Gateway + VirtualService | Routing traffic từ ngoài vào service |
+| Annotate LB | Bật Proxy Protocol trên Load Balancer |
+| Patch Envoy | Cho phép Envoy parse Proxy Protocol header |
+
+Preserve source IP là một yêu cầu quan trọng trong production — đặc biệt cho security logging, rate limiting, và compliance. Với Istio, giải pháp đơn giản là kết hợp Proxy Protocol trên Load Balancer với cấu hình `gatewayTopology` trên Envoy proxy.
+
+## References
+
+- [Getting started with Istio](https://istio.io/latest/docs/setup/getting-started/)
+- [Maintaining Traffic Transparency: Preserving Client Source IP in Istio](https://jimmysong.io/en/blog/maintaining-traffic-transparency-preserving-client-source-ip-in-istio/)
+- [Istio Gateway API Documentation](https://istio.io/latest/docs/reference/config/networking/gateway/)
+- [Proxy Protocol Specification](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt)
+- [VContainer Helm Infra Documentation - Istio](https://anngdinh.github.io/vcontainer-helm-infra-documentation/helm-charts/vks-fleet/istio.html)
+
+### Bài viết liên quan
+
+- [Cấu hình TLS Certificate với Nginx Ingress, Cert-Manager và Let's Encrypt](/blog/cert-manager-nginx-letsencrypt) - Hướng dẫn TLS với Nginx Ingress thay vì Istio Gateway
+- [Configure TLS Certificate with HAProxy Ingress and Cert-Manager](/blog/cert-manager-haproxy-guide) - Hướng dẫn TLS với HAProxy Ingress Controller
