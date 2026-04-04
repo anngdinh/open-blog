@@ -1,0 +1,389 @@
+---
+title: "Understanding Kubernetes CNI: How Pods Get Their Network"
+description: "Tổng quan về CNI trong Kubernetes - từ network model, so sánh cách GKE và AWS EKS triển khai networking, đến security groups và performance benchmarking"
+date: 2026-04-04
+---
+
+## CNI là gì?
+
+<div style={{display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '2rem', margin: '2rem 0', flexWrap: 'wrap'}}>
+  <img
+    src="/images/kubernetes-cni-overview/kubernetes-horizontal-color.png"
+    alt="Kubernetes Logo"
+    style={{maxWidth: '250px', height: 'auto'}}
+  />
+  <img
+    src="/images/kubernetes-cni-overview/cncf-color.png"
+    alt="CNCF Logo"
+    style={{maxWidth: '180px', height: 'auto'}}
+  />
+</div>
+
+**CNI (Container Network Interface)** là một dự án của Cloud Native Computing Foundation (CNCF) bao gồm specification và libraries để cấu hình network interfaces trong Linux containers. CNI chỉ tập trung vào hai việc:
+
+- **Kết nối network** cho container khi được tạo
+- **Dọn dẹp network** khi container bị xóa
+
+CNI không quản lý DNS, service discovery, hay load balancing - đó là việc của các thành phần khác trong Kubernetes.
+
+## The Kubernetes Network Model
+
+Kubernetes đặt ra các yêu cầu cơ bản cho networking:
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                  Kubernetes Network Model                       │
+├───────────────────────────────────���─────────────────────────────┤
+│                                                                 │
+│  1. Mỗi Pod có một IP duy nhất trong toàn cluster               │
+│                                                                 │
+│  2. Pod trên mọi node có thể giao tiếp với nhau                 │
+│     KHÔNG cần NAT                                               │
+��                                                                 │
+│  3. Agents trên node (kubelet, system daemons)                  │
+│     có thể giao tiếp với tất cả Pod trên node đó                │
+│                                                                 │
+└────────────────────────────────���────────────────────────────────┘
+```
+
+Nghe đơn giản, nhưng triển khai thực tế rất khác nhau tùy cloud provider. Hãy xem GKE và AWS EKS giải quyết bài toán này như thế nào.
+
+## GKE: Routes-Based vs VPC-Native
+
+Google Kubernetes Engine cung cấp hai chế độ networking:
+
+### Routes-Based Mode
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│                    GKE VPC (10.128.0.0/20)                   │
+│                                                              │
+│  ┌──────────────────┐          ┌──────────────────┐          │
+│  │  Node 1          │          │  Node 2          │          │
+│  │  IP: 10.128.0.2  │          │  IP: 10.128.0.3  │          │
+│  │                  │          │                  │          │
+│  │  Pod CIDR:       │          │  Pod CIDR:       │          │
+│  │  10.100.0.0/24   │          │  10.100.1.0/24   │          │
+│  │                  │          │                  │          │
+│  │  ┌────┐ ┌────┐  │          │  ┌────┐ ┌��───┐  ���          │
+│  │  │Pod1│ │Pod2│  │          │  │Pod3│ │Pod4│  │          │
+│  │  │.2  │ │.3  │  │          │  │.2  │ │.3  │  │          │
+│  │  └──┬─┘ └─┬──┘  │          │  └──┬─┘ └─┬──┘  │          │
+│  │     └──┬──┘     │          │     └──┬──┘     │          │
+│  │      cbr0       │          │      cbr0       │          │
+│  │   (L2 bridge)   │          │   (L2 bridge)   │          │
+│  └────────┬─────────┘          └────────┬─────────┘          │
+│           │                            │                    │
+│     ┌─────┴────────────────────────────┴──────┐             │
+│     │  GKE Auto Routes:                       │             │
+│     │  10.100.0.0/24 → via Node 1             │             │
+│     │  10.100.1.0/24 → via Node 2             │             │
+│     └─────────────────────────────────────────┘             │
+└───────────────────────────────���──────────────────────────────┘
+```
+
+Đặc điểm:
+- Mỗi node nhận một dải `/24` riêng (~254 Pod IPs per node)
+- **Pod IPs không được đăng ký trong VPC** - chúng chỉ tồn tại ở mức node
+- GKE tự động tạo routes giữa các node dựa trên Pod CIDR
+- Traffic cross-node đi qua node IP rồi được forward đến Pod
+
+**Networking bên trong node**: Pods có network namespace riêng biệt. Node kết nối với Pod qua **veth pair**, tất cả veth interfaces kết nối vào bridge `cbr0` (Layer 2).
+
+### VPC-Native Mode (Khuyến nghị)
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│                    GKE VPC                                   │
+│                                                              │
+│  Primary Subnet: 10.128.0.0/20  (cho nodes)                 │
+│  Secondary Range 1: 10.100.0.0/14  (cho pods)               │
+│  Secondary Range 2: 10.104.0.0/20  (cho services)           │
+│                                                              │
+│  ┌─────────────────────┐      ┌─────────────────────┐       │
+│  │  Node 1             │      │  Node 2             │       │
+│  │  Primary: 10.128.0.2│      │  Primary: 10.128.0.3│       │
+│  │                     │      │                     │       │
+│  │  Alias IP Range:    │      │  Alias IP Range:    │       │
+│  │  10.100.0.0/24      │      │  10.100.1.0/24      │       │
+│  │                     │      │                     │       │
+│  │  ┌────┐  ┌────┐    │      │  ┌────┐  ┌────┐    │       │
+│  │  │Pod │  │Pod │    │      │  │Pod │  │Pod │    │       │
+│  │  │.10 │  │.11 │    │      │  │.10 │  │.11 │    │       │
+│  │  └────┘  └────┘    │      │  └────┘  └────┘    │       │
+│  └─────────────────────┘      └─────────────────────┘       │
+│                                                              │
+│  ✓ Pod IPs natively routable trong VPC                       │
+│  ✓ Firewall rules target specific Pod ranges                 │
+│  ✓ Không cần custom static routes                            │
+│  ✓ Accessible từ on-premises qua VPN/Interconnect            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+VPC-Native sử dụng **Alias IP Ranges** - một network interface có thể có nhiều IP ranges. Ưu điểm so với Routes-Based:
+
+| | Routes-Based | VPC-Native |
+|---|---|---|
+| Pod IP routable trong VPC | Không | **Có** |
+| Firewall granularity | Per-node | **Per-pod range** |
+| Cần custom routes | Có | **Không** |
+| On-premises access | Phức tạp | **Qua VPN/Interconnect** |
+| NEG support | Không | **Có** |
+
+> VPC-Native mode không có nhược điểm so với Routes-Based. Google khuyến nghị luôn sử dụng VPC-Native.
+
+## AWS EKS: VPC CNI
+
+<div style={{display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '2rem', margin: '2rem 0', flexWrap: 'wrap'}}>
+  <img
+    src="/images/kubernetes-cni-overview/aws-eks-icon.svg"
+    alt="AWS EKS"
+    style={{maxWidth: '80px', height: 'auto'}}
+  />
+</div>
+
+AWS EKS sử dụng **Amazon VPC CNI** - cách tiếp cận hoàn toàn khác: **mỗi Pod nhận một IP thực từ VPC subnet**.
+
+### Kiến trúc
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│                      AWS VPC Subnet                          │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  EC2 Instance (Node)                                   │  │
+│  │                                                        │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  eth0 (Primary ENI)                              │  │  │
+│  │  │  Primary IP: 172.31.23.106                       │  │  │
+│  │  │  Secondary IPs: 172.31.19.13, 172.31.16.74, ... │  │  │
+│  │  └───────────────────────────────���──────────────────┘  │  │
+│  │                                                        │  │
+│  │  ┌──────────────────────────────────────────────────┐  │  │
+│  │  │  eth1 (Secondary ENI)                            │  │  ��
+│  │  │  Primary IP: 172.31.23.93                        │  │  │
+│  │  │  Secondary IPs: 172.31.27.54, 172.31.29.4, ...  │  │  │
+│  │  └──────────���───────────────────────────────────────┘  │  │
+│  │                                                        │  │
+│  │  ipamd: quản lý ENI + warm pool IPs                    │  │
+│  │                                                        │  │
+│  │  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐              │  ���
+│  │  │ Pod1 │  │ Pod2 │  │ Pod3 │  │ Pod4 │              │  │
+│  │  │.19.13│  │.16.74│  │.27.54│  │.29.4 │              │  │
+│  │  └──────┘  └──��───┘  └──────┘  └���─────┘              │  │
+│  └────────��───────────────────────────────────────────────┘  │
+│                                                              │
+└───────��──────────────────────────��───────────────────────────┘
+```
+
+### Hai thành phần chính
+
+**1. CNI Binary** - chạy trên root filesystem của node:
+- Được kubelet gọi khi Pod được tạo/xóa
+- Cấu hình network cho Pod (veth pair, route, ARP)
+- Sử dụng kỹ thuật `/32` IP + link-local gateway `169.254.1.1`
+
+**2. ipamd (IP Address Management Daemon)** - chạy liên tục trên mỗi node:
+- Quản lý các ENI (Elastic Network Interface) trên node
+- Duy trì **warm pool** các IP address sẵn sàng gán cho Pod
+- Tự động request thêm ENI/IP khi pool cạn
+
+### Pod networking bên trong node
+
+```text
+Pod Network Namespace:
+┌──────────────────────────────────────┐
+│  eth0: 172.31.23.163/32             │
+│                                      │
+│  Route table:                        │
+│  default via 169.254.1.1 dev eth0    │
+│  169.254.1.1 dev eth0 scope link     │
+│                                      │
+│  ARP:                                │
+│  169.254.1.1 → MAC(veth_host_side)   │
+└──────────────────────────────────────┘
+```
+
+> Nhận ra pattern này chưa? Đây chính xác là kỹ thuật **Secondary IP với Link-Local Gateway** mà chúng ta đã thực hành trong bài [Container Networking from Scratch](/blog/container-networking-from-scratch)!
+
+### Giới hạn
+
+Số Pod trên mỗi node bị giới hạn bởi instance type:
+
+```text
+Max Pods = (Số ENI tối đa) × (Số IP mỗi ENI - 1)
+
+Ví dụ t3.medium:
+  3 ENIs × (6 IPs - 1) = 15 Pods
+
+Ví dụ m5.xlarge:
+  4 ENIs × (15 IPs - 1) = 56 Pods
+```
+
+## Security Groups cho Pods
+
+### GKE: Firewall Rules
+
+GKE sử dụng VPC Firewall Rules với các thành phần:
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│                    GKE Firewall Rule                    │
+├─────────────────────────────────────────────────────────┤
+│  Network:     VPC network                               │
+│  Priority:    0-65535 (thấp hơn = ưu tiên cao hơn)     │
+│  Direction:   Ingress / Egress                          │
+│  Action:      Allow / Deny                              │
+│  Target:      All instances / Tags / Service accounts   │
+│  Source:      IP ranges / Service accounts / Tags       │
+│  Destination: IP ranges (v4/v6)                         │
+│  Protocol:    TCP / UDP / ICMP / ...                    │
+│  Ports:       Specific ports hoặc all                   │
+└────────���──────────────────────────��─────────────────────┘
+```
+
+Với **VPC-Native mode**, firewall rules có thể target **specific pod IP ranges** thay vì toàn bộ node - giúp security granular hơn nhiều.
+
+### AWS EKS: Security Groups for Pods
+
+AWS cho phép gán **security group riêng cho từng Pod** (không chỉ cho node). Cơ chế này sử dụng **trunk ENI**:
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  EC2 Node                                                   │
+│                                                             │
+│  eth0 (Primary ENI)                                         │
+│    ├── Pod1 (veth) ─── SG: default                          │
+│    └── Pod2 (veth) ─── SG: default                          │
+│                                                             │
+│  eth1 (Trunk ENI) ─── Supports multiple security groups     │
+│    ├── vlan.eth.1 ── Pod3 (ENI) ─── SG: pod-sg-database    │
+│    └── vlan.eth.2 ── Pod4 (ENI) ──��� SG: pod-sg-frontend    │
+│                                                             │
+└───────────────────────────────────���─────────────────────────┘
+```
+
+Kích hoạt bằng cách set `ENABLE_POD_ENI=true` trên VPC CNI, sau đó tạo SecurityGroupPolicy CRD:
+
+```yaml
+apiVersion: vpcresources.k8s.aws/v1beta1
+kind: SecurityGroupPolicy
+metadata:
+  name: my-security-group-policy
+  namespace: my-namespace
+spec:
+  podSelector:
+    matchLabels:
+      role: my-role
+  securityGroups:
+    groupIds:
+      - sg-0123456789abcdef0
+```
+
+Mỗi Pod với label matching sẽ nhận **ENI riêng** với security group chỉ định, thay vì dùng chung ENI với node.
+
+## So sánh các CNI phổ biến
+
+<div style={{display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '2rem', margin: '2rem 0', flexWrap: 'wrap'}}>
+  <img
+    src="/images/kubernetes-cni-overview/cilium-icon.png"
+    alt="Cilium"
+    style={{maxWidth: '60px', height: 'auto'}}
+  />
+  <img
+    src="/images/kubernetes-cni-overview/flannel-logo.png"
+    alt="Flannel"
+    style={{maxWidth: '150px', height: 'auto'}}
+  />
+</div>
+
+| | Flannel | Calico | Cilium | AWS VPC CNI |
+|---|---|---|---|---|
+| **Data plane** | VXLAN / host-gw | iptables / eBPF | eBPF | VPC native |
+| **Network Policy** | Không | Có | Có (L3-L7) | Security Groups |
+| **IPAM** | host-local | Calico IPAM | Cilium IPAM | ENI-based |
+| **Encryption** | Không | WireGuard | WireGuard / IPsec | VPC encryption |
+| **Observability** | Cơ bản | Cơ bản | Hubble (rất mạnh) | VPC Flow Logs |
+| **Complexity** | Thấp | Trung bình | Cao | Thấp (managed) |
+| **Use case** | Dev/test | Production general | Production advanced | AWS only |
+
+## CNI Performance Benchmarking
+
+Khi chọn CNI, performance là yếu tố quan trọng. Dưới đây là methodology để benchmark:
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│              CNI Benchmark Protocol                     │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  1. Preparation                                         │
+│     └── Setup nodes, Kubernetes, CNI                    │
+│                                                         │
+│  2. Idle Performance                                    │
+│     └── CPU/memory overhead sau khi cài CNI             │
+│                                                         │
+│  3. Pod-to-Pod TCP Bandwidth                            │
+│     ├── Single stream                                   │
+│     └── Multiple streams (8 threads)                    │
+│                                                         │
+│  4. Pod-to-Pod UDP Bandwidth                            │
+│     ├── Single stream                                   │
+│     └── Multiple streams                                │
+│                                                         │
+│  5. Pod-to-Service TCP/UDP Bandwidth                    │
+│     └── Qua kube-proxy (iptables vs IPVS)              │
+│                                                         │
+│  6. Kết quả đáng chú ý:                                 │
+│     ├── Cilium + eBPF: bypass kube-proxy, rất nhanh     │
+│     ├── Calico + IPVS: tốt hơn iptables ở scale lớn   │
+│     └── Flannel + VXLAN: overhead từ encapsulation      │
+│                                                         │
+└───────────────────────���─────────────────────────────────┘
+```
+
+Các cấu hình thường được so sánh:
+- **Calico + kube-proxy + iptables**: Setup phổ biến nhất
+- **Calico + kube-proxy + IPVS**: Tốt hơn khi có nhiều Services
+- **Cilium + eBPF**: Thay thế hoàn toàn kube-proxy, performance cao nhất
+
+> Tham khảo chi tiết: [Benchmark Kubernetes Network Plugins over 40Gbit/s (2024)](https://itnext.io/benchmark-results-of-kubernetes-network-plugins-cni-over-40gbit-s-network-2024-156f085a5e4e)
+
+## Tổng kết
+
+```text
+┌──────────────────────────────────────────────────────────┐
+│              Kubernetes CNI Landscape                    │
+├──────────────────────────────────────────────────────────┤
+│                                                          │
+│  Kubernetes Network Model                                │
+│  "Mỗi Pod một IP, không NAT"                            │
+│       │                                                  │
+│       ├── GKE                                            │
+│       │   ├── Routes-Based (legacy)                      │
+│       │   └── VPC-Native + Alias IPs (recommended)       │
+│       │                                                  │
+│       ├── AWS EKS                                        │
+│       │   └── VPC CNI + ENI + Secondary IPs              │
+│       │       └── Security Groups for Pods (trunk ENI)   │
+│       │                                                  │
+│       └── Self-managed                                   │
+���           ├── Flannel (simple, VXLAN overlay)             │
+│           ├── Calico (network policy, eBPF option)       │
+│           └── Cilium (eBPF native, L7 policy, Hubble)    │
+│                                                          │
+└───────────────��──────────────────────────────────────────┘
+```
+
+### Tiếp theo
+
+- [Container Networking from Scratch](/blog/container-networking-from-scratch) - Tự tay xây dựng networking từ veth pair đến CNI plugin
+- [AWS VPC CNI Deep Dive](/blog/aws-vpc-cni-deep-dive) - ENIs, trunk networking, và policy routing trên AWS
+
+### Tài nguyên tham khảo
+
+- [Kubernetes Networking Model](https://kubernetes.io/docs/concepts/cluster-administration/networking/)
+- [CNI Specification](https://www.cni.dev/docs/spec/)
+- [GKE VPC-Native Clusters](https://cloud.google.com/kubernetes-engine/docs/concepts/alias-ips)
+- [AWS VPC CNI Plugin](https://github.com/aws/amazon-vpc-cni-k8s)
+- [Cilium Documentation](https://docs.cilium.io/)
+- [Benchmark: Kubernetes Network Plugins over 40Gbit/s](https://itnext.io/benchmark-results-of-kubernetes-network-plugins-cni-over-40gbit-s-network-2024-156f085a5e4e)

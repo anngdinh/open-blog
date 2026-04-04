@@ -1,0 +1,489 @@
+---
+title: "AWS VPC CNI Deep Dive: ENIs, Trunk Networking & Policy Routing"
+description: "Phân tích chuyên sâu AWS VPC CNI - cách ENI gán IP cho Pod, trunk networking cho security groups, policy routing, và iptables chains trong EKS"
+date: 2026-04-04
+---
+
+## Tổng quan
+
+<div style={{display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '2rem', margin: '2rem 0', flexWrap: 'wrap'}}>
+  <img
+    src="/images/aws-vpc-cni-deep-dive/aws-eks-icon.svg"
+    alt="AWS EKS"
+    style={{maxWidth: '80px', height: 'auto'}}
+  />
+  <img
+    src="/images/aws-vpc-cni-deep-dive/kubernetes-logo.png"
+    alt="Kubernetes"
+    style={{maxWidth: '80px', height: 'auto'}}
+  />
+</div>
+
+AWS VPC CNI là CNI plugin mặc định trên Amazon EKS. Điểm đặc biệt: **mỗi Pod nhận một IP thực từ VPC** - không overlay, không encapsulation. Điều này mang lại native VPC networking cho Pod nhưng cũng đi kèm những ràng buộc riêng.
+
+Bài viết này đi sâu vào cách VPC CNI hoạt động bên trong một EKS node, từ ENI management đến trunk networking và iptables chains.
+
+## ENI và Secondary IPs
+
+### Cấu trúc network interfaces trên node
+
+Một EKS node điển hình có nhiều ENI (Elastic Network Interface), mỗi ENI mang nhiều secondary private IPs:
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│  EC2 Node (ap-southeast-2)                                       │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ eth0 - Primary ENI                                        │  │
+│  │ Primary IP: 172.31.23.106/20                               │  │
+│  │ Secondary IPs: 172.31.19.13, 172.31.16.74,                │  │
+│  │   172.31.26.201, 172.31.27.54, 172.31.29.4               │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ eth1 - Secondary ENI                                      │  │
+│  │ Primary IP: 172.31.23.93/20                                │  │
+│  │ Secondary IPs: 172.31.20.235, 172.31.20.89,               │  │
+│  │   172.31.31.116, 172.31.23.163, 172.31.21.208            │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ eth2 - Secondary ENI                                      │  │
+│  │ Primary IP: 172.31.18.110/20                               │  │
+│  │ Secondary IPs: ...                                         │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  Pods chạy trên node này nhận secondary IPs từ các ENI           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### ipamd - IP Address Management Daemon
+
+`ipamd` (chạy trong `aws-node` DaemonSet) quản lý toàn bộ lifecycle của ENI và IPs:
+
+```text
+┌─────────────────────────────────────────────────┐
+│                     ipamd                       │
+├─────────────────────────────────────────────────┤
+│                                                 │
+│  1. Khởi động: attach ENIs, lấy secondary IPs   │
+│                                                 │
+│  2. Warm Pool: giữ sẵn N IPs chưa dùng          │
+│     ├── WARM_IP_TARGET (default: 1)             │
+│     ├── WARM_ENI_TARGET (default: 1)            │
+│     └── MINIMUM_IP_TARGET                       │
+│                                                 │
+│  3. Khi kubelet gọi CNI ADD:                     │
+│     └── ipamd cấp IP từ warm pool               │
+│                                                 │
+│  4. Khi kubelet gọi CNI DEL:                     │
+│     └── IP trả về warm pool                      │
+│                                                 │
+│  5. Scale: tự động request thêm ENI khi cần      │
+│                                                 │
+└─────────────────────────────────────────────────┘
+```
+
+### Pod networking chi tiết
+
+Khi một Pod được tạo, CNI binary thực hiện:
+
+```text
+Host namespace:                     Pod namespace:
+┌──────────────────────┐           ┌──────────────────────────┐
+│                      │           │  eth0: 172.31.23.163/32  │
+│  eni4c9bab731ed ─────┼───────────┼─► (veth peer)            │
+│    (veth host side)  │           │                          │
+│                      │           │  Routes:                  │
+│  Route table:        │           │  default via 169.254.1.1  │
+│  172.31.23.163       │           │  169.254.1.1 scope link   │
+│    dev eni4c9bab731ed│           │                          │
+│    scope link        │           │  ARP:                     │
+│                      │           │  169.254.1.1 →            │
+│                      │           │    MAC(eni4c9bab731ed)    │
+└──────────────────────┘           └──────────────────────────┘
+```
+
+Key points:
+- Pod nhận IP `/32` (không phải subnet) - đây là **secondary IP** từ một ENI
+- Default gateway là `169.254.1.1` (link-local) với static ARP trỏ đến veth host side
+- Host có route `/32` trỏ traffic đến đúng veth interface của Pod
+
+> Pattern này giống hệt kỹ thuật "Secondary IP với Link-Local Gateway" trong bài [Container Networking from Scratch](/blog/container-networking-from-scratch#62-secondary-ip-với-link-local-gateway).
+
+### Network namespaces trên node
+
+```bash
+# Liệt kê các CNI network namespaces
+ip netns list
+```
+
+```text
+cni-29b37092-bcad-2228-1130-8b9945f6bb30
+cni-b3466bf5-4367-e10f-09dd-99abc561194e
+cni-55ae0531-a760-9e14-a192-fdc6d6c82970
+cni-da53182a-dd25-596a-fae3-2d0556c2692a
+...
+```
+
+Mỗi Pod có namespace riêng, được đặt tên theo format `cni-<uuid>`.
+
+```bash
+# Inspect một Pod namespace
+ip netns exec cni-29b37092-bcad-2228-1130-8b9945f6bb30 ip a
+ip netns exec cni-29b37092-bcad-2228-1130-8b9945f6bb30 ip route
+```
+
+## Trunk Networking - Security Groups cho Pods
+
+### Vấn đề
+
+Mặc định, tất cả Pods trên một node chia sẻ security groups của node. Nhưng trong thực tế:
+- Pod backend cần access database
+- Pod frontend không nên access database
+- Khi autoscale, security rules phải theo Pod, không theo node
+
+### Giải pháp: Trunk ENI + VLAN
+
+Kích hoạt bằng `ENABLE_POD_ENI=true`. VPC CNI sẽ tạo **trunk ENI** - một ENI đặc biệt hỗ trợ VLAN tagging:
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  EC2 Node                                                    │
+│                                                              │
+│  eth0 (Primary ENI) ── 172.31.0.225/20                       │
+│    ├── eni1e3dd7d66d7 ─── Pod1 (regular, shared SG)          │
+│    └── eni5f2d60c848c ─── Pod2 (regular, shared SG)          │
+│                                                              │
+│  eth1 (Trunk ENI)                                            │
+│    ├── vlan.eth.1 ─── Pod3 namespace ─── SG: sg-database     │
+│    │   └── VLAN ID: 1                                        │
+│    └── vlan.eth.2 ─── Pod4 namespace ─── SG: sg-frontend     │
+│        └── VLAN ID: 2                                        │
+│                                                              │
+│  eth2 (Secondary ENI) ── Regular pods                        │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Network interfaces thực tế trên node
+
+```bash
+ip link show
+```
+
+```text
+1: lo: <LOOPBACK,UP>
+2: eth0: <BROADCAST,MULTICAST,UP>          ← Primary ENI
+3: dummy0: <BROADCAST,NOARP>
+5: eni4c9bab731ed@if3: <BROADCAST,UP>      ← veth cho regular pod
+6: eth1: <BROADCAST,MULTICAST,UP>          ← Trunk ENI
+7: eth2: <BROADCAST,MULTICAST,UP>          ← Secondary ENI
+8: eni2bc5393b053@if3: <BROADCAST,UP>      ← veth cho regular pod
+11: vlan14d01641e41@eth1: <BROADCAST,UP>   ← VLAN subport (pod với SG)
+12: vlan.eth.3@eth1: <BROADCAST,UP>        ← VLAN subport
+17: eni37cc5983ec1@if3: <BROADCAST,UP>     ← veth cho regular pod
+```
+
+Chú ý sự khác biệt:
+- `eniXXX@if3`: veth pair thông thường cho regular pods
+- `vlanXXX@eth1`: VLAN interface trên trunk ENI cho pods với custom security group
+
+### Routing cho Trunk Pods
+
+Pods với security group riêng có routing khác:
+
+```text
+Regular Pod:                        Trunk Pod (with SG):
+┌──────────────────────┐           ┌──────────────────────────┐
+│ eth0: 172.31.20.89/32│           │ eth0: 172.31.19.50/32    │
+│                      │           │                          │
+│ via 169.254.1.1      │           │ via 169.254.1.1          │
+│ → veth pair → host   │           │ → VLAN interface → trunk │
+│   routing            │           │   ENI → VPC (direct)     │
+│                      │           │                          │
+│ Traffic đi qua host  │           │ Traffic đi trực tiếp     │
+│ iptables rules       │           │ qua trunk ENI            │
+└──────────────────────┘           └──────────────────────────┘
+```
+
+### SecurityGroupPolicy CRD
+
+```yaml
+apiVersion: vpcresources.k8s.aws/v1beta1
+kind: SecurityGroupPolicy
+metadata:
+  name: database-access
+  namespace: backend
+spec:
+  podSelector:
+    matchLabels:
+      role: api-server
+  securityGroups:
+    groupIds:
+      - sg-0abc123def456789  # Cho phép access tới RDS
+```
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: backend
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: api-server
+  template:
+    metadata:
+      labels:
+        app: api-server
+        role: api-server    # Match với SecurityGroupPolicy
+    spec:
+      terminationGracePeriodSeconds: 120
+      containers:
+      - name: api
+        image: my-api:latest
+        ports:
+        - containerPort: 8080
+```
+
+## Policy Routing trên EKS Node
+
+### Route tables
+
+EKS node sử dụng **policy-based routing** với nhiều route tables:
+
+```bash
+# Main route table
+ip route show table main
+```
+
+```text
+default via 172.31.16.1 dev eth0
+172.31.16.0/20 dev eth0 proto kernel scope link src 172.31.0.225
+
+# Per-pod routes
+172.31.20.89 dev eni1e3dd7d66d7 scope link    ← Regular pod
+172.31.19.50 dev vlan.eth.1 scope link         ← Trunk pod
+```
+
+```bash
+# Route tables cho VLAN interfaces (trunk pods)
+ip route show table 101
+```
+
+```text
+default via 172.31.16.1 dev vlan.eth.1
+```
+
+```bash
+ip route show table 102
+```
+
+```text
+default via 172.31.16.1 dev vlan.eth.2
+```
+
+### IP Rules
+
+Policy routing rules quyết định traffic đi qua table nào:
+
+```bash
+ip rule show
+```
+
+```text
+0:     from all lookup local
+512:   from all to 172.31.19.50 lookup main      ← Đến trunk pod: dùng main
+1024:  from all fwmark 0x80/0x80 lookup main      ← Marked traffic: dùng main
+1536:  from 172.31.19.50 lookup 101                ← Từ trunk pod: dùng table 101
+32766: from all lookup main
+32767: from all lookup default
+```
+
+> **`ip rule`** kiểm soát routing policy - quyết định dùng route table nào dựa trên source IP, destination IP, hoặc fwmark. Đây là cách VPC CNI đảm bảo traffic từ trunk pod đi đúng VLAN interface thay vì primary ENI.
+
+## iptables Chains trên EKS Node
+
+EKS node có một hệ thống iptables phức tạp với nhiều custom chains:
+
+### NAT Table
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                    NAT Table Flow                           │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  PREROUTING                                                 │
+│  └── KUBE-SERVICES                                          │
+│      └── Match Service ClusterIP:port                       │
+│          └── DNAT → Pod IP:port                             │
+│                                                             │
+│  OUTPUT                                                     │
+│  └── KUBE-SERVICES (cho local traffic)                      │
+│                                                             │
+│  POSTROUTING                                                │
+│  ├── KUBE-POSTROUTING                                       │
+│  │   └── MASQUERADE cho traffic từ Service                  │
+│  │                                                          │
+│  └── AWS-SNAT-CHAIN-0                                       │
+│      ├── Không SNAT traffic trong VPC CIDR                  │
+│      └── SNAT traffic ra ngoài VPC                          │
+│          └── AWS-CONNMARK-CHAIN-0                           │
+│              └── Đánh dấu connection cho return traffic     │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### AWS-specific chains
+
+**AWS-SNAT-CHAIN**: Xử lý Source NAT cho traffic ra ngoài VPC
+
+```bash
+iptables -t nat -S AWS-SNAT-CHAIN-0
+```
+
+```text
+# Không SNAT traffic nội bộ VPC
+-A AWS-SNAT-CHAIN-0 ! -d 172.31.0.0/16 -m comment --comment "AWS SNAT CHAIN" \
+  -j AWS-SNAT-CHAIN-1
+
+# SNAT traffic ra internet
+-A AWS-SNAT-CHAIN-1 -m comment --comment "AWS, SNAT" \
+  -m addrtype ! --dst-type LOCAL -j SNAT --to-source 172.31.0.225 \
+  --random-fully
+```
+
+**AWS-CONNMARK-CHAIN**: Đánh dấu connections để xử lý return traffic đúng interface
+
+```bash
+iptables -t nat -S AWS-CONNMARK-CHAIN-0
+```
+
+```text
+# Mark traffic đi ra ngoài VPC
+-A AWS-CONNMARK-CHAIN-0 ! -d 172.31.0.0/16 \
+  -m comment --comment "AWS CONNMARK CHAIN, VPC CIDR" \
+  -j AWS-CONNMARK-CHAIN-1
+
+# Set connmark
+-A AWS-CONNMARK-CHAIN-1 -m comment --comment "AWS, CONNMARK" \
+  -j CONNMARK --set-xmark 0x80/0x80
+```
+
+### KUBE-SERVICES: Service routing
+
+```text
+Ví dụ: CoreDNS Service (ClusterIP: 10.100.0.10:53)
+
+PREROUTING → KUBE-SERVICES
+  └── -d 10.100.0.10/32 -p udp --dport 53
+      └── KUBE-SVC-xxx (Service chain)
+          ├── 50% → KUBE-SEP-aaa → DNAT 172.31.20.89:53 (Pod 1)
+          └── 50% → KUBE-SEP-bbb → DNAT 172.31.23.45:53 (Pod 2)
+```
+
+> kube-proxy tạo các iptables rules này dựa trên Service và Endpoints. Đây là lý do tại sao Cilium với eBPF có performance tốt hơn - nó bypass hoàn toàn iptables.
+
+## Debugging VPC CNI
+
+### Kiểm tra ENI allocation
+
+```bash
+# Xem aws-node logs
+kubectl logs -n kube-system -l k8s-app=aws-node
+
+# Kiểm tra IP allocation trên node
+kubectl exec -n kube-system <aws-node-pod> -- /app/grpc-health-probe \
+  -addr :50051 -service=""
+```
+
+### Network debug trên node
+
+```bash
+# Xem tất cả interfaces
+ip link show
+
+# Xem route tables
+ip route show table all
+
+# Xem policy rules
+ip rule show
+
+# Inspect specific Pod namespace
+POD_NS=$(ip netns list | head -1)
+ip netns exec $POD_NS ip a
+ip netns exec $POD_NS ip route
+ip netns exec $POD_NS arp -n
+
+# Capture traffic
+tcpdump -nn -i any icmp -l
+ip netns exec $POD_NS tcpdump -nn -i eth0 -l
+```
+
+### Common issues
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│  Issue                    │  Nguyên nhân          │ Fix    │
+├────────────────────────────────────────────────────────────┤
+│  Pod stuck Pending        │  Hết IP trong subnet  │ Mở     │
+│  (no IP available)        │  hoặc hết ENI slots   │ rộng   │
+│                           │                       │ subnet │
+├────────────────────────────────────────────────────────────┤
+│  Pod-to-Pod timeout       │  Security group       │ Check  │
+│  cross-node               │  block traffic        │ SG     │
+│                           │                       │ rules  │
+├────────────────────────────────────────────────────────────┤
+│  SNAT không hoạt động     │  AWS-SNAT-CHAIN       │ Check  │
+│  (pod không ra internet)  │  misconfigured        │ VPC    │
+│                           │                       │ CIDR   │
+├────────────────────────────────────────────────────────────┤
+│  Trunk pod không có       │  ENABLE_POD_ENI       │ Set    │
+│  custom SG                │  chưa bật             │ =true  │
+└────────────────────────────────────────────────────────────┘
+```
+
+## Tổng kết
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│              AWS VPC CNI Architecture                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────┐    ┌──────────┐    ┌─────────────────────┐    │
+│  │ kubelet │───►│ CNI      │───►│ Pod Network Setup   │    │
+│  │         │    │ Binary   │    │  • veth pair         │    │
+│  └─────────┘    └──────────┘    │  • /32 IP            │    │
+│                                 │  • 169.254.1.1 gw    │    │
+│  ┌─────────────────────────┐    │  • static ARP        │    │
+│  │ ipamd (aws-node pod)   │    └─────────────────────┘    │
+│  │  • ENI management       │                               │
+│  │  • Warm IP pool         │    ┌─────────────────────┐    │
+│  │  • IP allocation        │    │ Trunk ENI           │    │
+│  └─────────────────────────┘    │  • VLAN per pod     │    │
+│                                 │  • Per-pod SG        │    │
+│  ┌─────────────────────────┐    │  • Policy routing    │    │
+│  │ iptables                │    └─────────────────────┘    │
+│  │  • KUBE-SERVICES (DNAT) │                               │
+│  │  • AWS-SNAT-CHAIN       │                               │
+│  │  • AWS-CONNMARK-CHAIN   │                               │
+│  └─────────────────────────┘                               │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Bài viết liên quan
+
+- [Container Networking from Scratch](/blog/container-networking-from-scratch) - Xây dựng networking từ đầu, hiểu các building blocks
+- [Understanding Kubernetes CNI](/blog/kubernetes-cni-overview) - So sánh các CNI approach: GKE, EKS, Cilium, Calico
+
+### Tài nguyên tham khảo
+
+- [AWS VPC CNI Plugin - GitHub](https://github.com/aws/amazon-vpc-cni-k8s)
+- [EKS Best Practices - Networking](https://aws.github.io/aws-eks-best-practices/networking/)
+- [Security Groups for Pods](https://docs.aws.amazon.com/eks/latest/userguide/security-groups-for-pods.html)
+- [Amazon VPC CNI Plugin Troubleshooting](https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting-cni.html)
+- [CNI Specification](https://www.cni.dev/docs/spec/)
