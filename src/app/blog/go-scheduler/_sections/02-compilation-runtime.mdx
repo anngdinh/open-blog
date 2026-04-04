@@ -1,0 +1,100 @@
+## Compilation và Go Runtime
+
+### Quá trình biên dịch
+
+Go compiler biến source code thành executable binary qua ba giai đoạn chính:
+
+```text
+.go source  --->  .s assembly  --->  .o object  --->  executable binary
+  (compile)        (assemble)         (link)
+```
+
+1. **Compile**: Go source code (`.go`) được chuyển thành assembly (`.s`) cho target platform
+2. **Assemble**: Assembly code được chuyển thành object files (`.o`)
+3. **Link**: Object files được link với nhau và với Go runtime để tạo thành executable binary cuối cùng
+
+Điểm quan trọng là Go **statically links** runtime vào mỗi binary. Điều này có nghĩa mọi Go binary đều chứa toàn bộ runtime bên trong — bao gồm scheduler, garbage collector, và memory allocator.
+
+### Go Runtime là gì?
+
+> **Go Runtime**: Là tập hợp các functions và data structures cung cấp scheduling, memory management, và garbage collection. Runtime được viết bằng Go và assembly, nằm trong `runtime` package của Go standard library.
+
+Go runtime không phải là virtual machine (như JVM). Nó là một library được compile và link trực tiếp vào application binary:
+
+```text
++--------------------------------------------------+
+|              Executable Binary                   |
+|                                                  |
+|  +-------------------+  +---------------------+  |
+|  | Application Code  |  |    Go Runtime       |  |
+|  |                   |  |                     |  |
+|  | - main()          |  | - Scheduler (GMP)   |  |
+|  | - your packages   |  | - Memory Allocator  |  |
+|  | - goroutines      |  | - Garbage Collector |  |
+|  |                   |  | - Netpoll           |  |
+|  +-------------------+  +---------------------+  |
+|                                                  |
++--------------------------------------------------+
+```
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/go_runtime_relationship.png"
+    alt="Relationship between Go runtime and application code"
+    style={{maxWidth: '700px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+### Compiler thay thế keywords bằng runtime calls
+
+Go compiler tự động thay thế một số keywords và built-in functions bằng các lời gọi đến runtime:
+
+| Keyword / Function | Runtime Call | Mô tả |
+|---|---|---|
+| `go` | `runtime.newproc` | Tạo goroutine mới |
+| `new` | `runtime.newobject` | Allocate memory cho object |
+| `make` (channel) | `runtime.makechan` | Tạo channel mới |
+| `make` (map) | `runtime.makemap` | Tạo map mới |
+| `make` (slice) | `runtime.makeslice` | Tạo slice mới |
+
+Ví dụ, khi bạn viết:
+
+```go
+go myFunction()
+```
+
+Compiler sẽ chuyển thành:
+
+```go
+runtime.newproc(myFunction)
+```
+
+### Các hàm đặc biệt trong runtime
+
+Một số functions trong runtime không có Go implementation — chúng tồn tại hoàn toàn ở assembly level hoặc được compiler xử lý đặc biệt:
+
+> **Compiler Intrinsic**: Là function mà compiler nhận diện và thay thế trực tiếp bằng machine code tối ưu, thay vì thực hiện function call thông thường. Trong Go, `getg` là một compiler intrinsic.
+
+- **`getg()`** — Lấy pointer đến goroutine struct (G) hiện tại. Đây là compiler intrinsic, được thay thế bằng assembly instruction đọc G từ TLS (Thread-Local Storage) hoặc dedicated register. Không có Go source code nào implement function này.
+
+- **`gogo()`** — Chuyển execution context sang một goroutine khác. Hoàn toàn được viết bằng assembly vì cần thao tác trực tiếp với CPU registers và stack pointer — điều Go code không thể làm.
+
+### `//go:linkname` directive
+
+> **`//go:linkname`**: Là compiler directive cho phép một function trong package này liên kết (link) với implementation ở package khác tại link time, bỏ qua Go's normal visibility rules.
+
+Directive này được sử dụng rộng rãi trong standard library để kết nối public API với internal runtime implementation:
+
+```go
+// In time package:
+//go:linkname Sleep runtime.timeSleep
+func Sleep(d Duration)
+
+// Actual implementation lives in runtime package:
+// runtime/time.go
+func timeSleep(ns int64) {
+    // ... implementation
+}
+```
+
+Khi user gọi `time.Sleep()`, linker sẽ redirect call đến `runtime.timeSleep()`. Cơ chế này giúp runtime giữ implementation internal trong khi vẫn expose clean public API.

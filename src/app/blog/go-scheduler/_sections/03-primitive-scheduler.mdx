@@ -1,0 +1,161 @@
+## Từ Primitive Scheduler đến GMP Model
+
+### Threading Models
+
+Trước khi đi vào Go scheduler, cần hiểu ba mô hình threading cơ bản mà các ngôn ngữ lập trình sử dụng để map user-space threads lên kernel threads.
+
+> **User-space Thread**: Thread được quản lý bởi runtime/library ở user space, kernel không biết đến sự tồn tại của chúng. Goroutines trong Go là user-space threads.
+
+> **Kernel Thread**: Thread được quản lý trực tiếp bởi OS kernel, có thể được schedule lên CPU cores. Kernel threads tốn nhiều tài nguyên hơn user-space threads.
+
+#### N:1 Model (Many-to-One)
+
+Nhiều user-space threads được map lên **một** kernel thread duy nhất.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/n_to_1_multithreading_model.png"
+    alt="N:1 multithreading model - many user threads mapped to one kernel thread"
+    style={{maxWidth: '500px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+- **Ưu điểm**: Context switch nhanh (không cần syscall), implementation đơn giản
+- **Nhược điểm**: Không tận dụng được multicore/multiprocessor. Khi một thread thực hiện blocking syscall, **tất cả** threads đều bị block vì chúng chia sẻ cùng một kernel thread
+
+#### 1:1 Model (One-to-One)
+
+Mỗi user-space thread được map trực tiếp lên **một** kernel thread.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/1_to_1_multithreading_model.png"
+    alt="1:1 multithreading model - each user thread mapped to one kernel thread"
+    style={{maxWidth: '500px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+- **Ưu điểm**: True parallelism trên multicore systems. Một thread block không ảnh hưởng threads khác
+- **Nhược điểm**: Thread creation tốn kém (~1-8 MB stack mỗi thread). Context switch qua kernel chậm. Số lượng threads bị giới hạn bởi OS resources
+
+Đây là model mà hầu hết các ngôn ngữ như Java, C++, Rust sử dụng (thông qua pthreads hoặc tương đương).
+
+#### M:N Model (Many-to-Many)
+
+M user-space threads được map lên N kernel threads (M >= N).
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/m_to_n_multithreading_model.png"
+    alt="M:N multithreading model - many user threads mapped to many kernel threads"
+    style={{maxWidth: '500px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+- **Ưu điểm**: Kết hợp tốt nhất của cả hai models — true parallelism và lightweight thread creation
+- **Nhược điểm**: Phức tạp nhất để implement. Runtime phải tự quản lý scheduling và xử lý edge cases (syscall blocking, thread parking, work stealing...)
+
+**Go sử dụng M:N model**, với goroutines (G) là user-space threads và OS threads (M) là kernel threads. Go runtime chịu trách nhiệm schedule goroutines lên OS threads một cách hiệu quả.
+
+### Primitive Scheduler (trước Go 1.1)
+
+Phiên bản đầu tiên của Go scheduler rất đơn giản — chỉ có hai entities:
+
+- **G (Goroutine)**: Đại diện cho một goroutine
+- **M (Machine/Thread)**: Đại diện cho một OS thread
+
+Tất cả goroutines được đặt trong một **global run queue** duy nhất, được bảo vệ bởi một mutex lock. Mọi M muốn lấy G để chạy đều phải acquire lock này.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/primitive_scheduler.png"
+    alt="Primitive Go scheduler with global run queue and mutex lock"
+    style={{maxWidth: '600px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+```text
++-------+  +-------+  +-------+
+|  M0   |  |  M1   |  |  M2   |
++---+---+  +---+---+  +---+---+
+    |          |          |    
+    v          v          v    
+    +---------------------+    
+    |  Global Run Queue   |    
+    | (protected by mutex)|    
+    |                     |    
+    | [G1][G2][G3]...[Gn] |    
+    +---------------------+    
+```
+
+### Vấn đề của Primitive Scheduler
+
+Năm 2012, **Dmitry Vyukov** (kỹ sư tại Google) đã phân tích và chỉ ra ba vấn đề nghiêm trọng:
+
+**1. Lock Contention (Tranh chấp khóa)**
+
+Mọi thao tác trên run queue — push, pop, hoặc thậm chí kiểm tra queue — đều cần acquire global mutex. Khi số lượng M tăng lên, các threads liên tục phải chờ nhau, tạo ra bottleneck nghiêm trọng.
+
+**2. Poor Locality (Locality kém)**
+
+Goroutines thường xuyên bị chuyển qua lại giữa các threads. Một goroutine được tạo trên M0 có thể chạy trên M1, rồi resume trên M2. Điều này phá hủy cache locality — data mà goroutine cần có thể đã nằm trong L1/L2 cache của thread cũ nhưng không có trong cache của thread mới.
+
+**3. Memory Waste (Lãng phí bộ nhớ)**
+
+Mỗi M có một **mcache** (memory cache cho allocation, có thể lên đến 2 MB). Vấn đề là mcache gắn với M, kể cả khi M đang bị block trong syscall và không làm gì cả. Trong thực tế, tỉ lệ active threads so với total threads có thể chỉ là **1:100** — 99 threads đang block nhưng vẫn giữ mcache.
+
+### Proposal 1: Local Run Queue
+
+Ý tưởng đầu tiên là cho mỗi M một **local run queue** riêng:
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/proposal_1.png"
+    alt="Proposal 1 - each thread M has its own local run queue"
+    style={{maxWidth: '600px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+Cách hoạt động:
+- Goroutine mới được đẩy vào local queue của M hiện tại (hoặc global queue nếu local queue đầy)
+- M ưu tiên lấy G từ local queue trước, rồi mới check global queue
+- Nếu cả hai đều trống, thực hiện **work stealing** — lấy goroutines từ local queue của M khác
+
+Proposal này giải quyết được **lock contention** (mỗi M có queue riêng) và **locality** (goroutine có xu hướng chạy trên cùng M đã tạo ra nó). Tuy nhiên, nó **không giải quyết memory waste** — mcache vẫn gắn với M, và work stealing trở nên tốn kém khi có nhiều M bị block (phải scan qua nhiều idle threads).
+
+### Proposal 2: Logical Processor (P) — GMP Model
+
+Giải pháp cuối cùng là giới thiệu entity thứ ba — **P (Processor)**:
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/proposal_2.png"
+    alt="Proposal 2 - introducing P (Processor) entity forming the GMP model"
+    style={{maxWidth: '700px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+> **P (Processor)**: Là logical processor trong GMP model. P giữ local run queue và mcache. Số lượng P được set bằng `GOMAXPROCS` (mặc định bằng số CPU cores). M phải acquire một P trước khi có thể thực thi goroutines.
+
+Thay đổi cốt lõi:
+- **Local run queue** và **mcache** thuộc về P, không phải M
+- Khi M bị block trong syscall, P **detach** khỏi M và attach vào M khác (hoặc tạo M mới)
+- Số lượng P giới hạn (thường bằng số CPU cores), nên work stealing chỉ cần scan qua một số P nhỏ — rất hiệu quả
+
+```text
+Before (Primitive):           After (GMP):
+
+  M0   M1   M2                M0--P0   M1--P1
+  |    |    |                 |        |
+  v    v    v                 v        v
+  [Global Queue]              [LRQ0]   [LRQ1]
+                                  \     /
+                               [Global Queue]
+```
+
+Thiết kế GMP model giải quyết cả ba vấn đề:
+- **Lock contention**: Mỗi P có local queue riêng, giảm thiểu lock tranh chấp
+- **Locality**: Goroutine thường chạy trên cùng P đã tạo ra nó
+- **Memory waste**: mcache gắn với P (số lượng ít, luôn active), không gắn với M (số lượng nhiều, thường block)
+
+Đây chính là nền tảng của Go scheduler hiện đại, được merge vào Go 1.1 (2013) và tiếp tục được cải tiến đến ngày nay.

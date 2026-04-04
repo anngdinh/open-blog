@@ -1,0 +1,69 @@
+## GMP Model
+
+Go scheduler hoạt động dựa trên mô hình **GMP** — ba thành phần cốt lõi phối hợp với nhau để quản lý hàng nghìn goroutine trên một số lượng hạn chế OS thread.
+
+> **Goroutine (G)**: Là đơn vị thực thi nhẹ trong Go, được biểu diễn bởi `g` struct chứa metadata, execution state, stack (khởi tạo 2KB, tự động grow khi cần), và program counter. Khi goroutine hoàn thành, nó được recycle vào free list thay vì bị hủy — chi phí tạo mới thấp hơn nhiều so với OS thread.
+
+> **Thread/Machine (M)**: Là OS kernel thread thực sự do hệ điều hành quản lý. Mỗi M có một goroutine đặc biệt gọi là **g0** chạy trên system stack (do kernel cấp), dùng để thực thi scheduler code và runtime code. Khi cần schedule goroutine mới, M chuyển sang g0 để thực hiện.
+
+> **Processor (P)**: Là logical processor, số lượng được xác định bởi `GOMAXPROCS`. Mỗi P sở hữu một local run queue gồm `runnext` (1 slot ưu tiên cao nhất) và `runq` (circular queue). Ngoài ra, P còn chứa `mcache` để memory allocation và quản lý timers thông qua min-heap.
+
+### Goroutine States
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/goroutine_state_machine.png"
+    alt="Goroutine state machine showing transitions between Idle, Runnable, Running, Syscall, Waiting, and Dead states"
+    style={{maxWidth: '600px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+Goroutine có 6 trạng thái chính:
+
+| State | Giá trị | Mô tả |
+|-------|---------|-------|
+| **Idle** | `_Gidle` | Goroutine vừa được allocate, chưa được khởi tạo |
+| **Runnable** | `_Grunnable` | Đã sẵn sàng chạy, nằm trong run queue, chờ được gán cho M |
+| **Running** | `_Grunning` | Đang thực thi trên một M, có P gắn kèm |
+| **Syscall** | `_Gsyscall` | Đang thực hiện system call, không sử dụng stack |
+| **Waiting** | `_Gwaiting` | Đang bị block bởi runtime (channel, mutex, sleep, I/O) |
+| **Dead** | `_Gdead` | Đã hoàn thành hoặc vừa được khởi tạo, sẵn sàng recycle |
+
+### Thread States
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/thread_state_machine.png"
+    alt="Thread state machine showing transitions between Running, Syscall, Spinning, and Sleep states"
+    style={{maxWidth: '600px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+Thread (M) có 4 trạng thái:
+
+| State | Mô tả |
+|-------|-------|
+| **Running** | Đang thực thi Go code hoặc runtime code, có P gắn kèm |
+| **Syscall** | Đang bị block trong system call, P có thể bị tách ra (handoff) |
+| **Spinning** | Đang tìm kiếm goroutine để steal từ P khác. Số lượng spinning thread bị giới hạn: chỉ cho phép khi spinning threads < một nửa số busy processors — tránh lãng phí CPU |
+| **Sleep** | Không có việc làm, nằm trong idle list chờ được đánh thức |
+
+### Processor States
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/processor_state_machine.png"
+    alt="Processor state machine showing transitions between Idle, Running, Syscall, GCStop, and Dead states"
+    style={{maxWidth: '600px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+Processor (P) có 5 trạng thái:
+
+| State | Mô tả |
+|-------|-------|
+| **Idle** | Không gắn với M nào, nằm trong idle P list |
+| **Running** | Đang gắn với một M và thực thi goroutine |
+| **Syscall** | M đang trong system call, P tạm thời không được sử dụng và có thể bị steal bởi M khác |
+| **GCStop** | Bị dừng bởi garbage collector trong STW (Stop-The-World) phase |
+| **Dead** | Không còn được sử dụng (khi GOMAXPROCS giảm dynamically) |

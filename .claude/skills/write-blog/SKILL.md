@@ -38,7 +38,32 @@ boilerplate pattern.
 
 ### File structure
 
-Create the post at `src/app/blog/<slug>/page.mdx` with this structure:
+Create the post at `src/app/blog/<slug>/page.mdx`.
+
+**For short-to-medium posts** (under ~300 lines of content), use a single file:
+
+```
+src/app/blog/<slug>/
+└── page.mdx          # Everything in one file
+```
+
+**For long posts** (over ~300 lines, or when the reference article has many sections), split
+into multiple MDX files and import them into the main page. This keeps each file manageable
+and allows writing sections in parallel:
+
+```
+src/app/blog/<slug>/
+├── page.mdx                    # Main file: frontmatter, imports, boilerplate, section imports
+├── _sections/
+│   ├── 01-introduction.mdx
+│   ├── 02-background.mdx
+│   ├── 03-core-concept.mdx
+│   ├── 04-deep-dive.mdx
+│   ├── 05-advanced.mdx
+│   └── 06-conclusion.mdx
+```
+
+The main `page.mdx` imports and renders each section:
 
 ```
 ---
@@ -50,6 +75,13 @@ date: YYYY-MM-DD
 import { generateBlogMetadata } from "../../../lib/blog";
 import BlogJsonLd from "../../../components/blog-json-ld";
 import Title from "../../../components/title";
+
+import Introduction from "./_sections/01-introduction.mdx";
+import Background from "./_sections/02-background.mdx";
+import CoreConcept from "./_sections/03-core-concept.mdx";
+import DeepDive from "./_sections/04-deep-dive.mdx";
+import Advanced from "./_sections/05-advanced.mdx";
+import Conclusion from "./_sections/06-conclusion.mdx";
 
 export const metadata = generateBlogMetadata({
   title: "<Post Title>",
@@ -69,13 +101,35 @@ export const metadata = generateBlogMetadata({
 
 <Title title={metadata.title} date={metadata.date} />
 
-[content sections here]
+[cover image here]
+
+<Introduction />
+<Background />
+<CoreConcept />
+<DeepDive />
+<Advanced />
+<Conclusion />
 
 ## References
 
 - [Title](url)
 - ...
 ```
+
+Each section file is a plain MDX file with no frontmatter — just content starting with `##`:
+
+```
+## Section Title
+
+Content here...
+```
+
+**When to split:** if the reference article has 10+ sections, or the total content would exceed
+~300 lines, or you're translating a very long article. The split makes it easier to write
+sections in parallel using subagents, and keeps each file readable.
+
+**Naming convention:** prefix with numbers (`01-`, `02-`) to maintain order. Use the `_sections/`
+directory (underscore prefix) so Next.js doesn't treat them as routes.
 
 ### Keyword definitions
 

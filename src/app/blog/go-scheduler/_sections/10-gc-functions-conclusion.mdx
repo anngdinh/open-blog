@@ -1,0 +1,123 @@
+## Garbage Collector
+
+Go sử dụng **tracing GC** với thuật toán **tri-color marking**. GC chạy concurrent với chương trình — giảm thiểu thời gian STW (Stop-The-World) pauses.
+
+> **Tri-color Marking**: Thuật toán GC chia objects thành 3 nhóm: white (chưa visited, có thể là garbage), gray (đã visited nhưng chưa scan references), và black (đã visited và đã scan tất cả references). Objects còn white sau khi marking hoàn thành sẽ bị sweep.
+
+GC hoạt động qua 4 phases:
+
+| Phase | Mô tả | Concurrent? |
+|-------|--------|-------------|
+| **First STW** | Tất cả P pause tại safe points | Không — STW |
+| **Marking** | GC goroutines chạy concurrent với regular Gs trên cùng P | Có |
+| **Second STW** | Finalize marking, đảm bảo tất cả objects được scan | Không — STW |
+| **Sweeping** | Background memory reclamation | Có |
+
+Trong `findRunnable`, runtime tìm kiếm cả regular goroutines và GC goroutines (steps 2 và 8 trong schedule loop) — đảm bảo GC work được thực hiện song song với application code.
+
+## Các Runtime Functions quan trọng
+
+### getg()
+
+> **getg()**: Lấy pointer đến goroutine struct (G) hiện tại. Không có Go implementation — compiler thay thế bằng instruction đọc G từ TLS hoặc dedicated register.
+
+`getg()` không có source code nào implement. Compiler nhận diện function này và thay thế trực tiếp bằng machine instruction đọc G pointer từ:
+- **TLS (Thread-Local Storage)** trên một số platforms
+- **Dedicated register** trên platforms khác
+
+G pointer được lưu vào TLS/register trong hai trường hợp:
+- Khi context switch qua `gogo()` — chuyển execution sang goroutine khác
+- Khi signal handler qua `sigtrampgo` — xử lý OS signals
+
+### gopark()
+
+> **gopark()**: Park goroutine hiện tại — chuyển từ Running sang Waiting state. Goroutine sẽ không được schedule cho đến khi được explicitly unpark (ví dụ bởi channel send, mutex unlock, hoặc timer).
+
+Quy trình hoạt động:
+
+1. Set `stackguard0 = stackPreempt` — đánh dấu goroutine cần được preempt
+2. Chuyển execution sang g0 thông qua `mcall(park_m)`
+3. Drop association giữa G và M — G không còn gắn với M nào
+4. Gọi `unlockf` callback:
+   - Return `false`: G được reschedule ngay lập tức (useful khi condition đã thay đổi)
+   - Return `true`: M vào schedule loop, tìm goroutine khác để chạy
+
+```go
+func gopark(unlockf func(*g, unsafe.Pointer) bool, ...) {
+    mp.waitunlockf = unlockf
+    releasem(mp)
+    mcall(park_m)
+}
+```
+
+### startm()
+
+> **startm()**: Schedule một M để chạy P. Đảm bảo mọi P có work đều có M tương ứng để thực thi.
+
+Quy trình:
+1. Nếu P parameter là nil -> lấy idle P từ global list
+2. Nếu không có idle P -> return (tất cả processors đang busy)
+3. Với P available:
+   - Tìm idle M trong idle list -> wake up bằng `futex`
+   - Nếu không có idle M -> tạo thread mới bằng `clone` syscall với `mstart` entry point
+
+### stopm()
+
+> **stopm()**: Đưa M vào trạng thái sleep — thêm M vào idle list và suspend bằng `futex` syscall. M không tiêu tốn CPU khi sleeping.
+
+`stopm` không return cho đến khi M được đánh thức — thường xảy ra khi có goroutine mới được tạo (qua `newproc`) hoặc khi có P cần M để chạy.
+
+### handoffp()
+
+> **handoffp()**: Transfer P từ M đang bị block sang M khác (M1). Đảm bảo P không bị idle khi vẫn còn work cần thực hiện.
+
+`handoffp` kiểm tra các conditions sau để quyết định có cần transfer P hay không:
+
+- Global run queue non-empty
+- Local run queue non-empty
+- Tracing hoặc GC work cần thực hiện
+- Không có thread nào handles netpoll
+
+Nếu không có condition nào thỏa mãn — P được trả về idle list.
+
+## GOMAXPROCS
+
+> **GOMAXPROCS**: Số lượng P (logical processors) tối đa mà Go runtime sử dụng. Xác định bao nhiêu goroutines có thể chạy thực sự parallel.
+
+`runtime.GOMAXPROCS(n)` set số lượng P. Mặc định bằng `runtime.NumCPU()` — query số CPU cores từ OS.
+
+**Vấn đề trong containers**: Mặc định, `runtime.NumCPU()` query từ OS và trả về tổng số CPU cores của host machine, không phải cgroup limits. Điều này có thể gây ra vấn đề trong containerized environments. Hiện có ongoing proposal để Go tự động respect cgroup CPU limits.
+
+> *"This call will go away when the scheduler improves."* — Go documentation
+
+Dgraph hardcode `GOMAXPROCS=128` để có nhiều P hơn cho I/O scheduling — cho phép nhiều goroutines thực hiện disk I/O đồng thời mà không bị block lẫn nhau.
+
+## Goexit
+
+> **runtime.Goexit()**: Gracefully terminate goroutine hiện tại. Tất cả deferred functions được thực thi trước khi goroutine kết thúc. Các goroutines khác tiếp tục chạy bình thường.
+
+Đặc điểm quan trọng:
+- Tất cả `defer` calls được execute theo thứ tự LIFO trước khi goroutine exit
+- Các goroutines khác không bị ảnh hưởng
+- Nếu **tất cả** goroutines exit (bao gồm main goroutine), chương trình crash
+- Useful trong testing: abort test sớm nhưng vẫn đảm bảo deferred cleanup chạy đúng
+
+## Tổng kết
+
+Go Scheduler cho phép lightweight concurrency thông qua mô hình GMP:
+
+- **G (Goroutine)**: Lightweight execution unit, 2KB stack, được recycle khi hoàn thành
+- **M (Machine/Thread)**: OS thread thực sự, có g0 riêng để chạy scheduler code
+- **P (Processor)**: Quản lý local run queue và mcache, số lượng = `GOMAXPROCS`
+
+Các cơ chế chính:
+
+| Cơ chế | Mô tả |
+|--------|--------|
+| **Preemption** | Non-cooperative (SIGURG signal) + cooperative (stack guard check) |
+| **Work Stealing** | Idle threads steal goroutines từ local run queue của P khác |
+| **Netpoll** | epoll-based I/O multiplexing, cho phép blocking-style code chạy non-blocking |
+| **Syscall Handling** | Processor handoff giữ P busy trong khi M bị block trong syscall |
+| **GC Integration** | Concurrent marking với minimal STW pauses |
+
+Sự kết hợp của các cơ chế này cho phép Go xử lý hàng triệu goroutines hiệu quả, với overhead thấp và latency ổn định — đặc biệt phù hợp cho web services, microservices, và distributed systems.

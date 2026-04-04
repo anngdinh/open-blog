@@ -1,0 +1,71 @@
+## Program Bootstrap
+
+Khi một chương trình Go khởi động, runtime thực hiện một chuỗi các bước khởi tạo trước khi user code được chạy:
+
+1. **Thread M0 và Goroutine G0 được tạo**: M0 là main thread — thread đầu tiên của process. G0 là goroutine đặc biệt gắn với M0, chạy trên system stack. TLS (Thread-Local Storage) được setup để M0 có thể truy cập goroutine hiện tại qua `getg()`.
+
+2. **`procresize` khởi tạo Processors**: Hàm `procresize` tạo ra đúng `GOMAXPROCS` processor, tất cả bắt đầu ở trạng thái **Idle**. P0 (processor đầu tiên) được gắn ngay với M0.
+
+3. **Main goroutine thực thi `runtime.main`**: Runtime tạo main goroutine và đặt vào run queue. Goroutine này thực thi `runtime.main`, trong đó spawn **sysmon** trên một dedicated thread riêng — sysmon không cần P để hoạt động.
+
+4. **`runtime.main` gọi `main.main`**: Đây là điểm bắt đầu thực sự của user code. Từ đây, chương trình của bạn bắt đầu chạy.
+
+### Sysmon
+
+**Sysmon** là background daemon thread chạy song song với toàn bộ chương trình, đảm nhiệm các tác vụ giám sát quan trọng:
+
+- **Preemption**: Phát hiện goroutine chạy quá lâu (>10ms) và gửi tín hiệu preempt
+- **Processor handoff**: Khi M bị block trong syscall quá lâu, sysmon tách P ra và giao cho M khác
+- **Network polling**: Định kỳ kiểm tra netpoll để đánh thức goroutine đang chờ I/O
+- **GC trigger**: Hỗ trợ kích hoạt garbage collection khi cần
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/program_bootstrap.png"
+    alt="Program bootstrap sequence showing M0, G0, processor initialization, and sysmon creation"
+    style={{maxWidth: '600px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+## Tạo Goroutine
+
+Khi bạn viết `go func()`, compiler chuyển đổi thành lời gọi `runtime.newproc`. Quá trình tạo goroutine gồm 3 giai đoạn:
+
+### Khởi tạo Goroutine
+
+Runtime ưu tiên lấy goroutine từ free list (recycle) thay vì allocate mới. Goroutine mới nhận stack 2KB và được setup để khi function hoàn thành, nó sẽ return vào `goexit`.
+
+Hàm `goexit` được push vào đáy stack — khi goroutine's function return, `goexit` thực hiện cleanup: đưa G vào free list để recycle và quay lại schedule loop tìm goroutine tiếp theo.
+
+### Đưa Goroutine vào Queue
+
+Goroutine mới được đặt vào **`runnext`** của P hiện tại — đây là slot có độ ưu tiên cao nhất, goroutine ở đây sẽ được chạy tiếp theo.
+
+Nếu `runnext` đã có goroutine khác, goroutine cũ bị đẩy xuống `runq` (local run queue). Nếu `runq` đã đầy (capacity 256), một nửa số goroutine trong queue sẽ được chuyển sang **global run queue** để cân bằng tải.
+
+```text
++--------------------------------------------------------------+
+|                        Processor (P)                         |
+|                                                              |
+|  runnext: [new G] <---------- go func() creates new G here   |
+|                                                              |
+|  runq: [G1][G2]...[G256]                                     |
+|         |                                                    |
+|         v (if full)                                          |
+|  half -> global runq                                         |
++--------------------------------------------------------------+
+```
+
+### Wake Up Processor
+
+Sau khi goroutine được đưa vào queue, runtime kiểm tra xem có P nào đang idle không. Nếu có, runtime đánh thức một M (hoặc tạo mới nếu cần) để gắn với P đó — nhằm tối đa hóa concurrency.
+
+Việc tạo goroutine mới là **trigger chính** để đánh thức idle thread. Đây là cơ chế đảm bảo rằng khi có work mới, hệ thống luôn cố gắng tận dụng tối đa số processor khả dụng.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/creating_goroutine.png"
+    alt="Creating goroutine flow showing initialization, queue placement, and processor wake-up"
+    style={{maxWidth: '600px', width: '100%', height: 'auto'}}
+  />
+</div>

@@ -1,0 +1,124 @@
+## Network I/O và Netpoll
+
+Theo Go Developer Survey, khoảng 75% use cases của Go là web services. Go được thiết kế từ đầu để giải quyết **C10K problem** một cách hiệu quả — xử lý hàng chục nghìn concurrent connections trên một server.
+
+> **C10K Problem**: Bài toán kỹ thuật kinh điển về việc làm sao một server có thể xử lý 10,000 concurrent connections. Các giải pháp truyền thống dựa trên thread-per-connection không scale được do overhead của OS threads.
+
+### HTTP Server Under the Hood
+
+Khi bạn viết một HTTP server đơn giản với `http.ListenAndServe()`, Go abstract rất nhiều syscalls phía sau:
+
+- **Server setup**: `socket()` -> `bind()` -> `listen()` -> `accept()` — tạo socket, bind address, listen và accept connections
+- **Request handling**: `http.HandleFunc()` abstract các syscall `read()` và `write()` cho mỗi connection
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/socket_system_calls_in_http_server.png"
+    alt="Socket system calls flow in HTTP server: socket, bind, listen, accept"
+    style={{maxWidth: '600px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/go_http_server_meme.jpg"
+    alt="Go HTTP server meme showing simplicity of Go net/http"
+    style={{maxWidth: '600px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+### I/O Models
+
+Để hiểu cách Go xử lý network I/O, trước tiên cần nắm 3 I/O models cơ bản:
+
+> **Blocking I/O**: Thread bị suspend cho đến khi data sẵn sàng. Đơn giản nhưng cần N threads cho N connections — không scale.
+
+> **Non-blocking I/O**: Syscall trả về ngay lập tức với data (nếu có) hoặc error `EAGAIN` (nếu chưa sẵn sàng). Hiệu quả nhưng phức tạp khi phải liên tục polling.
+
+> **I/O Multiplexing**: Sử dụng `select`/`poll`/`epoll` để theo dõi nhiều file descriptors cùng lúc. Application block trên `select` thay vì block trên từng I/O operation riêng lẻ.
+
+<div style={{display: 'flex', justifyContent: 'center', gap: '2rem', flexWrap: 'wrap', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/blocking_io.png"
+    alt="Blocking I/O model diagram"
+    style={{maxWidth: '280px', width: '100%', height: 'auto'}}
+  />
+  <img
+    src="/images/go-scheduler/non_blocking_io.png"
+    alt="Non-blocking I/O model diagram"
+    style={{maxWidth: '280px', width: '100%', height: 'auto'}}
+  />
+  <img
+    src="/images/go-scheduler/io_multiplexing.png"
+    alt="I/O multiplexing model diagram"
+    style={{maxWidth: '280px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+### I/O Model trong Go
+
+Go kết hợp **non-blocking I/O** với **I/O multiplexing** để đạt hiệu suất cao nhất. Tuy nhiên, Go không sử dụng `select`/`poll` truyền thống (vì performance giảm khi số lượng file descriptors lớn). Thay vào đó, Go sử dụng các platform-specific mechanisms:
+
+| Platform | Mechanism |
+|----------|-----------|
+| Linux | `epoll` |
+| Darwin (macOS) | `kqueue` |
+| Windows | `IOCP` (I/O Completion Ports) |
+
+Tất cả được abstract thông qua **netpoll** function trong runtime — cho phép Go code viết theo blocking style nhưng thực tế chạy non-blocking phía sau.
+
+### Cách Netpoll hoạt động
+
+#### Step 1: Tạo epoll instance và đăng ký goroutine
+
+Khi Go accept một TCP connection, socket được tạo với flag `SOCK_NONBLOCK` để đảm bảo non-blocking I/O. Quá trình đăng ký diễn ra như sau:
+
+1. **`net.netFD`** wraps file descriptor -> trigger `epoll_create` (thông qua `sync.Once` — chỉ tạo **một epoll instance duy nhất** cho toàn bộ process lifetime)
+2. **`runtime.pollDesc`** được allocate chứa scheduling metadata và G references -> gọi `epoll_ctl` với `EPOLL_CTL_ADD` để đăng ký FD vào epoll instance
+3. **`poll.FD`** quản lý read/write operations với polling support
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/netpoll_descriptors.png"
+    alt="Netpoll descriptor registration flow: netFD, pollDesc, and epoll"
+    style={{maxWidth: '600px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+**Lưu ý**: Việc chỉ sử dụng một epoll instance duy nhất có known issues (Go issue [#65064](https://github.com/golang/go/issues/65064)). Hiện đang có discussions về việc sử dụng multiple epoll instances hoặc chuyển sang `io_uring`.
+
+Go cũng sử dụng epoll cho file I/O: gọi `SetNonblock` để chuyển FD sang non-blocking mode, sau đó đăng ký vào cùng epoll instance.
+
+#### Step 2: Polling file descriptors
+
+Khi goroutine thực hiện read operation:
+
+1. `poll.FD.Read` gọi `read` syscall
+2. Nếu trả về `EAGAIN` (data chưa sẵn sàng) -> `poll_runtime_pollWait` **park goroutine** (chuyển sang Waiting state)
+3. **`netpoll` function** gọi `epoll_wait` để monitor tối đa 128 file descriptors cùng lúc
+4. Khi data sẵn sàng, `epoll_wait` trả về `runtime.pollDesc` của các FD đã ready
+5. Runtime extract G references từ `pollDesc` và đưa các goroutine này trở lại runnable state
+
+**Khi nào netpoll được gọi?** Trong `findRunnable`, runtime chỉ consult netpoll khi không tìm thấy goroutine nào trong local run queue và global run queue.
+
+**`delay` parameter của netpoll**:
+- **Positive value**: Block tối đa N nanoseconds
+- **Negative value**: Block cho đến khi có FD ready (used in sysmon)
+- **Zero**: Return ngay lập tức (used in `findRunnable`)
+
+#### Step 3: Unregister file descriptors
+
+Khi connection được close:
+
+1. `poll.FD.destroy` gọi `poll_runtime_pollClose`
+2. `poll_runtime_pollClose` gọi `epoll_ctl` với `EPOLL_CTL_DEL` để remove FD khỏi epoll instance
+
+**Quan trọng**: Phải unregister FD khi close connection để tránh **FD leak** và **goroutine starvation** — nếu FD không được unregister, goroutine đang chờ data trên FD đó sẽ không bao giờ được wake up.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/netpoll_in_gmp_model.png"
+    alt="Full netpoll process diagram integrated with GMP model"
+    style={{maxWidth: '600px', width: '100%', height: 'auto'}}
+  />
+</div>

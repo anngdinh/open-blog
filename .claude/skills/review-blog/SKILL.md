@@ -20,9 +20,14 @@ with English technical terms.
 
 1. **Identify the target post.** If the user doesn't specify a file, look for recently modified
    `.mdx` files under `src/app/blog/*/page.mdx` (check git status or file modification times).
-2. **Read the full post** — every line matters for a thorough review.
+2. **Read the full post** — every line matters for a thorough review. **For multi-file posts**
+   (those with a `_sections/` directory), read `page.mdx` AND every section file. Check for
+   section files with: `ls src/app/blog/<slug>/_sections/` — if the directory exists, the post
+   is multi-file and you need to review all of them. Run the diagram check script on each
+   section file individually.
 3. **Run through each review dimension** below and collect findings.
-4. **Output a single recommendations report** using the format at the bottom.
+4. **Output a single recommendations report** using the format at the bottom. For multi-file
+   posts, prefix each finding with the filename (e.g., `_sections/03-core-concept.mdx: Line 45`).
 
 ## Review dimensions
 

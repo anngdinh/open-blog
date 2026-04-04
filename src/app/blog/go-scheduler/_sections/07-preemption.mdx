@@ -1,0 +1,126 @@
+## Goroutine Preemption
+
+Preemption là cơ chế cho phép scheduler dừng một goroutine đang chạy để nhường CPU cho goroutine khác. Nếu không có preemption, một goroutine chạy vòng lặp vô hạn mà không có function call sẽ chiếm giữ P mãi mãi — tất cả goroutine khác trên P đó bị "bỏ đói" và không bao giờ được thực thi.
+
+> **Preemption**: Hành động scheduler dừng goroutine đang chạy (dù chưa hoàn thành) để gán P cho goroutine khác. Go sử dụng hai cơ chế: cooperative preemption (dựa vào function call) và non-cooperative preemption (dựa vào signal).
+
+### Non-cooperative Preemption
+
+> **Non-cooperative preemption**: Cơ chế preemption không cần sự hợp tác của goroutine. Runtime gửi signal để buộc goroutine dừng ngay lập tức, bất kể goroutine đang thực thi code gì.
+
+`sysmon` là daemon goroutine chạy trên một dedicated thread riêng — thread này **không cần P** để hoạt động. `sysmon` liên tục giám sát tất cả P đang ở trạng thái Running. Khi phát hiện một goroutine sử dụng P liên tục hơn **10ms**, quá trình preemption diễn ra:
+
+1. `sysmon` gửi **SIGURG** signal đến thread (M) đang chạy goroutine đó, sử dụng `tgkill` syscall
+2. Signal handler của thread được kích hoạt, chuyển quyền điều khiển sang `asyncPreempt` — hàm assembly lưu toàn bộ register state
+3. `asyncPreempt` gọi `asyncPreempt2`
+4. `asyncPreempt2` gọi `gopreempt_m`: goroutine bị tách khỏi M và được đưa vào **global run queue**
+5. Thread quay lại schedule loop để tìm goroutine mới
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/non_cooperative_preemption.png"
+    alt="Non-cooperative preemption flow: sysmon detects long-running goroutine, sends SIGURG signal to thread"
+    style={{maxWidth: '700px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/signal_delivery_and_handler_execution.png"
+    alt="Signal delivery and handler execution flow showing kernel interrupting user-space thread"
+    style={{maxWidth: '700px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+Lưu ý: Vì preemption là **asynchronous** (signal delivery phụ thuộc vào kernel scheduling), goroutine có thể chạy vượt quá 10ms trước khi thực sự bị interrupt. Thời gian 10ms chỉ là ngưỡng trigger, không phải giới hạn cứng.
+
+### Cooperative Preemption (truoc Go 1.14)
+
+Trước Go 1.14, Go chỉ hỗ trợ cooperative preemption — goroutine chỉ bị preempt khi nó **chủ động nhường CPU** bằng cách gọi `runtime.Gosched()`. Trong các vòng lặp chặt (tight loop), developer phải tự thêm `runtime.Gosched()`:
+
+```go
+for {
+    // Compute-intensive work...
+    runtime.Gosched() // Manually yield to scheduler
+}
+```
+
+Cách tiếp cận này có nhiều hạn chế:
+
+- **Tedious**: Developer phải nhớ thêm `Gosched()` vào mọi tight loop
+- **Error-prone**: Quên thêm sẽ gây starvation cho goroutine khác
+- **Performance issues**: Mỗi `Gosched()` là một context switch, nếu gọi quá thường xuyên sẽ giảm throughput
+
+### Cooperative Preemption (Go 1.14+)
+
+Từ Go 1.14, compiler chèn **stack guard check** vào phần đầu (prologue) của **mọi function**. Khi goroutine gọi bất kỳ function nào, quá trình kiểm tra diễn ra:
+
+1. Function prologue load giá trị `stackguard0` từ G struct
+2. So sánh `stackguard0` với stack pointer hiện tại
+3. Nếu `stackguard0 == stackPreempt` (giá trị đặc biệt): nhảy sang `morestack_noctxt` -> `newstack` -> `gopreempt_m`
+
+Khi `sysmon` phát hiện goroutine chạy quá 10ms, nó set `stackguard0 = stackPreempt`. Lần gọi function tiếp theo sẽ trigger preemption tự động.
+
+Ví dụ assembly trên ARM64 cho function prologue:
+
+```text
+MOVD 16(R28), R16    # Load stackguard0 from G struct
+SUB $48, RSP, R17    # Calculate stack frame limit
+CMP R16, R17         # Compare stackguard0 with stack pointer
+BLS 96(PC)           # Branch to morestack if overflow/preempt
+```
+
+Giải thích:
+- `R28` trỏ đến G struct hiện tại
+- `stackguard0` nằm ở offset 16 trong G struct
+- Nếu `stackguard0` được set thành `stackPreempt` (giá trị rất lớn), phép so sánh sẽ luôn fail -> nhảy vào `morestack` -> trigger preemption
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/cooperative_preemption.png"
+    alt="Cooperative preemption flow: sysmon sets stackguard0, next function call triggers morestack and preemption"
+    style={{maxWidth: '700px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+### So sanh qua Runtime Trace
+
+Sự khác biệt giữa hai cơ chế có thể quan sát rõ ràng qua Go runtime trace:
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/runtime_trace_start.png"
+    alt="Runtime trace showing initial goroutine scheduling"
+    style={{maxWidth: '800px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+**Non-cooperative preemption**: Goroutine chạy liên tục 10ms+ trước khi bị signal interrupt. Trace hiển thị các block dài trên mỗi P, cho thấy goroutine chiếm giữ P trong khoảng thời gian đáng kể trước khi yield.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/runtime_trace_preempt.png"
+    alt="Runtime trace showing non-cooperative preemption with 10ms+ goroutine blocks"
+    style={{maxWidth: '800px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+**Cooperative preemption**: Goroutine yield tại mỗi function call boundary (ví dụ `fmt.Printf`). Trace hiển thị các block rất ngắn (microsecond-level), cho thấy goroutine chuyển đổi nhanh chóng.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/runtime_trace_cooperative_preempt.png"
+    alt="Runtime trace showing cooperative preemption with microsecond-level context switches at function boundaries"
+    style={{maxWidth: '800px', width: '100%', height: 'auto'}}
+  />
+</div>
+
+### Tai sao can ca hai co che?
+
+Cả hai cơ chế preemption tồn tại song song vì chúng bổ sung cho nhau:
+
+- **Cooperative preemption** xử lý phần lớn trường hợp — vì function call rất thường xuyên trong code Go thông thường. Cơ chế này nhẹ hơn (chỉ cần kiểm tra stack guard, không cần signal) và cho phép preemption tại **safe points** nơi goroutine state nhất quán.
+
+- **Non-cooperative preemption** là lưới an toàn cho các tight loop không có function call — ví dụ `for {}` hoặc các vòng lặp tính toán thuần tuý chỉ thao tác trên biến local. Nếu không có cơ chế này, những goroutine như vậy sẽ chiếm giữ P vĩnh viễn và không bao giờ bị preempt.
+
+Kết hợp cả hai đảm bảo scheduler luôn có khả năng lấy lại quyền điều khiển, bất kể goroutine đang thực thi loại code nào.

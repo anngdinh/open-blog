@@ -1,0 +1,74 @@
+---
+title: "Go Scheduler Deep Dive: GMP Model, Preemption và Netpoll"
+description: "Phân tích chuyên sâu Go Scheduler - từ GMP model, goroutine preemption, system call handling đến netpoll và I/O multiplexing trong Go runtime"
+date: 2026-04-04
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+import Introduction from "./_sections/01-introduction.mdx";
+import CompilationRuntime from "./_sections/02-compilation-runtime.mdx";
+import PrimitiveScheduler from "./_sections/03-primitive-scheduler.mdx";
+import GmpModel from "./_sections/04-gmp-model.mdx";
+import BootstrapGoroutine from "./_sections/05-bootstrap-goroutine.mdx";
+import ScheduleLoop from "./_sections/06-schedule-loop.mdx";
+import Preemption from "./_sections/07-preemption.mdx";
+import SystemCalls from "./_sections/08-system-calls.mdx";
+import NetworkIO from "./_sections/09-network-io.mdx";
+import GcFunctionsConclusion from "./_sections/10-gc-functions-conclusion.mdx";
+
+export const metadata = generateBlogMetadata({
+  title: "Go Scheduler Deep Dive: GMP Model, Preemption và Netpoll",
+  description: "Phân tích chuyên sâu Go Scheduler - từ GMP model, goroutine preemption, system call handling đến netpoll và I/O multiplexing trong Go runtime",
+  date: "2026-04-04",
+  slug: "go-scheduler"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/go-scheduler/cover.jpg"
+    alt="Code editor displaying Go programming language source code"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+> Bài viết này là bản dịch và bổ sung giải thích từ bài gốc [Go Scheduler](https://nghiant3223.github.io/2025/04/15/go-scheduler.html) của **nghiant3223**. Nội dung được sử dụng cho mục đích học tập, phi thương mại. Mọi quyền thuộc về tác giả gốc.
+
+<Introduction />
+<CompilationRuntime />
+<PrimitiveScheduler />
+<GmpModel />
+<BootstrapGoroutine />
+<ScheduleLoop />
+<Preemption />
+<SystemCalls />
+<NetworkIO />
+<GcFunctionsConclusion />
+
+## References
+
+- [Go Scheduler - nghiant3223](https://nghiant3223.github.io/2025/04/15/go-scheduler.html)
+- [Go Scheduling - kelche.co](https://kelche.co/blog/go/scheduling/)
+- [Preemption in Go: An Introduction - unskilled.blog](https://unskilled.blog/posts/preemption-in-go-an-introduction/)
+- [Go Runtime Source Code (go1.24.0)](https://github.com/golang/go/tree/go1.24.0/src/runtime)
+- [Scalable Go Scheduler Design Doc - Dmitry Vyukov](https://docs.google.com/document/d/1TTj4T2JO42uD5ID9e89oa0sLKhJYD0Y_kqxDv3I3XMw)
+- [The Linux Programming Interface - Michael Kerrisk](https://man7.org/tlpi/)
+- [Unix Network Programming - W. Richard Stevens](https://www.amazon.com/Unix-Network-Programming-Sockets-Networking/dp/0131411551)
+- [Operating System Concepts - Silberschatz, Galvin, Gagne](https://www.os-book.com/)
+
+### Bài viết liên quan
+
+- [Deep Dive: Goroutines, Threads, and Processes in Go](/blog/golang-goroutines-deep-dive) - Khám phá sâu goroutines, threads và processes trong Go

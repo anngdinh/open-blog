@@ -1,0 +1,31 @@
+## Giới thiệu
+
+Go ra mắt năm 2009 bởi Google, nhanh chóng trở thành một trong những ngôn ngữ phổ biến nhất cho backend development và distributed systems. Một trong những điểm mạnh nổi bật nhất của Go chính là **concurrency model** dựa trên goroutines — lightweight user-space threads được Go runtime quản lý hoàn toàn, thay vì phụ thuộc vào OS threads truyền thống.
+
+> **Goroutine**: Là đơn vị thực thi nhẹ (lightweight execution unit) do Go runtime quản lý. Mỗi goroutine chỉ tốn khoảng 2-8 KB stack memory ban đầu, so với 1-8 MB cho một OS thread. Một chương trình Go có thể chạy hàng triệu goroutines đồng thời.
+
+> **Concurrency**: Là khả năng xử lý nhiều tasks đồng thời (not necessarily in parallel). Go cung cấp concurrency thông qua goroutines và channels, cho phép viết code đơn giản nhưng hiệu quả cho các bài toán I/O-bound và CPU-bound.
+
+Go cũng cung cấp **channels** — cơ chế communication và synchronization giữa các goroutines, theo triết lý nổi tiếng:
+
+> *"Don't communicate by sharing memory; share memory by communicating."*
+
+Hiểu cách Go scheduler hoạt động bên trong giúp developer:
+- Viết concurrent code hiệu quả hơn
+- Debug performance issues liên quan đến scheduling
+- Tối ưu I/O-bound và CPU-bound programs
+- Hiểu rõ behavior của runtime khi goroutines bị block
+
+### Nội dung bài viết
+
+Bài viết sẽ đi sâu vào các chủ đề sau:
+
+1. **Compilation và Go Runtime** — quá trình biên dịch và vai trò của runtime
+2. **Primitive Scheduler đến GMP Model** — evolution của scheduler design
+3. **GMP Model chi tiết** — cấu trúc G, M, P và cách chúng phối hợp
+4. **Bootstrap và tạo Goroutine** — quá trình khởi tạo chương trình Go
+5. **Schedule Loop** — vòng lặp scheduling chính
+6. **Preemption** — cooperative và non-cooperative preemption
+7. **System Call handling** — cách scheduler xử lý syscalls
+8. **Network I/O và Netpoll** — I/O multiplexing trong Go runtime
+9. **GC, Runtime Functions** — garbage collection và các hàm runtime quan trọng

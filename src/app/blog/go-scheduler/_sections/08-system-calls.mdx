@@ -1,0 +1,74 @@
+## Handling System Calls
+
+> **System Call (syscall)**: Là các services do kernel cung cấp cho user-space programs — bao gồm đọc file, thiết lập network connection, allocate memory, và nhiều thao tác khác. Go standard library abstract phần lớn syscalls, nhưng hiểu cách chúng hoạt động là chìa khóa để nắm rõ Go runtime internals.
+
+### Phân loại System Call
+
+Go runtime cung cấp hai wrappers cho system calls, phân biệt theo thời gian thực thi dự kiến:
+
+> **RawSyscall**: Wrapper thực hiện syscall trực tiếp mà không thông báo cho scheduler. Dùng cho các syscall nhanh, thời gian thực thi có thể dự đoán được — ví dụ `getpid`, `gettime`.
+
+> **Syscall**: Wrapper bọc `RawSyscall` với logic thông báo scheduler trước và sau khi thực hiện. Dùng cho các syscall có thời gian thực thi không thể dự đoán — ví dụ `read`, `write`, `connect`.
+
+```go
+func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
+    runtime_entersyscall()
+    r1, r2, err = RawSyscall6(trap, a1, a2, a3, 0, 0, 0)
+    runtime_exitsyscall()
+}
+```
+
+Cấu trúc rất rõ ràng: `Syscall` bọc `RawSyscall` với hai hàm `runtime_entersyscall()` và `runtime_exitsyscall()` — thông báo cho scheduler biết goroutine đang vào và ra khỏi syscall, để scheduler có thể điều phối tài nguyên hợp lý.
+
+### Scheduling trong Syscall
+
+#### Trước khi syscall (`runtime_entersyscall` -> `reentersyscall`)
+
+Khi goroutine chuẩn bị thực hiện syscall, runtime thực hiện các bước sau:
+
+1. **G chuyển state**: Running -> Syscall
+2. **Lưu execution context**: Save SP (stack pointer), PC (program counter), FP (frame pointer) để khôi phục sau khi syscall hoàn thành
+3. **M tách khỏi P**: M detaches khỏi P hiện tại, P chuyển sang trạng thái Syscall
+
+```text
++--------------+ entersyscall +--------------+
+| G: Running   | ---------->  | G: Syscall   |
+| M: has P     |              | M: no P      |
+| P: Running   |              | P: Syscall   |
++--------------+              +--------------+
+```
+
+#### sysmon monitoring
+
+> **sysmon**: Là một system goroutine chạy trên background thread riêng, liên tục monitor trạng thái của tất cả P trong hệ thống.
+
+Khi sysmon phát hiện một P ở trạng thái Syscall quá lâu (> 10ms), nó thực hiện **processor handoff** — gắn P đó cho một M khác (M1) để các goroutine runnable trong local run queue của P tiếp tục được thực thi.
+
+**Lưu ý quan trọng**: Đây là processor handoff, **không phải preemption**. M ban đầu vẫn bị block cùng G trong syscall — vì thread (M) là đơn vị thực thi của kernel, M thực hiện syscall thay mặt cho G, nên association giữa M và G được duy trì cho đến khi syscall hoàn thành.
+
+**Tại sao điều này quan trọng?** P trong trạng thái Syscall không thể được sử dụng bởi M khác cho đến khi sysmon seize nó hoặc syscall hoàn thành. Nếu nhiều goroutines cùng thực hiện syscall đồng thời và tất cả P đều bị lock trong trạng thái Syscall, chương trình sẽ không thể tiến triển (no progress). Đây là lý do tại sao Dgraph hardcode `GOMAXPROCS=128` — tăng số lượng P để có nhiều processor hơn cho disk I/O scheduling.
+
+#### Sau khi syscall (`runtime_exitsyscall`)
+
+Khi syscall hoàn thành, runtime cố gắng đưa goroutine trở lại trạng thái Running thông qua hai đường dẫn:
+
+**Fast path**: Có P available — P gốc vẫn ở trạng thái Syscall (sysmon chưa seize), hoặc tìm được idle P bất kỳ. G chuyển state: Syscall -> Running, tiếp tục thực thi ngay lập tức.
+
+**Slow path**: Không có P nào available. Runtime thử lấy idle P thêm một lần nữa:
+- Nếu tìm được idle P: schedule G trên P đó
+- Nếu không tìm được: G được đưa vào **global run queue**, M đi ngủ thông qua `stopm`
+
+```text
+                   exitsyscall
+                       |
+              +--------+--------+
+              |                 |
+         Fast path         Slow path
+              |                 |
+       P available?      Try idle P again
+          Yes |              |         |
+              v          Found P    No P
+        G: Running          |         |
+                       Schedule G   G -> global queue
+                       on P         M -> stopm (sleep)
+```

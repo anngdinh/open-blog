@@ -1,0 +1,145 @@
+## Schedule Loop
+
+Hàm `schedule()` là trung tâm của Go scheduler — nhiệm vụ chính là tìm và thực thi goroutine sẵn sàng chạy. Hàm này được gọi trong các trường hợp sau:
+
+- Một thread (M) mới được tạo
+- Goroutine gọi `runtime.Gosched()` để tự nguyện nhường CPU
+- Goroutine bị park (blocked trên channel, mutex, I/O) hoặc bị preempted
+- Sau khi system call hoàn tất
+
+Khi `schedule()` tìm được một goroutine (G) phù hợp, quá trình diễn ra như sau:
+
+1. G chuyển trạng thái từ **Runnable** sang **Running**
+2. Thread gọi hàm `gogo()` (được viết bằng assembly) để restore registers và nhảy vào code của G
+3. G bắt đầu thực thi
+
+### Vòng lặp Schedule
+
+Điểm quan trọng là schedule loop không bao giờ kết thúc — nó liên tục tìm và chạy goroutine. Khi một goroutine hoàn thành, flow diễn ra:
+
+1. Khi tạo goroutine, runtime đã push `goexit()` lên stack frame, nên khi G return, nó sẽ tự động gọi `goexit()`
+2. `goexit()` gọi `goexit0()` để dọn dẹp: chuyển G state sang **Dead**, đưa G vào free list để tái sử dụng, và hủy liên kết G-M
+3. `goexit0()` gọi lại `schedule()` — vòng lặp tiếp tục
+
+```text
+                    Schedule Loop
+                    =============
+
+  +-> schedule()
+  |       |
+  |       v
+  |   findRunnable() ---> select a G
+  |       |
+  |       v
+  |   execute(G)
+  |       |
+  |       v
+  |   gogo() [assembly] ---> restore registers
+  |       |
+  |       v
+  |   [G runs user code]
+  |       |
+  |       v
+  |   goexit() ---> auto-called when G returns
+  |       |
+  |       v
+  |   goexit0()
+  |       |  - G state -> Dead
+  |       |  - Put G in free list
+  |       |  - Drop G-M association
+  |       |
+  +-------+
+  
+  Alternative path (syscall):
+  
+  [G runs] -> entersyscall() -> [blocked in kernel]
+                                       |
+                                       v
+                                exitsyscall()
+                                       |
+                                       v
+                                  schedule()
+```
+
+### Tim Goroutine de chay (findRunnable)
+
+Hàm `findRunnable()` thực hiện quá trình tìm kiếm goroutine theo **9 bước ưu tiên**. Đây là thuật toán cốt lõi quyết định goroutine nào được chạy tiếp:
+
+**Bước 1: Kiểm tra trace reader goroutine**
+
+Nếu runtime đang thu thập execution trace (qua `runtime/trace` package), trace reader goroutine được ưu tiên cao nhất để đảm bảo trace data được xử lý kịp thời.
+
+**Bước 2: Kiểm tra GC worker goroutine**
+
+Nếu garbage collector đang chạy và cần worker goroutine, GC sẽ được ưu tiên. GC worker thực hiện marking phase — quét object graph để xác định live objects.
+
+**Bước 3: Lấy từ global run queue (xác suất 1/61)**
+
+> **Starvation prevention**: Cứ mỗi 61 lần gọi `schedule()`, hàm sẽ kiểm tra global run queue trước. Nếu không có cơ chế này, goroutine trong global queue có thể bị "bỏ đói" vĩnh viễn vì local queue luôn được kiểm tra trước và có thể luôn có goroutine sẵn sàng.
+
+Con số 61 là số nguyên tố — được chọn để tránh pattern lặp đều đặn và đảm bảo phân phối đều hơn.
+
+**Bước 4: Kiểm tra local run queue**
+
+Local run queue gồm hai thành phần:
+
+- **`runnext`**: Một slot duy nhất, chứa goroutine có độ ưu tiên cao nhất. Đây thường là goroutine vừa mới được tạo hoặc vừa được unblock — cho phép nó chạy ngay trên cùng P (tận dụng cache locality)
+- **`runq`**: Ring buffer với capacity lên đến **256** goroutine, hoạt động theo FIFO
+
+`runnext` được kiểm tra trước, sau đó mới đến `runq`.
+
+**Bước 5: Kiểm tra global run queue**
+
+Nếu local queue trống, kiểm tra global run queue. Khác với bước 3 (chỉ kiểm tra theo xác suất), bước này kiểm tra vô điều kiện.
+
+**Bước 6: Kiểm tra netpoll**
+
+Kiểm tra network poller xem có goroutine nào đang chờ I/O đã sẵn sàng hay không. Nếu có socket readable/writable, goroutine tương ứng sẽ được đánh thức.
+
+**Bước 7: Work stealing từ P khác**
+
+> **Work stealing**: Khi P hết việc, nó sẽ "ăn cắp" goroutine từ local run queue của P khác. Cơ chế này giúp cân bằng tải giữa các processor — tránh tình trạng một P quá tải trong khi P khác idle.
+
+Quá trình steal thực hiện tối đa **4 lần thử** (attempts), chọn P victim ngẫu nhiên:
+
+- **3 lần đầu**: Chỉ steal từ `runq` — lấy một nửa số goroutine trong queue của victim
+- **Lần thứ 4** (lần cuối): Thử steal `runnext` trước, nếu không có thì steal từ `runq`
+
+Lý do `runnext` chỉ bị steal ở lần cuối: goroutine trong `runnext` được kỳ vọng chạy trên P hiện tại để tận dụng CPU cache locality. Chỉ khi thực sự không tìm được goroutine nào khác, scheduler mới steal `runnext` từ P khác.
+
+**Bước 8: Kiểm tra GC worker lần nữa**
+
+Kiểm tra lại GC worker một lần nữa — có thể GC đã bắt đầu trong thời gian tìm kiếm.
+
+**Bước 9: Kiểm tra global queue lần nữa (nếu M đang spinning)**
+
+> **Spinning thread**: Thread đang trong trạng thái tích cực tìm kiếm goroutine. Spinning thread tiêu tốn CPU nhưng đổi lại giảm latency — goroutine mới có thể được chạy ngay lập tức mà không cần đánh thức thread đang ngủ.
+
+Nếu M đang spinning, kiểm tra global queue lần cuối trước khi từ bỏ.
+
+### Lấy batch từ global queue
+
+Ở các bước 3, 5 và 9, khi lấy goroutine từ global queue, scheduler lấy theo **batch** thay vì từng goroutine một:
+
+```text
+batch_size = (global_queue_size / num_P) + 1
+```
+
+Giá trị này bị giới hạn (cap) bởi:
+- Giá trị max cho phép (tuỳ context)
+- Một nửa capacity của local run queue của P (128 goroutine)
+
+Trong batch, **một goroutine** được trả về trực tiếp để thực thi ngay. Phần còn lại được đưa vào local run queue của P hiện tại.
+
+### Khi không tìm được goroutine
+
+Nếu sau 9 bước vẫn không tìm được goroutine nào:
+
+**Blocking trên netpoll**: M chờ trên network poller cho đến khi timer gần nhất hết hạn hoặc có I/O event. Khi netpoll trả kết quả (có goroutine I/O-ready), M quay lại schedule loop.
+
+**Idle state**: Nếu P không có timer nào đang chờ:
+
+1. P được đưa vào **idle P list** — danh sách các processor rảnh rỗi
+2. M đi ngủ bằng `stopm()`, sử dụng **futex** syscall ở mức kernel
+3. Trong trạng thái sleep, M **không tiêu tốn CPU** — kernel sẽ không schedule thread này cho đến khi nó được đánh thức
+4. Khi một thread khác tạo goroutine mới hoặc có event cần xử lý, nó sẽ đánh thức M đang ngủ
