@@ -101,6 +101,58 @@ This format matters because it creates a visual pattern readers can scan for —
 a blockquote with a bold term, they know it's a definition. Keep this consistent across every
 post.
 
+### Cover image
+
+Every blog post should have a cover image at the top, right after the `<Title>` component.
+This image sets the visual tone for the post and appears in social previews.
+
+**How to find and add a cover image:**
+
+1. **Search for a relevant image** using WebSearch. Search for terms related to the blog topic
+   on free image sources. Good search queries:
+   - `"unsplash" <topic> wallpaper wide`
+   - `"pexels" <topic> technology banner`
+   - `<topic> cover image 1200x630`
+
+2. **Use Unsplash as the primary source.** Unsplash images are free to use without attribution
+   (though attribution is appreciated). The direct download URL pattern is:
+   ```
+   https://images.unsplash.com/photo-<ID>?w=1200&h=630&fit=crop
+   ```
+   You can also use Pexels or other free stock photo sites.
+
+3. **Download the image** to `public/images/<slug>/cover.jpg` using curl:
+   ```bash
+   curl -L -o public/images/<slug>/cover.jpg "<image-url>"
+   ```
+
+4. **Verify the image** was downloaded and has a reasonable file size (should be >10KB):
+   ```bash
+   ls -la public/images/<slug>/cover.jpg
+   ```
+
+5. **Target size and ratio**: aim for approximately **1200x630px** (roughly 1.9:1 ratio). This
+   is the Open Graph standard and looks good as a blog banner. The `w=1200&h=630&fit=crop`
+   parameters on Unsplash URLs handle this automatically. If downloading from other sources,
+   the exact dimensions don't need to be perfect — anything in the 16:9 to 2:1 range works.
+
+6. **Place the cover image** in the MDX right after the `<Title>` component:
+   ```jsx
+   <Title title={metadata.title} date={metadata.date} />
+
+   <div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+     <img
+       src="/images/<slug>/cover.jpg"
+       alt="Descriptive alt text about the cover image"
+       style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+     />
+   </div>
+   ```
+
+7. **Choose images that match the content.** For a Kubernetes post, search for cloud/server
+   imagery. For a Go programming post, search for code/programming visuals. The image should
+   feel relevant — not a random stock photo.
+
 ### Images
 
 **Handling images from reference sources is critical — follow these rules carefully:**
@@ -229,6 +281,7 @@ Before presenting the post to the user, verify:
 - [ ] Language matches what the user requested
 - [ ] Frontmatter has title, description, date
 - [ ] Imports, metadata export, BlogJsonLd, and Title components are included
+- [ ] Cover image found, downloaded to `public/images/<slug>/cover.jpg`, and placed after Title
 - [ ] All keyword definitions use the blockquote + bold format
 - [ ] Images from references are downloaded to `public/images/<slug>/`
 - [ ] No reference images were replaced with text diagrams

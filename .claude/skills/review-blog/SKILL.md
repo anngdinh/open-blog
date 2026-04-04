@@ -58,32 +58,33 @@ The blog is written in Vietnamese with English technical terms mixed in. Review 
 ### 4. Text Diagrams (high priority)
 
 This blog relies heavily on ASCII/box-drawing diagrams. Diagram quality is critical — broken
-diagrams look unprofessional and confuse readers. Check every diagram in the post for:
+diagrams look unprofessional and confuse readers.
 
-- **Straight borders** — vertical lines (`│`) must be vertically aligned, horizontal lines (`─`)
-  must connect cleanly to corners (`┌`, `┐`, `└`, `┘`) and T-junctions (`├`, `┤`, `┬`, `┴`, `┼`).
-  A border is broken if the characters don't line up when rendered in a monospace font.
+**Do not eyeball diagram alignment.** Human counting of spaces is unreliable — off-by-one
+errors are invisible when reading but obvious when rendered. Instead, run the verification
+script to programmatically check every diagram:
+
+```bash
+python3 .claude/skills/review-blog/scripts/check_diagrams.py <path-to-mdx-file>
+```
+
+The script measures the actual display width of each line using Unicode `east_asian_width`
+and reports any lines that don't match the expected width. It also flags Vietnamese characters
+and wide Unicode arrows inside diagrams. Include the script output in your review.
+
+In addition to running the script, visually check for:
+
 - **Corrupted characters** — look for U+FFFD replacement characters (�) or other garbled Unicode.
-  These often appear when box-drawing characters get corrupted during copy-paste or encoding issues.
 - **Consistent character set** — don't mix thin (`─`, `│`) and thick (`━`, `┃`) box-drawing
-  characters within the same diagram unless intentional. Also watch for accidental use of regular
-  dashes (`-`) or pipes (`|`) mixed with Unicode box-drawing characters.
-- **English only inside diagrams** — Vietnamese diacritical characters (ổ, ự, ắ, etc.) have
-  inconsistent widths in monospace fonts, causing right borders to misalign. All text inside
-  diagram boxes must be in English. Flag any Vietnamese text found inside a diagram.
-- **No wide Unicode arrows** — characters like `▶`, `▼`, `→` take 2 columns in monospace,
-  breaking alignment. Flag them and suggest ASCII replacements: `>`, `v`, `->`.
-- **Column alignment** — text inside boxes should be padded consistently. If one box has content
-  flush-left and another has a space before content, flag it.
-- **Closing boxes** — every opened box (`┌`) must be properly closed (`┘`). Look for diagrams
-  where the bottom border is missing or cut off.
-- **Whitespace consistency** — diagrams should use consistent spacing. Watch for lines that are
-  shorter or longer than the box border, or labels that overflow their containers.
+  characters within the same diagram. Also watch for regular dashes (`-`) or pipes (`|`) mixed
+  with Unicode box-drawing characters.
+- **English only inside diagrams** — Vietnamese diacritical characters cause misalignment.
+  The script checks for this automatically.
+- **No wide Unicode arrows** — `▶`, `▼`, `→` take 2 columns in monospace. Use `>`, `v`, `->`.
+  The script checks for this automatically.
+- **Closing boxes** — every opened box (`┌`) must be properly closed (`┘`).
 
-When you find a broken diagram, report the specific line numbers and describe what's wrong
-(e.g., "Line 68: the right border `│` is misaligned by one space" or "Lines 156-172: contains
-U+FFFD replacement characters — the box-drawing characters are corrupted").
-
+When you find a broken diagram, report the specific line numbers and describe what's wrong.
 If a diagram is complex (>15 lines), suggest a corrected version when the fix isn't obvious.
 
 ### 5. Structure & MDX quality
