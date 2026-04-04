@@ -1,0 +1,300 @@
+---
+title: "Thiết lập Site-to-Site VPN giữa GCP và Ubuntu với Strongswan"
+description: "Hướng dẫn cấu hình IPSec VPN tunnel giữa Google Cloud Platform và server Ubuntu sử dụng Strongswan với IKEv2 và Pre-Shared Key"
+date: 2026-04-04
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+export const metadata = generateBlogMetadata({
+  title: "Thiết lập Site-to-Site VPN giữa GCP và Ubuntu với Strongswan",
+  description: "Hướng dẫn cấu hình IPSec VPN tunnel giữa Google Cloud Platform và server Ubuntu sử dụng Strongswan với IKEv2 và Pre-Shared Key",
+  date: "2026-04-04",
+  slug: "gke-vpn-strongswan"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/gke-vpn-strongswan/cover.jpg"
+    alt="Network cables connected to switches in a data center representing VPN connectivity"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+## Giới thiệu
+
+Khi bạn có workload chạy trên Google Cloud Platform (GCP) và cần kết nối an toàn với hạ tầng on-premises hoặc một server ở nơi khác, **Site-to-Site VPN** là giải pháp phổ biến nhất. Thay vì mở port và expose service ra public internet, VPN tạo một encrypted tunnel giữa hai mạng, cho phép chúng giao tiếp như thể cùng nằm trong một mạng nội bộ.
+
+Bài viết này hướng dẫn cách thiết lập IPSec VPN tunnel giữa **GCP Cloud VPN** và một server **Ubuntu** sử dụng **Strongswan** — một trong những IPSec implementation phổ biến nhất trên Linux.
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│             Site-to-Site VPN Topology                      │
+│                                                            │
+│  ┌────────────────┐            ┌────────────────┐          │
+│  │ GCP VPC        │            │ On-premises    │          │
+│  │ (Private Sub)  │            │ (Private Sub)  │          │
+│  │                │            │                │          │
+│  │ GCP VPN GW     │<--IPSec--->│ Strongswan     │          │
+│  │ (Public IP)    │  Tunnel    │ (Public IP)    │          │
+│  └────────────────┘            └────────────────┘          │
+└────────────────────────────────────────────────────────────┘
+```
+
+## Kiến thức nền tảng
+
+> **IPSec (Internet Protocol Security)**: Là bộ giao thức bảo mật hoạt động ở Layer 3, cung cấp authentication và encryption cho IP packets. IPSec là nền tảng của hầu hết các giải pháp VPN enterprise.
+
+> **IKEv2 (Internet Key Exchange version 2)**: Là giao thức dùng để thiết lập Security Association (SA) giữa hai bên trong IPSec tunnel. IKEv2 nhanh hơn và ổn định hơn so với IKEv1, đặc biệt khi cần reconnect.
+
+> **Pre-Shared Key (PSK)**: Là một secret key được chia sẻ trước giữa hai bên (GCP và Strongswan) để xác thực nhau khi thiết lập VPN tunnel. Đơn giản hơn certificate-based authentication nhưng kém linh hoạt hơn.
+
+> **Strongswan**: Là một open-source IPSec implementation cho Linux, hỗ trợ IKEv1, IKEv2, và nhiều authentication methods. Strongswan thay thế cho openswan/libreswan và được sử dụng rộng rãi trong production.
+
+> **Security Association (SA)**: Là một kết nối logic một chiều giữa hai bên, định nghĩa các tham số bảo mật (encryption algorithm, key, lifetime). Mỗi IPSec tunnel cần ít nhất hai SA (mỗi chiều một SA).
+
+## Yêu cầu trước khi bắt đầu
+
+- Server Ubuntu 22.04 với public IP
+- GCP project với Cloud VPN đã được cấu hình
+- Thông tin cần có:
+
+| Thông tin | Mô tả |
+|---|---|
+| GCP Public IP | IP của GCP VPN Gateway |
+| GCP Private Subnet | CIDR của mạng nội bộ GCP (VPC) |
+| Strongswan Public IP | IP public của server Ubuntu |
+| Strongswan Private IP | IP private của server Ubuntu |
+| Strongswan Private Subnet | CIDR của mạng nội bộ phía Ubuntu |
+
+## Bước 1: Cấu hình IP Forwarding
+
+Server Ubuntu cần forward IP packets giữa các interfaces để hoạt động như một VPN gateway. Chỉnh sửa `/etc/sysctl.conf`:
+
+```bash
+sudo nano /etc/sysctl.conf
+```
+
+Thêm hoặc uncomment các dòng sau:
+
+```text
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.ipv4.conf.all.accept_redirects = 0
+```
+
+Apply thay đổi:
+
+```bash
+sudo sysctl -p
+```
+
+> Lưu ý: `ip_forward = 1` cho phép kernel forward packets giữa các network interfaces — đây là yêu cầu bắt buộc để server hoạt động như router/VPN gateway. `accept_redirects = 0` tắt ICMP redirects để tránh bị thay đổi routing table bởi external sources.
+
+## Bước 2: Cài đặt Strongswan
+
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo apt install strongswan strongswan-pki libcharon-extra-plugins \
+  libcharon-extauth-plugins libstrongswan-extra-plugins \
+  libtss2-tcti-tabrmd0 -y
+```
+
+Bật Strongswan service:
+
+```bash
+sudo systemctl enable strongswan-starter
+```
+
+## Bước 3: Tạo Pre-Shared Key
+
+Tạo một random PSK đủ mạnh:
+
+```bash
+head -c 24 /dev/urandom | base64
+```
+
+Lưu output lại — bạn sẽ cần dùng key này ở cả hai phía (GCP và Strongswan). Key này cũng cần được cấu hình trên GCP Cloud VPN.
+
+## Bước 4: Cấu hình IPSec
+
+### 4.1 Cấu hình secrets
+
+Thêm PSK vào `/etc/ipsec.secrets`:
+
+```bash
+sudo nano /etc/ipsec.secrets
+```
+
+```text
+STRONGSWAN_PUBLIC_IP GCP_PUBLIC_IP : PSK "YOUR_PSK_VALUE"
+```
+
+Thay `STRONGSWAN_PUBLIC_IP`, `GCP_PUBLIC_IP`, và `YOUR_PSK_VALUE` bằng giá trị thực tế.
+
+### 4.2 Cấu hình tunnel
+
+Tạo file `/etc/ipsec.conf`:
+
+```bash
+sudo nano /etc/ipsec.conf
+```
+
+```text
+config setup
+        charondebug="all"
+
+conn site-b
+        type=tunnel
+        auto=start
+        keyexchange=ikev2
+        authby=secret
+        right=GCP_PUBLIC_IP
+        rightsubnet=GCP_PRIVATE_SUBNET
+        left=STRONGSWAN_PRIVATE_IP
+        leftid=STRONGSWAN_PUBLIC_IP
+        leftsubnet=STRONGSWAN_PRIVATE_SUBNET
+        ike=aes256-sha1-modp1024!
+        esp=aes256-sha1!
+        aggressive=no
+        keyingtries=%forever
+        ikelifetime=86400s
+        lifetime=43200s
+        lifebytes=576000000
+        dpddelay=30s
+        dpdtimeout=120s
+        dpdaction=restart
+```
+
+Giải thích các tham số quan trọng:
+
+| Tham số | Giá trị | Mô tả |
+|---|---|---|
+| `keyexchange` | `ikev2` | Sử dụng IKEv2 protocol |
+| `authby` | `secret` | Xác thực bằng Pre-Shared Key |
+| `right` | GCP Public IP | Peer (phía GCP) |
+| `rightsubnet` | GCP CIDR | Mạng nội bộ phía GCP |
+| `left` | Strongswan Private IP | Local identity |
+| `leftid` | Strongswan Public IP | ID gửi cho peer |
+| `auto` | `start` | Tự động kết nối khi service start |
+| `dpdaction` | `restart` | Tự động reconnect khi Dead Peer Detection phát hiện tunnel down |
+| `keyingtries` | `%forever` | Retry không giới hạn nếu kết nối thất bại |
+
+```text
+┌──────────────────────────────────────────────────────────┐
+│            IPSec Tunnel Parameters                       │
+│                                                          │
+│  Phase 1 (IKE SA):                                       │
+│    Encryption: AES-256                                   │
+│    Hash:       SHA-1                                     │
+│    DH Group:   modp1024 (Group 2)                        │
+│    Lifetime:   86400s (24 hours)                         │
+│                                                          │
+│  Phase 2 (Child SA / ESP):                               │
+│    Encryption: AES-256                                   │
+│    Hash:       SHA-1                                     │
+│    Lifetime:   43200s (12 hours)                         │
+│    Bytes:      576MB                                     │
+│                                                          │
+│  Dead Peer Detection:                                    │
+│    Delay:   30s                                          │
+│    Timeout: 120s                                         │
+│    Action:  restart                                      │
+└──────────────────────────────────────────────────────────┘
+```
+
+## Bước 5: Khởi động VPN tunnel
+
+```bash
+sudo ipsec restart
+```
+
+Kiểm tra trạng thái kết nối:
+
+```bash
+sudo ipsec statusall
+```
+
+Kết quả mong đợi — bạn sẽ thấy trạng thái `ESTABLISHED` cho IKE SA và `INSTALLED` cho Child SA:
+
+```text
+Connections:
+  site-b: STRONGSWAN_PRIVATE_IP...GCP_PUBLIC_IP  IKEv2
+Security Associations:
+  site-b[1]: ESTABLISHED ... IKEv2 SPIs: ...
+  site-b{1}: INSTALLED, TUNNEL, ESP SPIs: ...
+```
+
+## Bước 6: Cấu hình routing trên GCP
+
+Để traffic từ GCP VPC đi qua VPN tunnel đến mạng phía Strongswan, bạn cần tạo route trên GCP:
+
+1. Trong GCP Console, vào **VPC network** > **Routes**
+2. Tạo route mới:
+   - **Destination**: CIDR của mạng phía Strongswan
+   - **Next hop**: VPN tunnel đã tạo
+
+Hoặc sử dụng `gcloud`:
+
+```bash
+gcloud compute routes create vpn-route-to-onprem \
+  --network=YOUR_VPC \
+  --destination-range=STRONGSWAN_PRIVATE_SUBNET \
+  --next-hop-vpn-tunnel=YOUR_VPN_TUNNEL \
+  --next-hop-vpn-tunnel-region=YOUR_REGION
+```
+
+## Troubleshooting
+
+Một số lỗi thường gặp:
+
+- **Tunnel không ESTABLISHED**: Kiểm tra PSK khớp ở cả hai phía, firewall cho phép UDP port 500 và 4500 (IKE), và IP protocol 50 (ESP).
+- **Tunnel ESTABLISHED nhưng không ping được**: Kiểm tra routing — cả hai phía cần có route trỏ về subnet của phía còn lại qua VPN tunnel. Kiểm tra `ip route` trên Strongswan và routes trên GCP.
+- **Tunnel bị drop liên tục**: Kiểm tra DPD settings và đảm bảo cả hai phía dùng cùng IKE/ESP proposals (algorithm mismatch là nguyên nhân phổ biến).
+
+Debug bằng `tcpdump`:
+
+```bash
+sudo tcpdump -i any -n esp or udp port 500 or udp port 4500
+```
+
+Xem Strongswan logs:
+
+```bash
+sudo journalctl -u strongswan-starter -f
+```
+
+## Tổng kết
+
+| Bước | Mục đích |
+|---|---|
+| IP Forwarding | Cho phép server forward packets qua VPN |
+| Install Strongswan | IPSec implementation trên Ubuntu |
+| Pre-Shared Key | Authentication giữa hai bên |
+| ipsec.conf + ipsec.secrets | Cấu hình tunnel parameters |
+| ipsec restart | Khởi động và kết nối tunnel |
+| GCP Routes | Routing traffic qua VPN tunnel |
+
+Site-to-Site VPN với Strongswan là giải pháp đáng tin cậy để kết nối hạ tầng on-premises với GCP. Với `dpdaction=restart` và `keyingtries=%forever`, tunnel sẽ tự động reconnect khi gặp sự cố, đảm bảo kết nối liên tục.
+
+> Lưu ý bảo mật: SHA-1 và modp1024 (DH Group 2) trong cấu hình trên đã được coi là yếu theo tiêu chuẩn hiện tại. Nếu GCP hỗ trợ, hãy nâng cấp lên `sha256` hoặc `sha384`, và `modp2048` (Group 14) hoặc cao hơn cho production.
+
+## References
+
+- [Strongswan Documentation](https://docs.strongswan.org/docs/5.9/index.html)
+- [GCP Cloud VPN Overview](https://cloud.google.com/network-connectivity/docs/vpn/concepts/overview)
+- [GCP Classic VPN with Strongswan](https://cloud.google.com/network-connectivity/docs/vpn/how-to/creating-static-vpns)
+- [VContainer Helm Infra Documentation - GCP VPN Strongswan](https://anngdinh.github.io/vcontainer-helm-infra-documentation/helm-charts/vks-fleet/GKEVPN-strongswan.html)
