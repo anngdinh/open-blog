@@ -156,6 +156,14 @@ text alone. Use them to complement the content — they're a signature style of 
 - Use Unicode box-drawing characters (`┌`, `─`, `┐`, `│`, `└`, `┘`, `├`, `┤`, `┬`, `┴`, `┼`)
   for clean borders — or `+`, `-`, `|` for simpler diagrams
 - Don't mix character sets within one diagram
+- **Always use English for text inside diagrams.** Vietnamese diacritical characters (ổ, ự, ắ,
+  etc.) have inconsistent widths in monospace fonts, which causes the right border to misalign.
+  English characters are always exactly one column wide, so borders stay straight. The blog
+  prose around the diagram can be in any language — this rule only applies to text inside the
+  diagram box.
+- **Avoid wide Unicode arrows inside diagrams.** Characters like `▶`, `▼`, `→` take 2 columns
+  in monospace fonts, breaking right-border alignment. Use ASCII equivalents instead:
+  `▶` → `>`, `▼` → `v`, `→` → `->`. The box-drawing border characters (`┌─┐│└┘├┤`) are fine.
 - Keep borders straight and aligned (this will be verified by the review-blog skill)
 - Do NOT create a text diagram to replace an image from a reference source — the image takes
   priority. You may add a supplementary text diagram alongside an image if it helps explain
