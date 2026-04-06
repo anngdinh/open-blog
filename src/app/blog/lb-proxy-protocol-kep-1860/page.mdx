@@ -1,6 +1,6 @@
 ---
-title: "Khi Load Balancer Bị Tàng Hình Trong Chính Cluster: Debug Proxy Protocol và KEP-1860"
-description: "Hành trình debug vấn đề kube-proxy bypass Load Balancer khi bật Proxy Protocol, workaround bằng hostname, và fix chính thức với KEP-1860 trong Kubernetes 1.32"
+title: "Khi Pod Nội Bộ Không Gọi Được Service Của Chính Mình: Debug Proxy Protocol Trên VKS Và Bài Học Từ KEP-1860"
+description: "Hành trình debug vấn đề kube-proxy bypass Load Balancer khi bật Proxy Protocol trên VKS, workaround bằng hostname, và fix chính thức với KEP-1860 ipMode: Proxy"
 date: 2026-04-04
 ---
 
@@ -9,8 +9,8 @@ import BlogJsonLd from "../../../components/blog-json-ld";
 import Title from "../../../components/title";
 
 export const metadata = generateBlogMetadata({
-  title: "Khi Load Balancer Bị Tàng Hình Trong Chính Cluster: Debug Proxy Protocol và KEP-1860",
-  description: "Hành trình debug vấn đề kube-proxy bypass Load Balancer khi bật Proxy Protocol, workaround bằng hostname, và fix chính thức với KEP-1860 trong Kubernetes 1.32",
+  title: "Khi Pod Nội Bộ Không Gọi Được Service Của Chính Mình: Debug Proxy Protocol Trên VKS Và Bài Học Từ KEP-1860",
+  description: "Hành trình debug vấn đề kube-proxy bypass Load Balancer khi bật Proxy Protocol trên VKS, workaround bằng hostname, và fix chính thức với KEP-1860 ipMode: Proxy",
   date: "2026-04-04",
   slug: "lb-proxy-protocol-kep-1860"
 })
@@ -34,388 +34,404 @@ export const metadata = generateBlogMetadata({
   />
 </div>
 
-## Mở đầu: Mọi thứ hoạt động tốt... cho đến khi bật Proxy Protocol
+## 1. Bối cảnh: Hệ thống trên VKS với mô hình NLB -> Nginx Ingress
 
-Tôi đang phát triển một **Load Balancer Controller** cho cloud provider nội bộ của công ty — về cơ bản là một custom controller giúp K8s tự động provision LB thật khi có Service kiểu `LoadBalancer` được tạo ra.
-
-Mọi thứ hoạt động hoàn hảo. Customer có thể tạo Service, LB được provision, traffic vào bình thường.
-
-Rồi một ngày, team quyết định bật **Proxy Protocol** trên LB để backend có thể biết được real IP của client.
-
-Câu chuyện bắt đầu từ đây.
-
-## Background: Proxy Protocol là gì và tại sao cần nó?
-
-> **Proxy Protocol**: Là một network protocol do HAProxy phát triển, hoạt động ở tầng TCP. Load Balancer thêm một dòng header đặc biệt vào đầu mỗi TCP stream trước khi forward đến backend, chứa thông tin về IP gốc của client. Giải quyết vấn đề mất source IP khi traffic đi qua NAT.
-
-Khi traffic đi qua một Load Balancer, IP gốc của client thường bị mất do NAT. Backend service chỉ thấy IP của LB thay vì IP thật của người dùng — điều này gây ra vấn đề với logging, rate limiting, geo-blocking, và nhiều thứ khác.
-
-Proxy Protocol header trông như thế này:
+Hệ thống của chúng tôi chạy trên **VNG Kubernetes Service (VKS)** — managed Kubernetes của VNGCLOUD. Mô hình expose traffic ra bên ngoài khá phổ biến với nhiều team:
 
 ```text
-PROXY TCP4 192.168.1.100 10.0.0.1 54321 80\r\n
+Internet
+    |
+    v
++-----------------------------------+
+|   vLB Network Load Balancer       |  <-- L4, TCP passthrough, Public IP
+|   (auto-provisioned by VKS)       |
++-----------------+-----------------+
+                  |
+                  v
++-----------------------------------+
+|   Nginx Ingress Controller        |  <-- L7, TLS termination
+|   (inside cluster)                |      route by host / path
++---------+--------------+----------+
+          |              |
+          v              v
+     Service A      Service B
+     (api.*)        (admin.*)
 ```
 
-Backend service đọc header này và biết được real client IP — mà không cần HTTP header hay bất kỳ thay đổi nào ở application layer.
+Mô hình này phổ biến vì:
+- **NLB (L4)** xử lý TCP nhanh, không inspect nội dung, terminate ở node
+- **Nginx Ingress (L7)** xử lý TLS, routing phức tạp theo host/path — linh hoạt hơn nhiều so với dùng ALB của cloud provider trực tiếp
+- Chi phí hợp lý: một NLB duy nhất phía trước, mọi routing logic nằm trong Nginx
 
-> Lưu ý quan trọng: Nếu backend service được cấu hình để expect Proxy Protocol header, mà traffic đến lại không có header này, service sẽ **reject connection ngay lập tức** — vì nó coi đó là malformed request.
-
-## Cần hiểu: kube-proxy và cơ chế iptables
-
-Để hiểu vấn đề, chúng ta cần nắm cơ chế hoạt động của kube-proxy.
-
-> **kube-proxy**: Là một component chạy trên mỗi node dưới dạng DaemonSet, lập trình iptables rules (hoặc IPVS rules) để intercept và route traffic đến Kubernetes Services. kube-proxy không phải là proxy thật — nó chỉ quản lý network rules.
-
-**Kubernetes Service không phải là một process thật sự.** Không có gì đang "lắng nghe" trên ClusterIP đó cả. Theo [learnkube.com](https://learnkube.com/kubernetes-services-and-load-balancing):
-
-> *"Services are just definitions of how traffic should be forwarded to pods. There's no load balancer."*
-
-Khi bạn tạo một Service:
-1. Endpoint controller thu thập IP của các pod match với selector
-2. kube-proxy subscribe vào các thay đổi này
-3. kube-proxy tạo iptables rules để DNAT traffic từ Service IP sang Pod IP
+Khi tạo Service kiểu `LoadBalancer` cho Nginx Ingress, VKS tự động provision một NLB và trả về Public IP trong `status.loadBalancer.ingress`:
 
 ```bash
-# Ví dụ iptables chain cho một service
-# KUBE-SVC-XXXXX -> KUBE-SEP-YYYYY (DNAT: 10.96.0.100:80 -> 10.244.1.5:8080)
+kubectl get svc -n ingress-nginx nginx-ingress-controller
+# NAME                       TYPE           CLUSTER-IP    EXTERNAL-IP      PORT(S)
+# nginx-ingress-controller   LoadBalancer   10.96.45.12   103.245.252.75   80:31080/TCP,443:31443/TCP
 ```
 
-Đây là cơ chế **hoạt động ở tầng L3/L4** — nó chỉ quan tâm đến IP address, không quan tâm đến hostname hay domain.
+`103.245.252.75` là IP public của NLB — đây là địa chỉ mà DNS domain của chúng tôi trỏ tới.
 
-### LoadBalancer Service hoạt động thế nào?
+---
 
-Khi bạn tạo `type: LoadBalancer`:
-1. Cloud provider provision một LB thật (external)
-2. LB IP được gán vào `status.loadBalancer.ingress[].ip` của Service
-3. **kube-proxy đọc IP này và tạo iptables rules cho nó** — giống hệt ClusterIP
+## 2. Nhu cầu: Muốn thấy Client IP thật ở backend
 
-Điều này có nghĩa là khi **bất kỳ pod nào trong cluster** gọi đến LB IP này, traffic sẽ **bị iptables intercept và DNAT thẳng đến backend pod** — không hề đi qua LB thật.
+Một ngày team yêu cầu backend service phải log được **real IP của client** — phục vụ audit, rate limiting, và geo-blocking. Vấn đề là khi traffic qua NLB rồi qua Nginx, backend chỉ thấy IP của Nginx pod, không phải IP thật của client.
+
+VNGCLOUD có hẳn một trang hướng dẫn cho use case này: [Preserve Source IP when using NLB and Nginx Ingress Controller](https://docs.vngcloud.vn/vng-cloud-document/vks/network/working-with-nlb/preserve-source-ip-when-using-nlb-and-nginx-ingress-controller.md).
+
+> **Proxy Protocol**: Là một network protocol do HAProxy phát triển, hoạt động ở tầng TCP. LB thêm một dòng header đặc biệt vào đầu mỗi TCP stream trước khi forward đến backend, chứa thông tin về IP gốc của client.
+
+Giải pháp là bật **Proxy Protocol** — NLB sẽ inject một header đặc biệt vào đầu mỗi TCP stream trước khi forward sang Nginx:
 
 ```text
-+-----------------------------------------------------------+
-|            LoadBalancer Service Flow                      |
-|                                                           |
-|  External client --> LB --> NodePort --> Pod   (normal)   |
-|                                                           |
-|  Internal pod -----> LB IP                                |
-|       |                                                   |
-|       +---> iptables DNAT ---> Pod directly  (shortcut!)  |
-|             (LB is bypassed)                              |
-+-----------------------------------------------------------+
+PROXY TCP4 <client-ip> <nlb-ip> <client-port> <nlb-port>\r\n
 ```
 
-## Vấn đề: Traffic không đi qua LB khi gọi từ bên trong cluster
+Nginx đọc header này và biết được real IP, rồi forward vào `X-Forwarded-For` cho backend.
 
-### Triệu chứng
+### Cấu hình theo doc của VNGCLOUD
 
-Sau khi bật Proxy Protocol trên LB và cấu hình backend service (Nginx) để expect header:
+**Bước 1:** Cập nhật ConfigMap của Nginx Ingress để đọc Proxy Protocol:
 
 ```bash
-# Customer gọi từ bên ngoài cluster -> hoạt động tốt
-$ curl -s https://103.45.67.89/api
-{"status": "ok", "client_ip": "14.232.166.45"}
-
-# Customer gọi từ pod bên trong cluster -> connection failed
-$ kubectl exec -it debug-pod -- curl http://103.45.67.89/api
-curl: (56) Recv failure: Connection reset by peer
+kubectl edit cm -n kube-system nginx-ingress-controller
 ```
-
-Kiểm tra log của backend service (Nginx với `proxy_protocol` enabled):
-
-```text
-2026/03/15 09:23:41 [error] 29#29: *1842 broken header:
-  "GET /api HTTP/1.1..." while reading PROXY protocol,
-  client: 10.244.1.15, server: 0.0.0.0:80
-2026/03/15 09:23:41 [error] 29#29: *1843 broken header:
-  "GET /api HTTP/1.1..." while reading PROXY protocol,
-  client: 10.244.1.15, server: 0.0.0.0:80
-```
-
-Log rất rõ ràng: Nginx đang expect Proxy Protocol header ở đầu connection, nhưng nhận được `GET /api HTTP/1.1` — tức là **raw HTTP request không có Proxy Protocol header**. Và source IP là `10.244.1.15` — một Pod IP trong cluster, không phải IP của LB.
-
-Điều kỳ lạ: tại sao traffic từ pod lại đến thẳng backend mà không qua LB?
-
-### Debug: Traffic đi đâu?
-
-**Bước 1: tcpdump trên node để xem traffic có ra khỏi node không**
-
-```bash
-# Capture tất cả traffic đến LB IP trên node mà pod đang chạy
-$ tcpdump -i eth0 host 103.45.67.89 -n
-tcpdump: verbose output suppressed, use -v for full protocol decode
-listening on eth0, link-type EN10MB
-^C
-0 packets captured
-```
-
-**Không có packet nào ra khỏi node đến LB IP.** Traffic biến mất ở đâu đó bên trong node.
-
-**Bước 2: tcpdump trên tất cả interfaces**
-
-```bash
-$ tcpdump -i any host 103.45.67.89 -n -c 10
-09:25:01.234 IP 10.244.1.15.54321 > 103.45.67.89.80: Flags [S], seq 1234567
-09:25:01.234 IP 10.244.1.15.54321 > 10.244.2.10.8080: Flags [S], seq 1234567
-09:25:01.235 IP 10.244.2.10.8080 > 10.244.1.15.54321: Flags [S.], seq 7654321
-```
-
-**Bingo!** Dòng thứ hai cho thấy: packet gửi đến `103.45.67.89:80` bị **DNAT thành `10.244.2.10:8080`** (Pod IP của backend) ngay trên node. Traffic không bao giờ rời khỏi cluster.
-
-**Bước 3: Kiểm tra iptables rules**
-
-```bash
-$ iptables -t nat -L KUBE-SERVICES -n | grep 103.45.67.89
-KUBE-SVC-ABCDE  tcp  --  0.0.0.0/0  103.45.67.89  /* default/my-service loadbalancer IP */ tcp dpt:80
-
-$ iptables -t nat -L KUBE-SVC-ABCDE -n
-Chain KUBE-SVC-ABCDE (2 references)
-target          prot  source      destination
-KUBE-SEP-FGHIJ  all  --  0.0.0.0/0  0.0.0.0/0  /* default/my-service */
-
-$ iptables -t nat -L KUBE-SEP-FGHIJ -n
-Chain KUBE-SEP-FGHIJ (1 references)
-target   prot  source      destination
-DNAT     tcp   --  0.0.0.0/0  0.0.0.0/0  /* default/my-service */ tcp to:10.244.2.10:8080
-```
-
-**Eureka!** kube-proxy đã tạo iptables rules cho LB IP và đang DNAT traffic thẳng đến backend pod — **bỏ qua hoàn toàn LB thật**.
-
-## Root Cause: kube-proxy "shortcut" LoadBalancer IP
-
-Đây là cơ chế mà ít người biết đến. Khi kube-proxy thấy `status.loadBalancer.ingress[].ip`, nó sẽ:
-
-1. **Tạo iptables rules match trên IP đó** — giống như ClusterIP
-2. Bất kỳ traffic nào từ trong cluster đến IP đó **bị intercept và DNAT** đến backend pod
-
-```text
-+-----------------------------------------------------------+
-|                    Root Cause                             |
-|                                                           |
-|  Pod --> LB IP --> iptables DNAT --> Backend Pod          |
-|                   (LB never sees the packet)              |
-|                                                           |
-|  Result: No Proxy Protocol header injected                |
-|          Backend expects header --> rejects connection    |
-+-----------------------------------------------------------+
-```
-
-**Vì LB không bao giờ thấy packet, nó không có cơ hội inject Proxy Protocol header.** Backend service expect header -> không có header -> reject connection.
-
-> Vấn đề này không phải là "hairpin" theo nghĩa chính xác. Hairpin là khi pod gọi đến service mà chính nó là backend. Đây là một vấn đề khác nhưng cùng nguồn gốc: kube-proxy can thiệp vào routing không như mong đợi.
-
-## Giải pháp: Dùng Hostname thay vì IP
-
-### Tại sao hostname lại khác?
-
-Nhận ra rằng iptables chỉ có thể match trên **IP address**, không thể match trên hostname. Điều này dẫn đến một giải pháp sáng tạo:
-
-**Thay vì** gán IP vào `status.loadBalancer.ingress[].ip`:
 
 ```yaml
+data:
+  proxy-protocol: "True"
+  real-ip-header: proxy_protocol
+  real-ip-recursive: "True"
+  set-real-ip-from: 0.0.0.0/0
+  use-proxy-protocol: "True"   # Nginx expect PP header from upstream
+```
+
+**Bước 2:** Annotate Service của Nginx để NLB bật Proxy Protocol:
+
+```bash
+kubectl annotate service -n kube-system nginx-ingress-controller \
+  vks.vngcloud.vn/enable-proxy-protocol="http,https"
+```
+
+Sau khi apply, test từ bên ngoài — client IP thật đã xuất hiện trong log. **Mọi thứ có vẻ ổn.**
+
+---
+
+## 3. Sự cố: Smoke test trong cluster bắt đầu fail
+
+Chúng tôi có một bộ **smoke test** chạy dưới dạng Kubernetes Job — trigger sau mỗi lần deploy để verify toàn bộ production path, bao gồm TLS, authentication middleware và routing rule. Job này gọi đúng domain production (`api.company.com`) thay vì ClusterIP nội bộ — vì chúng tôi muốn test **đúng những gì user thật trải nghiệm**, không gọi tắt.
+
+Sau khi bật Proxy Protocol, smoke test job bắt đầu fail hoàn toàn:
+
+```bash
+kubectl logs smoke-test-job-a1b2c3
+# [FAIL] GET https://api.company.com/healthz
+# curl: (56) Recv failure: Connection reset by peer
+#
+# [FAIL] GET https://api.company.com/v1/products
+# curl: (52) Empty reply from server
+```
+
+Trong khi đó, test từ laptop bên ngoài cluster vẫn pass hoàn toàn. **Cùng domain, cùng endpoint — bên ngoài OK, bên trong fail.**
+
+---
+
+## 4. Debug: Tìm hiểu traffic đi đâu
+
+### Log từ smoke test pod
+
+Connection bị reset ngay lập tức, không phải timeout — đây là dấu hiệu server chủ động đóng connection, không phải network issue.
+
+### Log từ Nginx Ingress pod
+
+```bash
+kubectl logs -n ingress-nginx nginx-ingress-controller-xxx | grep "api.company.com"
+# 2024/01/15 10:23:41 [error] 123#123: *456 SSL_do_handshake() failed
+#   (SSL: error:14094418:SSL routines:ssl3_read_bytes:tlsv1 alert unknown ca)
+#   while SSL handshaking, client: 10.244.2.15, server: 0.0.0.0:443
+```
+
+Kỳ lạ: Nginx log `client: 10.244.2.15` — đây là **Pod IP của smoke test job**, không phải IP của NLB hay bất kỳ external IP nào. Tại sao Nginx lại thấy IP nội bộ của pod?
+
+### tcpdump trên node
+
+```bash
+# Capture on the node running the smoke test pod
+tcpdump -i any host 103.245.252.75 -n
+
+# Result: NO packets to/from 103.245.252.75 !
+```
+
+Traffic hướng đến `103.245.252.75` (IP của NLB) nhưng **không có gói tin nào thật sự rời khỏi node**.
+
+### Nhờ team VNGCLOUD support tcpdump trên NLB
+
+Chúng tôi liên hệ team support của VNGCLOUD, nhờ họ capture traffic trên NLB trong thời gian smoke test chạy.
+
+Kết quả từ phía NLB: **không có connection nào từ IP của cluster đến NLB trong khoảng thời gian đó.** NLB không hề nhìn thấy request của smoke test.
+
+**Kết luận:** Traffic từ smoke test pod đến `103.245.252.75` đã bị "nuốt" mất ở đâu đó trong node — không ra ngoài internet, không đến NLB.
+
+### Kiểm tra iptables
+
+```bash
+# SSH into node, check iptables
+iptables -t nat -L KUBE-SERVICES -n | grep 103.245.252.75
+
+# Output:
+# KUBE-SVC-XXXXXXXXXXXXXX  tcp  --  0.0.0.0/0  103.245.252.75  tcp dpt:443
+# KUBE-SVC-YYYYYYYYYYYYYY  tcp  --  0.0.0.0/0  103.245.252.75  tcp dpt:80
+```
+
+**Tìm ra thủ phạm.** kube-proxy đã tạo iptables rules cho IP `103.245.252.75` — bất kỳ traffic nào từ trong cluster đến IP này đều bị intercept và DNAT thẳng đến Nginx pod, **không đi qua NLB thật**.
+
+```bash
+iptables -t nat -L KUBE-SVC-XXXXXXXXXXXXXX -n
+# KUBE-SEP-ZZZZZZ  tcp -- DNAT to 10.244.1.8:443  (Nginx pod IP)
+```
+
+---
+
+## 5. Root Cause: kube-proxy intercept LB IP — Thiết kế có chủ đích
+
+Đây không phải bug. Kubernetes blog [chính thức giải thích](https://kubernetes.io/blog/2023/12/18/kubernetes-1-29-feature-loadbalancer-ip-mode-alpha/) đây là behavior có chủ đích với hai lý do:
+
+### Lý do 1 — Tối ưu traffic path
+
+Không có interception, traffic từ pod đến LB sẽ phải đi vòng:
+
+```text
+Pod -> exit node -> NLB -> back to cluster -> Nginx pod
+```
+
+Với interception, kube-proxy đi tắt:
+
+```text
+Pod -> kube-proxy DNAT -> Nginx pod  (no external hop)
+```
+
+Tiết kiệm latency và bandwidth — hoàn toàn hợp lý khi LB chỉ đơn thuần forward traffic.
+
+### Lý do 2 — Xử lý health-check packets từ LB
+
+Một số LB gửi packet với destination IP là LB IP (không phải pod IP). Không có rules thì những packet này không biết đi đâu. kube-proxy tạo rules để route chúng đúng đến backend.
+
+### Khi nào interception trở thành vấn đề?
+
+Khi LB **có thêm logic xử lý** mà packet phải đi qua:
+
+```text
+Normal (LB only forwards):
+  Pod -> [kube-proxy DNAT] -> Nginx  OK
+  (LB does nothing special -> bypass is fine)
+
+With Proxy Protocol:
+  Pod -> [kube-proxy DNAT] -> Nginx  FAIL
+  (NLB never sees the packet -> no PP header injected)
+  (Nginx expects PP header -> rejects connection)
+```
+
+Kubernetes blog tổng kết hai nhóm vấn đề:
+
+> *"Feature loss at load balancer level: Certain cloud providers offer features (such as TLS termination, proxy protocol, etc.) at the load balancer level. Bypassing the load balancer results in the loss of these features when the packet reaches the service, leading to protocol errors."*
+
+Và:
+
+> *"Source IP: Some cloud providers use the load balancer's IP as the source IP when transmitting packets to the node. In the ipvs mode of kube-proxy, health checks from the load balancer never return."*
+
+Đây chính xác là vấn đề chúng tôi gặp: Nginx được cấu hình `use-proxy-protocol: "True"` — nghĩa là **mọi connection đến đều phải có PP header**. Connection từ pod không có header -> Nginx reject ngay lập tức.
+
+```text
+================================================================
+BEFORE: Proxy Protocol OFF
+================================================================
+
+External client                  Smoke test pod (inside cluster)
+      |                                       |
+      v                                       | calls 103.245.252.75
++-------------+                               |
+|  vLB NLB    |                               | kube-proxy DNAT
+|  (forward)  |                               | (shortcut to Nginx)
++------+------+                               |
+       v                                      v
++-----------------+                  +-----------------+
+|  Nginx Ingress  |                  |  Nginx Ingress  |
+|  (no PP config) |                  |  (no PP config) |
++--------+--------+                  +--------+--------+
+         v                                    v
+   Backend OK                           Backend OK
+
+
+================================================================
+AFTER: Proxy Protocol ON (per VNGCLOUD docs)
+================================================================
+
+External client                  Smoke test pod (inside cluster)
+      |                                       |
+      v                                       | calls 103.245.252.75
++-------------+                               |
+|  vLB NLB    |                               | kube-proxy DNAT
+|  +PP header |                               | (same shortcut!)
++------+------+                               |
+       | TCP + PP header                      | (no PP header)
+       v                                      v
++----------------------+          +----------------------+
+|    Nginx Ingress     |          |    Nginx Ingress     |
+| use-proxy-protocol:  |          | use-proxy-protocol:  |
+|        true          |          |        true          |
+|  reads PP header OK  |          |  NO PP header !!     |
++----------+-----------+          +----------------------+
+           v                                  v
+     Backend OK                    Connection reset !!
+```
+
+---
+
+## 6. Tìm giải pháp: Làm việc cùng team VNGCLOUD
+
+Sau khi xác định root cause, chúng tôi làm việc với team support VNGCLOUD để tìm phương án. Có ba hướng được đặt ra:
+
+### Phương án 1: Hostname workaround — nip.io
+
+kube-proxy chỉ tạo iptables rules dựa trên **IP** lấy từ `status.loadBalancer.ingress[].ip`. Nếu thay bằng hostname, kube-proxy không tạo được rules -> traffic buộc phải đi theo routing thật -> qua NLB -> PP header được inject.
+
+VNGCLOUD update controller để set hostname thay vì IP:
+
+```yaml
+# Before
 status:
   loadBalancer:
     ingress:
-    - ip: "103.45.67.89"  # kube-proxy tạo rules cho IP này!
-```
+    - ip: "103.245.252.75"        # kube-proxy creates rules for this IP
 
-**Dùng** hostname thay thế:
-
-```yaml
+# After (workaround)
 status:
   loadBalancer:
     ingress:
-    - hostname: "103.45.67.89.nip.io"  # kube-proxy không tạo rules được!
+    - hostname: "103.245.252.75.nip.io"  # kube-proxy cannot process hostname
 ```
 
-### nip.io là gì?
-
-> **nip.io**: Là một wildcard DNS service miễn phí. Bất kỳ hostname dạng `<ip>.nip.io` đều resolve thành `<ip>` đó. Không cần cấu hình gì thêm, không cần DNS server riêng.
+> **nip.io**: Là một wildcard DNS service miễn phí — `103.245.252.75.nip.io` resolve thành `103.245.252.75`. Không cần cấu hình gì thêm, không cần DNS server riêng.
 
 ```text
-103.45.67.89.nip.io  -->  103.45.67.89
-10-0-0-1.nip.io      -->  10.0.0.1
+Smoke test pod calls 103.245.252.75.nip.io
+    |
+    v  DNS resolve -> 103.245.252.75
+    |
+    |  (no iptables rule matches!)
+    v
+vLB NLB  ->  inject PP header  ->  Nginx  ->  Backend OK
 ```
 
-### Tại sao điều này fix được vấn đề?
+**Kết quả:** Smoke test pass. Client IP thật hiện trong log.
 
-Khi LB controller gán hostname vào ingress status, kube-proxy **không tạo iptables rules** cho hostname đó (nó chỉ xử lý IP từ `ingress[].ip`, không phải hostname).
-
-```text
-+-----------------------------------------------------------+
-|              Hostname Workaround Flow                     |
-|                                                           |
-|  1. Pod calls 103.45.67.89.nip.io                         |
-|  2. DNS resolves -> 103.45.67.89 (real LB IP)             |
-|  3. No iptables rules match (kube-proxy has none)         |
-|  4. Packet follows default routing -> exits node          |
-|  5. LB receives packet -> injects Proxy Protocol header   |
-|  6. Forward to backend -> backend reads header -> OK      |
-+-----------------------------------------------------------+
-```
-
-### Xác minh: Traffic giờ đi qua LB thật
-
-Sau khi apply hostname workaround, kiểm tra lại bằng tcpdump:
-
-```bash
-# Confirm: không còn iptables rules cho LB IP
-$ iptables -t nat -L KUBE-SERVICES -n | grep 103.45.67.89
-# (no output - không có rules nào!)
-
-# tcpdump trên eth0: traffic giờ ĐI RA NGOÀI node
-$ tcpdump -i eth0 host 103.45.67.89 -n -c 4
-09:35:12.101 IP 10.0.0.5.45678 > 103.45.67.89.80: Flags [S], seq 9876543
-09:35:12.103 IP 103.45.67.89.80 > 10.0.0.5.45678: Flags [S.], seq 1122334
-09:35:12.103 IP 10.0.0.5.45678 > 103.45.67.89.80: Flags [.], ack 1
-09:35:12.105 IP 103.45.67.89.80 > 10.0.0.5.45678: Flags [P.], ...
-```
-
-Traffic giờ đi đến LB IP thật (`103.45.67.89`) qua eth0 — không bị DNAT nữa. LB nhận packet, inject Proxy Protocol header, và forward đến backend.
-
-```bash
-# Backend Nginx log: giờ nhận được Proxy Protocol header đúng
-$ kubectl logs -l app=my-service --tail=5
-2026/03/15 09:35:12 [info] 29#29: *2001 client 14.232.166.45
-  connected via PROXY protocol, server: 0.0.0.0:80
-```
-
-### Implementation trong LB Controller
-
-```go
-func (r *LoadBalancerReconciler) setLBStatus(svc *v1.Service, ip string) {
-    svc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{
-        // Dùng hostname để bypass kube-proxy shortcut:
-        {Hostname: ip + ".nip.io"},
-    }
-}
-```
-
-## Cilium cũng bị, và cũng được fix cùng cách
-
-Một câu hỏi tự nhiên: nếu dùng **Cilium** thay vì kube-proxy thì sao? Cilium dùng eBPF thay vì iptables — liệu vấn đề có còn không?
-
-Câu trả lời: **Vấn đề vẫn tồn tại, thậm chí sớm hơn.**
-
-> **Cilium kube-proxy replacement**: Cilium dùng socket-level load balancing — nó intercept ở tầng `connect()` syscall, trước cả khi packet vào network stack. Tuy nhiên, cơ chế vẫn tương tự: Cilium đọc `status.loadBalancer.ingress[].ip` và tạo eBPF maps dựa trên IP đó.
-
-**Điều quan trọng:** Cả kube-proxy lẫn Cilium đều chỉ xử lý `ingress[].ip` — không xử lý `ingress[].hostname`. Do đó, khi LB controller gán hostname thay vì IP, cả hai đều không tạo rules -> traffic đi đúng path -> fix được vấn đề.
-
-Workaround hostname là **universal fix**, không phụ thuộc vào CNI plugin đang dùng.
-
-## Bài học từ Cộng đồng: Deckhouse cũng gặp y chang
-
-Tìm kiếm thêm, phát hiện ra issue [#14657 trên GitHub của Deckhouse](https://github.com/deckhouse/deckhouse/issues/14657) — một Kubernetes distribution khác — cũng gặp đúng vấn đề này với OpenStack cloud provider và Proxy Protocol.
-
-Issue mô tả:
-
-> *"In prior Kubernetes versions, using Proxy Protocol with LoadBalancer services often required publishing a domain name (e.g., nip.io or sslip.io) in the service status — specifically under `.status.loadBalancer.ingress[].hostname` — instead of a direct external IP address. This workaround was needed to bypass kube-proxy limitations and ensure correct client IP propagation through the external load balancer."*
-
-Điều này confirm rằng workaround hostname không phải chỉ là hack của riêng tôi — đây là một **known pattern** trong cộng đồng.
-
-## Fix Chính Thức: Kubernetes 1.32 và KEP-1860
-
-Workaround hostname hoạt động, nhưng nó có những nhược điểm:
-- Thêm DNS lookup latency
+**Nhược điểm:**
+- Thêm DNS lookup mỗi lần kết nối
+- `EXTERNAL-IP` trong `kubectl get svc` hiện hostname thay vì IP — ít transparent hơn
 - Phụ thuộc external DNS service (nip.io)
-- Không transparent với user (EXTERNAL-IP hiển thị hostname thay vì IP)
 
-Tin vui: **Kubernetes 1.32** đã giải quyết vấn đề này một cách chính thức thông qua [KEP-1860: Service LoadBalancer IP Mode](https://github.com/kubernetes/enhancements/issues/1860).
+### Phương án 2: ipMode: Proxy — Fix chính thức từ K8s 1.29+
 
-> **KEP-1860 (ipMode: Proxy)**: Thêm field `ipMode` vào `status.loadBalancer.ingress`. Khi set `ipMode: "Proxy"`, kube-proxy sẽ **không tạo iptables rules** cho IP đó — dù IP được set vào `ingress[].ip`. Traffic từ trong cluster sẽ đi theo routing thật và đến LB thật.
+Đây là giải pháp sạch nhất và chính thức. Kubernetes blog [chính thức thừa nhận](https://kubernetes.io/blog/2023/12/18/kubernetes-1-29-feature-loadbalancer-ip-mode-alpha/) workaround hostname chỉ là "makeshift solution" và giới thiệu field `ipMode` từ K8s 1.29:
 
 ```yaml
 status:
   loadBalancer:
     ingress:
-    - ip: "103.45.67.89"
-      ipMode: "Proxy"   # <-- field mới trong K8s 1.32+
+    - ip: "103.245.252.75"
+      ipMode: "Proxy"    # kube-proxy will NOT bind this IP on node
 ```
 
-Theo issue Deckhouse:
+Khi `ipMode: "Proxy"` được set, kube-proxy **không tạo iptables rules** cho IP đó — dù IP vẫn được hiển thị bình thường. Traffic từ trong cluster sẽ đi theo routing thật và qua NLB.
 
-> *"Starting with Kubernetes v1.32, this workaround is obsolete. With the new `ipMode` field, kube-proxy does not bind the external IP on nodes, ensuring all external traffic is routed through the actual load balancer."*
-
-### Migration path cho LB Controller
-
-```go
-func (r *LoadBalancerReconciler) setLBStatus(svc *v1.Service, ip string) {
-    k8sVersion := r.getK8sVersion()
-
-    if k8sVersion >= "1.32" {
-        // K8s 1.32+: dùng ipMode: Proxy (fix chính thức)
-        svc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{
-            {
-                IP:     ip,
-                IPMode: ptr("Proxy"),
-            },
-        }
-    } else {
-        // K8s < 1.32: dùng hostname workaround
-        svc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{
-            {Hostname: ip + ".nip.io"},
-        }
-    }
-}
-```
-
-## Các Giải Pháp Thay Thế Khác
-
-### externalTrafficPolicy: Local
-
-```yaml
-spec:
-  type: LoadBalancer
-  externalTrafficPolicy: Local
-```
-
-Khi set Local, kube-proxy **chỉ forward traffic đến pod local trên node đó**, không SNAT, và không forward sang node khác. Điều này giải quyết bài toán **source IP preservation** từ external traffic, nhưng không hoàn toàn giải quyết bài toán **LB bypass** khi gọi từ trong cluster.
-
-### allocateLoadBalancerNodePorts: false
-
-```yaml
-spec:
-  type: LoadBalancer
-  allocateLoadBalancerNodePorts: false
-```
-
-Cho phép LB route traffic **thẳng đến Pod IP** thay vì qua NodePort, bỏ qua toàn bộ kube-proxy. Nhưng cần CNI hỗ trợ routable pod IPs (AWS CNI, Azure CNI) và LB phải có khả năng reach pod IPs trực tiếp.
-
-## Tổng Kết
-
-### Timeline của vấn đề
-
-| Thời điểm | Sự kiện |
+| K8s Version | Trạng thái |
 |---|---|
-| K8s ra đời | kube-proxy dùng iptables để manage Service routing |
-| Proxy Protocol phổ biến | Các cloud LB support Proxy Protocol để preserve client IP |
-| Vấn đề xuất hiện | Pod gọi LB IP -> kube-proxy shortcut -> LB bypass -> header mất |
-| Workaround | Dùng hostname (nip.io) thay IP -> traffic đi đúng path |
-| K8s 1.32 | KEP-1860: `ipMode: Proxy` — fix chính thức |
+| 1.29 | Alpha |
+| 1.30 | Beta |
+| **1.32** | **Stable / GA** |
 
-### Bài học rút ra
+**Phương án được chọn:** Hostname workaround cho các cluster đang chạy K8s < 1.29, migrate sang `ipMode: Proxy` khi cluster lên 1.29+.
 
-**1. Debug networking trong K8s: luôn trace packet thật**
+---
+
+## 7. Với Cilium thay thế kube-proxy — Có bị dính không?
+
+Một câu hỏi tự nhiên: nếu cluster dùng **Cilium** với kube-proxy replacement thì sao? Cilium dùng eBPF thay iptables — liệu vấn đề còn tồn tại không?
+
+**Câu trả lời: Vẫn bị, thậm chí sớm hơn.**
+
+> **Cilium kube-proxy replacement**: Cilium dùng socket-level load balancing — intercept ở tầng `connect()` syscall, trước cả khi packet vào network stack. Tuy nhiên cơ chế cũng tương tự: Cilium đọc `status.loadBalancer.ingress[].ip` và tạo eBPF maps dựa trên IP đó.
+
+```text
+kube-proxy (iptables):
+  Packet -> iptables DNAT -> Backend pod
+  (intercept at L3/L4, after packet is created)
+
+Cilium socket-LB (eBPF):
+  connect(LB_IP) -> eBPF hook -> redirect -> Backend pod
+  (intercept at socket layer, before packet is created!)
+```
+
+Cilium thậm chí intercept **sớm hơn** kube-proxy — nhưng cùng nguồn gốc: đọc IP từ `ingress[].ip` và tạo rules.
+
+**Điều quan trọng:** Cả kube-proxy lẫn Cilium đều **không xử lý `ingress[].hostname`**. Do đó:
+- Workaround nip.io vẫn work với cả hai
+- `ipMode: Proxy` vẫn là fix chính thức cho cả hai
+
+Đây là lý do workaround hostname là **universal fix** — không phụ thuộc CNI plugin đang dùng.
+
+---
+
+## 8. Tổng kết
+
+### Timeline
+
+| Giai đoạn | Chi tiết |
+|---|---|
+| Mô hình NLB -> Nginx hoạt động ổn | kube-proxy intercept LB IP, DNAT vào Nginx — LB chỉ forward TCP nên không vấn đề |
+| Bật Proxy Protocol theo doc VNGCLOUD | External traffic OK, nhưng pod nội bộ fail |
+| Debug với VNGCLOUD support | tcpdump xác nhận traffic không ra khỏi node, iptables rules là thủ phạm |
+| Workaround | Hostname (nip.io) bypass kube-proxy rules |
+| **K8s 1.29+** | `ipMode: Proxy` — fix chính thức, không cần workaround |
+| **K8s 1.32** | `ipMode: Proxy` GA |
+
+### Bài học
+
+**1. Khi debug networking K8s: đừng tin log application, trace packet thật**
 
 ```bash
-iptables -t nat -L KUBE-SERVICES -n | grep <ip>
+# Check iptables rules
+iptables -t nat -L KUBE-SERVICES -n | grep <lb-ip>
+
+# Trace traffic
 tcpdump -i any host <lb-ip> -n -v
 ```
 
-**2. Hiểu layer nào xử lý traffic** — kube-proxy hoạt động ở L3/L4, chỉ hiểu IP, không hiểu hostname.
+**2. kube-proxy intercept LB IP là thiết kế có chủ đích** — tối ưu traffic path. Nhưng khi LB có thêm logic (TLS, Proxy Protocol, WAF...), bypass LB sẽ gây mất tính năng.
 
-**3. Workaround nên là tạm thời** — hostname workaround cho K8s < 1.32, migrate sang `ipMode: Proxy` khi upgrade.
+**3. Workaround hostname là universal** — hoạt động với kube-proxy (iptables/IPVS) và Cilium (eBPF), vì cả hai đều chỉ xử lý `ingress[].ip`.
 
-**4. Vấn đề không phụ thuộc vào CNI** — Flannel, Calico, Cilium đều bị. Workaround hostname đều work.
+**4. Migrate sang `ipMode: Proxy` khi có thể** — giải pháp sạch, transparent, không cần DNS workaround.
+
+---
 
 ## References
 
-- [Deckhouse Issue #14657: No more domain workaround needed for Proxy Protocol on K8s 1.32+](https://github.com/deckhouse/deckhouse/issues/14657)
-- [KEP-1860: Service LoadBalancer IP Mode](https://github.com/kubernetes/enhancements/issues/1860)
-- [LearnKube: Kubernetes networking — service, kube-proxy, load balancing](https://learnkube.com/kubernetes-services-and-load-balancing)
-- [Kubernetes Blog: Advancements in Kubernetes Traffic Engineering](https://kubernetes.io/blog/2022/12/30/advancements-in-kubernetes-traffic-engineering/)
-- [Cilium Documentation: Kubernetes Without kube-proxy](https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/)
-- [HAProxy: The PROXY Protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt)
-- [nip.io — Dead simple wildcard DNS for any IP Address](https://nip.io)
+1. [VNGCLOUD Docs: Preserve Source IP when using NLB and Nginx Ingress Controller](https://docs.vngcloud.vn/vng-cloud-document/vks/network/working-with-nlb/preserve-source-ip-when-using-nlb-and-nginx-ingress-controller.md)
+2. [Kubernetes Blog: Load Balancer IP Mode for Services (K8s 1.29 alpha)](https://kubernetes.io/blog/2023/12/18/kubernetes-1-29-feature-loadbalancer-ip-mode-alpha/)
+3. [KEP-1860: Service LoadBalancer IP Mode](https://github.com/kubernetes/enhancements/issues/1860)
+4. [Deckhouse Issue #14657: No more domain workaround needed for Proxy Protocol on K8s 1.32+](https://github.com/deckhouse/deckhouse/issues/14657)
+5. [LearnKube: Kubernetes networking — service, kube-proxy, load balancing](https://learnkube.com/kubernetes-services-and-load-balancing)
+6. [Cilium Docs: Kubernetes Without kube-proxy](https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/)
+7. [nip.io — Wildcard DNS for any IP Address](https://nip.io)
+
+---
+
+*Bài viết dựa trên trải nghiệm thực tế khi vận hành hệ thống trên VNG Kubernetes Service. Cảm ơn team support VNGCLOUD đã hỗ trợ debug cùng trong quá trình này.*
+
+*Submitted to: [Cloud Native Vietnam Writing Contest 2026](https://cloudnativevn.org/writing-contest-2026-intro/)*
 
 ### Bài viết liên quan
 
