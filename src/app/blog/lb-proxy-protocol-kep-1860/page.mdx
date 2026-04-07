@@ -1,5 +1,5 @@
 ---
-title: "Khi Pod Nội Bộ Không Gọi Được Service Của Chính Mình: Debug Proxy Protocol Trên VKS Và Bài Học Từ KEP-1860"
+title: "Cùng Domain, Cùng Endpoint — Bên Ngoài OK, Bên Trong Fail: Proxy Protocol và KEP-1860"
 description: "Hành trình debug vấn đề kube-proxy bypass Load Balancer khi bật Proxy Protocol trên VKS, workaround bằng hostname, và fix chính thức với KEP-1860 ipMode: Proxy"
 date: 2026-04-04
 ---
@@ -9,7 +9,7 @@ import BlogJsonLd from "../../../components/blog-json-ld";
 import Title from "../../../components/title";
 
 export const metadata = generateBlogMetadata({
-  title: "Khi Pod Nội Bộ Không Gọi Được Service Của Chính Mình: Debug Proxy Protocol Trên VKS Và Bài Học Từ KEP-1860",
+  title: "Cùng Domain, Cùng Endpoint — Bên Ngoài OK, Bên Trong Fail: Proxy Protocol và KEP-1860",
   description: "Hành trình debug vấn đề kube-proxy bypass Load Balancer khi bật Proxy Protocol trên VKS, workaround bằng hostname, và fix chính thức với KEP-1860 ipMode: Proxy",
   date: "2026-04-04",
   slug: "lb-proxy-protocol-kep-1860"
@@ -368,20 +368,7 @@ Cilium thậm chí intercept **sớm hơn** kube-proxy — nhưng cùng nguồn 
 
 ---
 
-## 8. Tổng kết
-
-### Timeline
-
-| Giai đoạn | Chi tiết |
-|---|---|
-| Mô hình NLB -> Nginx hoạt động ổn | kube-proxy intercept LB IP, DNAT vào Nginx — LB chỉ forward TCP nên không vấn đề |
-| Bật Proxy Protocol theo doc GreenNode.ai | External traffic OK, nhưng pod nội bộ fail |
-| Debug với GreenNode.ai support | tcpdump xác nhận traffic không ra khỏi node, iptables rules là thủ phạm |
-| Workaround | Hostname (nip.io) bypass kube-proxy rules |
-| **K8s 1.29+** | `ipMode: Proxy` — fix chính thức, không cần workaround |
-| **K8s 1.32** | `ipMode: Proxy` GA |
-
-### Bài học
+## 8. Bài học
 
 **1. Khi debug networking K8s: đừng tin log application, trace packet thật**
 
@@ -416,8 +403,3 @@ tcpdump -i any host <lb-ip> -n -v
 *Bài viết dựa trên trải nghiệm thực tế khi vận hành hệ thống trên VNG Kubernetes Service. Cảm ơn team support [GreenNode.ai](https://greennode.ai) đã hỗ trợ debug cùng trong quá trình này.*
 
 *Submitted to: [Cloud Native Vietnam Writing Contest 2026](https://cloudnativevn.org/writing-contest-2026-intro/)*
-
-### Bài viết liên quan
-
-- [Preserve Source IP Address với Istio Ingress Gateway](/blog/istio-preserve-source-ip) - Cách giữ nguyên source IP với Istio và Proxy Protocol
-- [Cấu hình TLS Certificate với Nginx Ingress, Cert-Manager và Let's Encrypt](/blog/cert-manager-nginx-letsencrypt) - TLS setup cho Kubernetes services
