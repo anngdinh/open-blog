@@ -40,19 +40,19 @@ Hệ thống của chúng tôi chạy trên **VNG Kubernetes Service (VKS)** —
 
 ```text
 Internet
-    |
+    │
     v
-+-----------------------------------+
-|   vLB Network Load Balancer       |  <-- L4, TCP passthrough, Public IP
-|   (auto-provisioned by VKS)       |
-+-----------------+-----------------+
-                  |
+┌───────────────────────────────────┐
+│   vLB Network Load Balancer       │  <-- L4, TCP passthrough, Public IP
+│   (auto-provisioned by VKS)       │
+└─────────────────┬─────────────────┘
+                  │
                   v
-+-----------------------------------+
-|   Nginx Ingress Controller        |  <-- L7, TLS termination
-|   (inside cluster)                |      route by host / path
-+---------+--------------+----------+
-          |              |
+┌───────────────────────────────────┐
+│   Nginx Ingress Controller        │  <-- L7, TLS termination
+│   (inside cluster)                │      route by host / path
+└─────────┬──────────────┬──────────┘
+          │              │
           v              v
      Service A      Service B
      (api.*)        (admin.*)
@@ -225,17 +225,17 @@ BEFORE: Proxy Protocol OFF
 ================================================================
 
 External client                  Smoke test pod (inside cluster)
-      |                                       |
-      v                                       | calls 103.245.252.75
-+-------------+                               |
-|  vLB NLB    |                               | kube-proxy DNAT
-|  (forward)  |                               | (shortcut to Nginx)
-+------+------+                               |
+      │                                       │
+      v                                       │ calls 103.245.252.75
+┌─────────────┐                               │
+│  vLB NLB    │                               │ kube-proxy DNAT
+│  (forward)  │                               │ (shortcut to Nginx)
+└──────┬──────┘                               │
        v                                      v
-+-----------------+                  +-----------------+
-|  Nginx Ingress  |                  |  Nginx Ingress  |
-|  (no PP config) |                  |  (no PP config) |
-+--------+--------+                  +--------+--------+
+┌─────────────────┐                  ┌─────────────────┐
+│  Nginx Ingress  │                  │  Nginx Ingress  │
+│  (no PP config) │                  │  (no PP config) │
+└────────┬────────┘                  └────────┬────────┘
          v                                    v
    Backend OK                           Backend OK
 
@@ -245,20 +245,20 @@ AFTER: Proxy Protocol ON (per GreenNode.ai docs)
 ================================================================
 
 External client                  Smoke test pod (inside cluster)
-      |                                       |
-      v                                       | calls 103.245.252.75
-+-------------+                               |
-|  vLB NLB    |                               | kube-proxy DNAT
-|  +PP header |                               | (same shortcut!)
-+------+------+                               |
-       | TCP + PP header                      | (no PP header)
+      │                                       │
+      v                                       │ calls 103.245.252.75
+┌─────────────┐                               │
+│  vLB NLB    │                               │ kube-proxy DNAT
+│  +PP header │                               │ (same shortcut!)
+└──────┬──────┘                               │
+       │ TCP + PP header                      │ (no PP header)
        v                                      v
-+----------------------+          +----------------------+
-|    Nginx Ingress     |          |    Nginx Ingress     |
-| use-proxy-protocol:  |          | use-proxy-protocol:  |
-|        true          |          |        true          |
-|  reads PP header OK  |          |  NO PP header !!     |
-+----------+-----------+          +----------------------+
+┌──────────────────────┐          ┌──────────────────────┐
+│    Nginx Ingress     │          │    Nginx Ingress     │
+│ use-proxy-protocol:  │          │ use-proxy-protocol:  │
+│        true          │          │        true          │
+│  reads PP header OK  │          │  NO PP header !!     │
+└──────────┬───────────┘          └──────────────────────┘
            v                                  v
      Backend OK                    Connection reset !!
 ```
@@ -301,10 +301,10 @@ status:
 
 ```text
 Smoke test pod calls 103.245.252.75.nip.io
-    |
+    │
     v  DNS resolve -> 103.245.252.75
-    |
-    |  (no iptables rule matches!)
+    │
+    │  (no iptables rule matches!)
     v
 vLB NLB  ->  inject PP header  ->  Nginx  ->  Backend OK
 ```
