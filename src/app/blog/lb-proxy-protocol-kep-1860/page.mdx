@@ -36,7 +36,7 @@ export const metadata = generateBlogMetadata({
 
 ## 1. Bối cảnh: Hệ thống trên VKS với mô hình NLB -> Nginx Ingress
 
-Hệ thống của chúng tôi chạy trên **VNG Kubernetes Service (VKS)** — managed Kubernetes của VNGCLOUD. Mô hình expose traffic ra bên ngoài khá phổ biến với nhiều team:
+Hệ thống của chúng tôi chạy trên **VNG Kubernetes Service (VKS)** — managed Kubernetes của [GreenNode.ai](https://greennode.ai). Mô hình expose traffic ra bên ngoài khá phổ biến với nhiều team:
 
 ```text
 Internet
@@ -71,7 +71,7 @@ kubectl get svc -n ingress-nginx nginx-ingress-controller
 # nginx-ingress-controller   LoadBalancer   10.96.45.12   103.245.252.75   80:31080/TCP,443:31443/TCP
 ```
 
-`103.245.252.75` là IP public của NLB — đây là địa chỉ mà DNS domain của chúng tôi trỏ tới.
+`103.245.252.75` là IP public của NLB — đây là địa chỉ mà `api.company.com` trỏ tới.
 
 ---
 
@@ -79,51 +79,38 @@ kubectl get svc -n ingress-nginx nginx-ingress-controller
 
 Một ngày team yêu cầu backend service phải log được **real IP của client** — phục vụ audit, rate limiting, và geo-blocking. Vấn đề là khi traffic qua NLB rồi qua Nginx, backend chỉ thấy IP của Nginx pod, không phải IP thật của client.
 
-VNGCLOUD có hẳn một trang hướng dẫn cho use case này: [Preserve Source IP when using NLB and Nginx Ingress Controller](https://docs.vngcloud.vn/vng-cloud-document/vks/network/working-with-nlb/preserve-source-ip-when-using-nlb-and-nginx-ingress-controller.md).
+Giải pháp là bật **Proxy Protocol** theo [hướng dẫn của GreenNode.ai](https://docs.vngcloud.vn/vng-cloud-document/vks/network/working-with-nlb/preserve-source-ip-when-using-nlb-and-nginx-ingress-controller.md) — NLB sẽ inject một header đặc biệt vào đầu mỗi TCP stream trước khi forward sang Nginx, chứa thông tin IP gốc của client.
 
 > **Proxy Protocol**: Là một network protocol do HAProxy phát triển, hoạt động ở tầng TCP. LB thêm một dòng header đặc biệt vào đầu mỗi TCP stream trước khi forward đến backend, chứa thông tin về IP gốc của client.
-
-Giải pháp là bật **Proxy Protocol** — NLB sẽ inject một header đặc biệt vào đầu mỗi TCP stream trước khi forward sang Nginx:
 
 ```text
 PROXY TCP4 <client-ip> <nlb-ip> <client-port> <nlb-port>\r\n
 ```
 
-Nginx đọc header này và biết được real IP, rồi forward vào `X-Forwarded-For` cho backend.
-
-### Cấu hình theo doc của VNGCLOUD
-
-**Bước 1:** Cập nhật ConfigMap của Nginx Ingress để đọc Proxy Protocol:
+Nginx đọc header này và biết được real IP, rồi forward vào `X-Forwarded-For` cho backend. Sau khi apply theo doc, test từ bên ngoài — client IP thật đã xuất hiện trong log:
 
 ```bash
-kubectl edit cm -n kube-system nginx-ingress-controller
+kubectl logs -n ingress-nginx nginx-ingress-controller-xxx | tail -5
+# 203.0.113.42 - - [15/Jan/2024:10:23:41 +0000] "GET /api/health HTTP/1.1" 200 14 "-" "curl/7.68.0" 443 0.001
+# 203.0.113.42 - - [15/Jan/2024:10:23:42 +0000] "GET /v1/products HTTP/1.1" 200 512 "-" "curl/7.68.0" 443 0.003
 ```
 
-```yaml
-data:
-  proxy-protocol: "True"
-  real-ip-header: proxy_protocol
-  real-ip-recursive: "True"
-  set-real-ip-from: 0.0.0.0/0
-  use-proxy-protocol: "True"   # Nginx expect PP header from upstream
-```
-
-**Bước 2:** Annotate Service của Nginx để NLB bật Proxy Protocol:
-
-```bash
-kubectl annotate service -n kube-system nginx-ingress-controller \
-  vks.vngcloud.vn/enable-proxy-protocol="http,https"
-```
-
-Sau khi apply, test từ bên ngoài — client IP thật đã xuất hiện trong log. **Mọi thứ có vẻ ổn.**
+`203.0.113.42` là IP thật của client — không còn thấy IP của NLB hay Nginx pod nữa. **Mọi thứ có vẻ ổn.**
 
 ---
 
-## 3. Sự cố: Smoke test trong cluster bắt đầu fail
+## 3. Sự cố: Log bất thường và smoke test bắt đầu fail
 
-Chúng tôi có một bộ **smoke test** chạy dưới dạng Kubernetes Job — trigger sau mỗi lần deploy để verify toàn bộ production path, bao gồm TLS, authentication middleware và routing rule. Job này gọi đúng domain production (`api.company.com`) thay vì ClusterIP nội bộ — vì chúng tôi muốn test **đúng những gì user thật trải nghiệm**, không gọi tắt.
+Sau khi bật Proxy Protocol, log từ Nginx Ingress bắt đầu xuất hiện những error kỳ lạ:
 
-Sau khi bật Proxy Protocol, smoke test job bắt đầu fail hoàn toàn:
+```bash
+kubectl logs -n ingress-nginx nginx-ingress-controller-xxx | grep "api.company.com"
+# 2024/01/15 10:23:41 [error] 123#123: *456 SSL_do_handshake() failed
+#   (SSL: error:14094418:SSL routines:ssl3_read_bytes:tlsv1 alert unknown ca)
+#   while SSL handshaking, client: 10.244.2.15, server: 0.0.0.0:443
+```
+
+Lần theo thì phát hiện **smoke test** — bộ Kubernetes Job chạy sau mỗi lần deploy để verify toàn bộ production path, gọi thẳng domain `api.company.com` thay vì ClusterIP nội bộ — bắt đầu fail hoàn toàn:
 
 ```bash
 kubectl logs smoke-test-job-a1b2c3
@@ -142,18 +129,7 @@ Trong khi đó, test từ laptop bên ngoài cluster vẫn pass hoàn toàn. **C
 
 ### Log từ smoke test pod
 
-Connection bị reset ngay lập tức, không phải timeout — đây là dấu hiệu server chủ động đóng connection, không phải network issue.
-
-### Log từ Nginx Ingress pod
-
-```bash
-kubectl logs -n ingress-nginx nginx-ingress-controller-xxx | grep "api.company.com"
-# 2024/01/15 10:23:41 [error] 123#123: *456 SSL_do_handshake() failed
-#   (SSL: error:14094418:SSL routines:ssl3_read_bytes:tlsv1 alert unknown ca)
-#   while SSL handshaking, client: 10.244.2.15, server: 0.0.0.0:443
-```
-
-Kỳ lạ: Nginx log `client: 10.244.2.15` — đây là **Pod IP của smoke test job**, không phải IP của NLB hay bất kỳ external IP nào. Tại sao Nginx lại thấy IP nội bộ của pod?
+Connection bị reset ngay lập tức, không phải timeout — đây là dấu hiệu server chủ động đóng connection, không phải network issue. Tại sao Nginx lại thấy IP nội bộ của pod thay vì IP của NLB?
 
 ### tcpdump trên node
 
@@ -166,9 +142,9 @@ tcpdump -i any host 103.245.252.75 -n
 
 Traffic hướng đến `103.245.252.75` (IP của NLB) nhưng **không có gói tin nào thật sự rời khỏi node**.
 
-### Nhờ team VNGCLOUD support tcpdump trên NLB
+### Nhờ team GreenNode.ai support tcpdump trên NLB
 
-Chúng tôi liên hệ team support của VNGCLOUD, nhờ họ capture traffic trên NLB trong thời gian smoke test chạy.
+Chúng tôi liên hệ team support của GreenNode.ai, nhờ họ capture traffic trên NLB trong thời gian smoke test chạy.
 
 Kết quả từ phía NLB: **không có connection nào từ IP của cluster đến NLB trong khoảng thời gian đó.** NLB không hề nhìn thấy request của smoke test.
 
@@ -235,11 +211,11 @@ With Proxy Protocol:
 
 Kubernetes blog tổng kết hai nhóm vấn đề:
 
-> *"Feature loss at load balancer level: Certain cloud providers offer features (such as TLS termination, proxy protocol, etc.) at the load balancer level. Bypassing the load balancer results in the loss of these features when the packet reaches the service, leading to protocol errors."*
+> *"Mất tính năng ở tầng load balancer: Một số cloud provider cung cấp các tính năng như TLS termination, proxy protocol, v.v. ở tầng load balancer. Khi bypass load balancer, các tính năng này bị mất khi packet đến service, dẫn đến lỗi giao thức."*
 
 Và:
 
-> *"Source IP: Some cloud providers use the load balancer's IP as the source IP when transmitting packets to the node. In the ipvs mode of kube-proxy, health checks from the load balancer never return."*
+> *"Source IP: Một số cloud provider dùng IP của load balancer làm source IP khi truyền packet đến node. Trong mode ipvs của kube-proxy, health check từ load balancer sẽ không bao giờ nhận được response."*
 
 Đây chính xác là vấn đề chúng tôi gặp: Nginx được cấu hình `use-proxy-protocol: "True"` — nghĩa là **mọi connection đến đều phải có PP header**. Connection từ pod không có header -> Nginx reject ngay lập tức.
 
@@ -265,7 +241,7 @@ External client                  Smoke test pod (inside cluster)
 
 
 ================================================================
-AFTER: Proxy Protocol ON (per VNGCLOUD docs)
+AFTER: Proxy Protocol ON (per GreenNode.ai docs)
 ================================================================
 
 External client                  Smoke test pod (inside cluster)
@@ -289,15 +265,25 @@ External client                  Smoke test pod (inside cluster)
 
 ---
 
-## 6. Tìm giải pháp: Làm việc cùng team VNGCLOUD
+## 6. Tìm giải pháp: Làm việc cùng team GreenNode.ai
 
-Sau khi xác định root cause, chúng tôi làm việc với team support VNGCLOUD để tìm phương án. Có ba hướng được đặt ra:
+Sau khi xác định root cause, chúng tôi làm việc với team support GreenNode.ai để tìm phương án. Có ba hướng được đặt ra:
 
-### Phương án 1: Hostname workaround — nip.io
+### Phương án 1: Dùng hostname thay vì IP cho LB
 
 kube-proxy chỉ tạo iptables rules dựa trên **IP** lấy từ `status.loadBalancer.ingress[].ip`. Nếu thay bằng hostname, kube-proxy không tạo được rules -> traffic buộc phải đi theo routing thật -> qua NLB -> PP header được inject.
 
-VNGCLOUD update controller để set hostname thay vì IP:
+Trên AWS, NLB luôn trả về hostname thay vì IP trong `status.loadBalancer.ingress` — nên vấn đề này không xảy ra ở đó.
+
+<div style={{borderLeft: '4px solid #6366f1', background: '#f5f3ff', padding: '0.75rem 1rem', borderRadius: '0 6px 6px 0', margin: '1.5rem 0', fontStyle: 'italic', fontWeight: '600', color: '#4338ca'}}>
+  Vậy nếu cloud provider trả về IP thì sao? 
+</div>
+
+Đơn giản là dùng một wildcard DNS service như <a href="https://nip.io" target="_blank" rel="noopener noreferrer" style={{color: '#4338ca', textDecoration: 'underline'}}>nip.io</a> để tạo hostname trỏ về IP đó — không cần cấu hình DNS phức tạp, không cần domain thật.
+
+> **nip.io**: Là một wildcard DNS service miễn phí — `103.245.252.75.nip.io` resolve thành `103.245.252.75`. Không cần cấu hình gì thêm, không cần DNS server riêng. Đây là giải pháp nhanh khi chưa có domain thật.
+
+GreenNode.ai update controller để set hostname thay vì IP:
 
 ```yaml
 # Before
@@ -313,8 +299,6 @@ status:
     - hostname: "103.245.252.75.nip.io"  # kube-proxy cannot process hostname
 ```
 
-> **nip.io**: Là một wildcard DNS service miễn phí — `103.245.252.75.nip.io` resolve thành `103.245.252.75`. Không cần cấu hình gì thêm, không cần DNS server riêng.
-
 ```text
 Smoke test pod calls 103.245.252.75.nip.io
     |
@@ -328,9 +312,9 @@ vLB NLB  ->  inject PP header  ->  Nginx  ->  Backend OK
 **Kết quả:** Smoke test pass. Client IP thật hiện trong log.
 
 **Nhược điểm:**
-- Thêm DNS lookup mỗi lần kết nối
+- Mất đi lợi ích tối ưu của kube-proxy: traffic trong cluster giờ phải đi vòng qua NLB thay vì được DNAT trực tiếp đến pod — thêm một hop không cần thiết
 - `EXTERNAL-IP` trong `kubectl get svc` hiện hostname thay vì IP — ít transparent hơn
-- Phụ thuộc external DNS service (nip.io)
+- Phụ thuộc external DNS service (nip.io) nếu không có domain thật
 
 ### Phương án 2: ipMode: Proxy — Fix chính thức từ K8s 1.29+
 
@@ -391,8 +375,8 @@ Cilium thậm chí intercept **sớm hơn** kube-proxy — nhưng cùng nguồn 
 | Giai đoạn | Chi tiết |
 |---|---|
 | Mô hình NLB -> Nginx hoạt động ổn | kube-proxy intercept LB IP, DNAT vào Nginx — LB chỉ forward TCP nên không vấn đề |
-| Bật Proxy Protocol theo doc VNGCLOUD | External traffic OK, nhưng pod nội bộ fail |
-| Debug với VNGCLOUD support | tcpdump xác nhận traffic không ra khỏi node, iptables rules là thủ phạm |
+| Bật Proxy Protocol theo doc GreenNode.ai | External traffic OK, nhưng pod nội bộ fail |
+| Debug với GreenNode.ai support | tcpdump xác nhận traffic không ra khỏi node, iptables rules là thủ phạm |
 | Workaround | Hostname (nip.io) bypass kube-proxy rules |
 | **K8s 1.29+** | `ipMode: Proxy` — fix chính thức, không cần workaround |
 | **K8s 1.32** | `ipMode: Proxy` GA |
@@ -419,7 +403,7 @@ tcpdump -i any host <lb-ip> -n -v
 
 ## References
 
-1. [VNGCLOUD Docs: Preserve Source IP when using NLB and Nginx Ingress Controller](https://docs.vngcloud.vn/vng-cloud-document/vks/network/working-with-nlb/preserve-source-ip-when-using-nlb-and-nginx-ingress-controller.md)
+1. [GreenNode.ai Docs: Preserve Source IP when using NLB and Nginx Ingress Controller](https://docs.vngcloud.vn/vng-cloud-document/vks/network/working-with-nlb/preserve-source-ip-when-using-nlb-and-nginx-ingress-controller.md)
 2. [Kubernetes Blog: Load Balancer IP Mode for Services (K8s 1.29 alpha)](https://kubernetes.io/blog/2023/12/18/kubernetes-1-29-feature-loadbalancer-ip-mode-alpha/)
 3. [KEP-1860: Service LoadBalancer IP Mode](https://github.com/kubernetes/enhancements/issues/1860)
 4. [Deckhouse Issue #14657: No more domain workaround needed for Proxy Protocol on K8s 1.32+](https://github.com/deckhouse/deckhouse/issues/14657)
@@ -429,7 +413,7 @@ tcpdump -i any host <lb-ip> -n -v
 
 ---
 
-*Bài viết dựa trên trải nghiệm thực tế khi vận hành hệ thống trên VNG Kubernetes Service. Cảm ơn team support VNGCLOUD đã hỗ trợ debug cùng trong quá trình này.*
+*Bài viết dựa trên trải nghiệm thực tế khi vận hành hệ thống trên VNG Kubernetes Service. Cảm ơn team support [GreenNode.ai](https://greennode.ai) đã hỗ trợ debug cùng trong quá trình này.*
 
 *Submitted to: [Cloud Native Vietnam Writing Contest 2026](https://cloudnativevn.org/writing-contest-2026-intro/)*
 
