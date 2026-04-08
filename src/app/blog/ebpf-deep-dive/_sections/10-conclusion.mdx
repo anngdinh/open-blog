@@ -1,0 +1,71 @@
+## Kết luận
+
+Sau khi đi qua từng lớp của eBPF — từ bpftrace one-liner đến XDP, TC, LSM, rồi đến verifier internals — có một số điểm cần nhớ:
+
+### Khi nào dùng gì
+
+| Công cụ | Khi nào dùng |
+|---|---|
+| `bpftrace` | Ad-hoc tracing, debugging production issue ngay lập tức |
+| `bcc tools` | Dùng tool có sẵn (execsnoop, tcplife, biolatency, ...) |
+| `libbpf + skeleton` | Build eBPF tool hoàn chỉnh, cần distribute |
+| `XDP` | High-performance packet filtering, DDoS mitigation |
+| `TC hooks` | Packet modification, policy enforcement |
+| `BPF LSM` | Security policy tại kernel level |
+| `sched_ext` | Custom CPU scheduling |
+
+### Mental model quan trọng
+
+```text
+eBPF program:
+  - Attach to a hook point (kprobe, XDP, tracepoint, ...)
+  - Execute on every event at that hook
+  - Communicate with userspace via Maps or Ring Buffer
+  - Must pass Verifier (safety guarantee)
+  - Compiled to native code by JIT (performance guarantee)
+
+Maps:
+  - Shared memory between kernel programs and userspace
+  - Multiple types for different access patterns (hash, array, LPM, ringbuf, ...)
+  - Persist across program invocations
+  - Can be shared between multiple eBPF programs
+```
+
+### Checklist khi debug eBPF program
+
+```bash
+# 1. Xem verifier error chi tiết
+sudo bpftool prog load prog.bpf.o /sys/fs/bpf/prog 2>&1
+
+# 2. List programs đang chạy
+sudo bpftool prog list
+
+# 3. Xem JIT code
+sudo bpftool prog dump jited id <ID>
+
+# 4. Xem map nội dung
+sudo bpftool map dump id <ID>
+
+# 5. Debug với bpf_printk (đọc từ trace pipe)
+sudo cat /sys/kernel/debug/tracing/trace_pipe
+
+# 6. Kiểm tra BTF có available không
+ls /sys/kernel/btf/vmlinux
+
+# 7. Check BPF limits
+cat /proc/sys/kernel/bpf_stats_enabled
+ulimit -l  # locked memory limit (quan trọng cho maps)
+```
+
+### Resources để đọc thêm
+
+Ngoài các bài viết trong phần References, một số tools/repos hữu ích:
+
+- **[libbpf-bootstrap](https://github.com/libbpf/libbpf-bootstrap)**: Template project cho eBPF development với libbpf
+- **[bcc/tools](https://github.com/iovisor/bcc/tree/master/tools)**: 70+ production-ready eBPF tools
+- **[bpftrace/tools](https://github.com/bpftrace/bpftrace/tree/master/tools)**: bpftrace one-liner scripts
+- **[cilium/ebpf](https://github.com/cilium/ebpf)**: Go library để viết eBPF loader
+- **[Aya](https://aya-rs.dev/)**: Rust eBPF framework
+- **[scx](https://github.com/sched-ext/scx)**: Reference BPF schedulers dùng sched_ext
+
+eBPF đang phát triển nhanh hơn bất kỳ phần nào khác của Linux kernel — mỗi kernel version lại có thêm capabilities mới. Nếu bạn làm về infrastructure, observability, hay security, đây là thứ không thể bỏ qua.

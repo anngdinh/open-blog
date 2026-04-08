@@ -1,0 +1,289 @@
+## Modern eBPF: BTF, CO-RE, và những tính năng mới nhất
+
+### CO-RE — Compile Once, Run Everywhere
+
+Trước CO-RE, bạn phải compile eBPF program trên máy target (vì cần kernel headers đúng version). CO-RE giải quyết vấn đề này:
+
+```text
+Trước CO-RE:
+  Source.c -> compile trên kernel 5.4 -> binary chỉ chạy trên kernel 5.4
+
+Với CO-RE:
+  Source.c -> compile 1 lần -> binary chạy trên kernel 5.4, 5.15, 6.1, 6.12
+                                     (miễn là kernel có BTF)
+```
+
+**Workflow CO-RE:**
+
+```bash
+# 1. Generate vmlinux.h từ kernel đang chạy
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+
+# 2. Compile với BTF target
+clang -g -O2 -target bpf \
+    -D__TARGET_ARCH_x86 \
+    -I. \
+    -c program.bpf.c -o program.bpf.o
+
+# 3. Distribute .bpf.o file — chạy được trên bất kỳ kernel nào có BTF
+```
+
+**CO-RE macros:**
+
+```c
+// Đọc field từ kernel struct (CO-RE safe)
+u32 pid = BPF_CORE_READ(task, pid);
+
+// Đọc nested struct
+u32 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
+
+// Check nếu field tồn tại (cross-version compatibility)
+if (bpf_core_field_exists(struct task_struct, on_cpu)) {
+    // Kernel có field này
+    bool on_cpu = BPF_CORE_READ(task, on_cpu);
+}
+
+// Đọc string
+char filename[256];
+BPF_CORE_READ_STR_INTO(&filename, bprm, filename);
+```
+
+### BPF Skeleton — Modern Loading Pattern
+
+Skeleton là auto-generated header, thay thế manual map/prog loading:
+
+```bash
+# Generate skeleton
+bpftool gen skeleton program.bpf.o > program.skel.h
+```
+
+```c
+// Generated skeleton (program.skel.h) — simplified
+struct program_bpf {
+    struct {
+        struct bpf_object *obj;
+        struct bpf_program *trace_execve;  // BPF program
+    } progs;
+    struct {
+        struct bpf_map *events;            // BPF map
+        struct bpf_map *config;
+    } maps;
+    struct {
+        struct bpf_link *trace_execve;     // Link to hook
+    } links;
+};
+
+// API:
+struct program_bpf *skel;
+skel = program_bpf__open();        // Open (before load)
+// Modify maps/progs before load:
+skel->rodata->config_value = 42;
+program_bpf__load(skel);           // Load into kernel
+program_bpf__attach(skel);         // Attach to hooks
+program_bpf__destroy(skel);        // Cleanup
+```
+
+### BPF Global Variables (Rodata)
+
+```c
+// Trong BPF program — khai báo global config
+const volatile u32 min_duration_ns = 0;
+const volatile bool filter_by_comm = false;
+
+SEC("tracepoint/syscalls/sys_enter_execve")
+int trace_execve(...)
+{
+    u64 duration = get_duration();
+    if (min_duration_ns && duration < min_duration_ns)
+        return 0;  // Skip short-lived processes
+    // ...
+}
+```
+
+```c
+// Trong userspace — set trước khi load
+skel = program_bpf__open();
+skel->rodata->min_duration_ns = 100 * 1000 * 1000;  // 100ms
+skel->rodata->filter_by_comm = true;
+program_bpf__load(skel);
+```
+
+### BPF Tokens — Unprivileged eBPF (Kernel 6.9+)
+
+Trước đây, load eBPF program yêu cầu `CAP_BPF` (root-equivalent). BPF Tokens cho phép delegate quyền này:
+
+```c
+// Admin: tạo BPF token và gắn vào BPF filesystem mount
+// user có thể mount BPF FS với specific permissions:
+// mount -t bpf none /sys/fs/bpf -o delegate_cmds=prog_load:map_create
+
+// Unprivileged user: sử dụng token để load BPF program
+int token_fd = open("/sys/fs/bpf", O_RDONLY);
+LIBBPF_OPTS(bpf_prog_load_opts, opts,
+    .token_fd = token_fd,
+);
+bpf_prog_load(prog_type, insns, insns_cnt, &opts);
+```
+
+### BPF Arena — Shared Memory (Kernel 6.9+)
+
+> **BPF Arena**: Là shared memory region giữa kernel eBPF program và userspace. Cho phép hiệu năng cao hơn so với maps cho các trường hợp streaming dữ liệu lớn — không cần copy qua syscall.
+
+```c
+// Kernel side: allocate từ arena
+struct {
+    __uint(type, BPF_MAP_TYPE_ARENA);
+    __uint(max_entries, 1 << 20);  // 1MB arena
+} arena SEC(".maps");
+
+SEC("xdp")
+int xdp_with_arena(struct xdp_md *ctx)
+{
+    // arena_alloc tự quản lý memory trong arena
+    void *buf = bpf_arena_alloc_pages(&arena, NULL, 1, NUMA_NO_NODE, 0);
+    if (!buf)
+        return XDP_PASS;
+
+    // Write data directly to arena — visible to userspace
+    // ...
+    return XDP_PASS;
+}
+```
+
+### sched_ext — Custom CPU Scheduler (Kernel 6.12+)
+
+> **sched_ext**: Extension cho phép viết CPU scheduling algorithm bằng eBPF. Không cần rebuild kernel — load BPF scheduler vào kernel đang chạy.
+
+```c
+// Minimal BPF scheduler skeleton
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+
+// Simple FIFO scheduler
+struct {
+    __uint(type, BPF_MAP_TYPE_QUEUE);
+    __uint(max_entries, 4096);
+    __type(value, u32);  // task PID
+} runq SEC(".maps");
+
+// Called when task becomes runnable
+void BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags)
+{
+    s32 pid = p->pid;
+    bpf_map_push_elem(&runq, &pid, 0);
+}
+
+// Called to select next task to run
+void BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev)
+{
+    s32 pid;
+    if (bpf_map_pop_elem(&runq, &pid) == 0) {
+        struct task_struct *p = bpf_task_from_pid(pid);
+        if (p) {
+            scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+            bpf_task_release(p);
+        }
+    }
+}
+
+// Scheduler metadata
+SEC(".struct_ops.link")
+struct sched_ext_ops my_sched = {
+    .enqueue  = (void *)sched_enqueue,
+    .dispatch = (void *)sched_dispatch,
+    .name     = "my_fifo_scheduler",
+};
+
+char LICENSE[] SEC("license") = "GPL";
+```
+
+```bash
+# Load custom scheduler
+sudo scxtool -l my_sched.bpf.o
+# Tất cả processes giờ dùng scheduler của bạn
+
+# Restore default scheduler
+sudo scxtool -u
+```
+
+**Use cases của sched_ext:**
+- **Gaming**: giảm latency bằng cách ưu tiên game thread
+- **Cloud**: isolate noisy neighbor workloads
+- **Real-time**: custom latency-sensitive scheduling
+- **Research**: thử nghiệm scheduling algorithm mới mà không cần patch kernel
+
+### BPF Exceptions (Kernel 6.7+)
+
+```c
+// Thay vì check mọi return value
+struct iphdr *ip = data + sizeof(struct ethhdr);
+if ((void *)(ip + 1) > data_end)
+    return XDP_PASS;
+
+// Với BPF exceptions (future simplification):
+// bpf_exception_throw() thoát khỏi program ngay lập tức
+// (hiện đang trong development)
+```
+
+### Rust + eBPF: Aya framework
+
+```rust
+// Viết eBPF program bằng Rust với Aya
+// Cargo.toml
+[package]
+name = "my-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-bpf = { version = "0.1", features = ["async"] }
+aya-log-ebpf = "0.1"
+```
+
+```rust
+// src/main.rs (kernel side)
+#![no_std]
+#![no_main]
+
+use aya_bpf::{
+    macros::tracepoint,
+    programs::TracePointContext,
+    helpers::bpf_get_current_pid_tgid,
+};
+use aya_log_ebpf::info;
+
+#[tracepoint]
+pub fn trace_execve(ctx: TracePointContext) -> u32 {
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    info!(&ctx, "execve called by pid={}", pid);
+    0
+}
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+```
+
+```rust
+// userspace (src/main.rs)
+use aya::{Bpf, include_bytes_aligned, programs::TracePoint};
+use tokio::signal;
+
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    let mut bpf = Bpf::load(include_bytes_aligned!(
+        "../../target/bpfel-unknown-none/release/my-ebpf"
+    ))?;
+
+    let program: &mut TracePoint = bpf.program_mut("trace_execve")
+        .unwrap()
+        .try_into()?;
+    program.load()?;
+    program.attach("syscalls", "sys_enter_execve")?;
+
+    println!("Tracing execve... Ctrl+C to stop");
+    signal::ctrl_c().await?;
+    Ok(())
+}
+```

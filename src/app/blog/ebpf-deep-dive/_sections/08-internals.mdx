@@ -1,0 +1,245 @@
+## eBPF Internals — Verifier, JIT, và Instruction Set
+
+Phần này dành cho những ai muốn hiểu eBPF hoạt động thực sự như thế nào bên dưới — từ bytecode đến machine code.
+
+### eBPF Instruction Set
+
+Mỗi eBPF instruction có kích thước cố định **8 bytes (64-bit)**:
+
+```text
+eBPF Instruction encoding (64-bit / 8 bytes):
+
+  Byte 0     Byte 1     Byte 2-3   Byte 4-7
+  +--------+ +--------+ +--------+ +--------+
+  | opcode | |dst |src | | offset | | imm32  |
+  | 8 bits | |4b  |4b  | | 16 bit | | 32 bit |
+  +--------+ +--------+ +--------+ +--------+
+```
+
+**Opcode structure:**
+
+```text
+opcode (8 bits):
+  bits [7:3] = operation code (add, mov, load, store, jump, ...)
+  bits [2:0] = instruction class:
+    000 = BPF_LD    (load)
+    001 = BPF_LDX   (load from memory)
+    010 = BPF_ST    (store immediate)
+    011 = BPF_STX   (store register)
+    100 = BPF_ALU   (32-bit arithmetic)
+    101 = BPF_JMP   (64-bit jumps)
+    110 = BPF_JMP32 (32-bit jumps)
+    111 = BPF_ALU64 (64-bit arithmetic)
+```
+
+**Một số opcode thông dụng:**
+
+```text
+BPF_MOV64_REG(dst, src)   -- dst = src           (64-bit move)
+BPF_MOV64_IMM(dst, imm)   -- dst = imm           (immediate)
+BPF_ALU64_IMM(ADD, dst, imm) -- dst += imm       (add)
+BPF_JMP_IMM(JEQ, src, imm, off) -- if src == imm goto pc+off
+BPF_LDX_MEM(DW, dst, src, off) -- dst = *(u64*)(src+off)
+BPF_STX_MEM(DW, dst, src, off) -- *(u64*)(dst+off) = src
+BPF_CALL func_id              -- call helper function
+BPF_EXIT_INSN()               -- return r0
+```
+
+**Ví dụ: Disassemble một eBPF program đơn giản:**
+
+```bash
+# Compile BPF program
+clang -O2 -target bpf -c simple.bpf.c -o simple.bpf.o
+
+# Disassemble
+llvm-objdump -d simple.bpf.o
+```
+
+```text
+Output:
+simple.bpf.o:   file format elf64-bpf
+
+Disassembly of section tracepoint/syscalls/sys_enter_execve:
+
+0000000000000000 <trace_execve>:
+       0:       85 00 00 00 0e 00 00 00 call 14    ; bpf_get_current_pid_tgid()
+       1:       77 00 00 00 20 00 00 00 r0 >>= 32  ; get PID (upper 32 bits)
+       2:       63 0a f8 ff 00 00 00 00 *(u32 *)(r10 - 8) = r0  ; store PID on stack
+       3:       bf a1 00 00 00 00 00 00 r1 = r10   ; r1 = frame pointer
+       4:       07 01 00 00 f0 ff ff ff r1 += -16  ; r1 = &comm buffer
+       ...
+```
+
+### BPF Verifier — Deep Dive
+
+Verifier thực hiện **abstract interpretation**: nó simulate tất cả code paths với abstract values thay vì concrete values.
+
+```text
+Verifier state for each instruction:
+
+  regs[0..10] = {
+    type:    SCALAR / PTR_TO_MAP_VALUE / PTR_TO_CTX / NOT_INIT / ...
+    value:   known value (if constant)
+    range:   [min_value, max_value] (if bounded)
+    off:     offset from base pointer
+    id:      unique ID for pointer tracking
+  }
+  stack[0..511] = similar state per stack slot
+```
+
+**Ví dụ về verifier rejection:**
+
+```c
+// BUG: Missing bounds check
+SEC("xdp")
+int bad_program(struct xdp_md *ctx)
+{
+    void *data     = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ethhdr *eth = data;
+    // BUG: không check bounds trước khi access eth->h_proto
+    __u16 proto = eth->h_proto;  // VERIFIER REJECTS THIS
+    return XDP_PASS;
+}
+
+// FIX: Add bounds check
+SEC("xdp")
+int good_program(struct xdp_md *ctx)
+{
+    void *data     = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ethhdr *eth = data;
+    // Check: eth + sizeof(*eth) <= data_end
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    __u16 proto = eth->h_proto;  // OK!
+    return XDP_PASS;
+}
+```
+
+**Verifier error messages thường gặp:**
+
+```text
+"invalid mem access 'inv'"
+  -> Dereference uninitialized/invalid pointer
+
+"R1 min value is negative, either use unsigned or 'var &= const'"
+  -> Pointer arithmetic với negative offset chưa được check
+
+"back-edge from insn X to Y"
+  -> Backward jump không có bound (infinite loop)
+
+"value -1 makes map_value pointer be out of bounds"
+  -> Map value access vượt quá kích thước
+
+"math between map_value pointer and register with unbounded min value"
+  -> Pointer arithmetic với unbounded register
+```
+
+**Debug verifier với verbose log:**
+
+```bash
+# Bật verbose verifier log
+sudo bpftool prog load myebpf.bpf.o /sys/fs/bpf/myebpf \
+    2>&1 | head -100
+```
+
+### JIT Compiler
+
+Sau khi verifier pass, kernel JIT compile eBPF bytecode → native machine code.
+
+```bash
+# Bật JIT (thường enabled by default)
+echo 1 | sudo tee /proc/sys/net/core/bpf_jit_enable
+
+# Xem JIT compiled code của một program
+sudo bpftool prog dump xlated id <prog_id>     # eBPF bytecode
+sudo bpftool prog dump jited id <prog_id>      # Native assembly
+```
+
+**Ví dụ output dump jited:**
+
+```text
+int trace_execve(...):
+; u32 pid = bpf_get_current_pid_tgid() >> 32;
+   0:    push   rbp
+   1:    mov    rbp, rsp
+   4:    push   rbx
+   5:    push   r13
+   7:    push   r14
+   9:    push   r15
+   b:    sub    rsp, 0x28
+   f:    call   0xffffffffce4a1c70  ; bpf_get_current_pid_tgid
+  14:    shr    rax, 0x20           ; >> 32 to get PID
+  18:    mov    dword ptr [rbp - 0x4], eax  ; store on stack
+```
+
+JIT code chạy với overhead gần như native C code — không có interpretation overhead.
+
+### BTF — BPF Type Format
+
+BTF là format debug info cho eBPF, cho phép CO-RE (Compile Once, Run Everywhere):
+
+```bash
+# Xem BTF của kernel
+bpftool btf dump file /sys/kernel/btf/vmlinux | head -50
+
+# Xem BTF của một BPF program
+bpftool btf dump prog id <prog_id>
+```
+
+```text
+# BTF output mẫu (struct sock)
+[156] STRUCT 'sock' size=760 vlen=44
+    'sk_node' type_id=157 bits_offset=0
+    'sk_hash' type_id=4 bits_offset=256
+    'sk_portpair' type_id=4 bits_offset=320
+    ...
+    '__sk_common' type_id=163 bits_offset=0
+    'sk_rcvtimeo' type_id=4 bits_offset=6080
+```
+
+**CO-RE hoạt động như thế nào:**
+
+```c
+// Với CO-RE, thay vì trực tiếp:
+// u32 dport = sk->__sk_common.skc_dport;  // BAD: offset hardcoded
+
+// Dùng BPF_CORE_READ:
+u32 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
+// Tại load time, libbpf sẽ:
+// 1. Đọc BTF của kernel hiện tại
+// 2. Tính offset thực của skc_dport trong kernel này
+// 3. Patch instruction để dùng offset đúng
+// -> Program chạy đúng trên mọi kernel version có BTF
+```
+
+### Xem program đang chạy
+
+```bash
+# List tất cả BPF programs
+sudo bpftool prog list
+
+# Chi tiết về một program
+sudo bpftool prog show id 42
+
+# List maps
+sudo bpftool map list
+
+# Xem nội dung map
+sudo bpftool map dump id 5
+
+# Pin map để share giữa các process
+sudo bpftool map pin id 5 /sys/fs/bpf/mymap
+```
+
+```text
+# Output mẫu bpftool prog list
+42: tracepoint  name trace_execve  tag abc123def456  gpl
+    loaded_at 2024-01-01T00:00:00+0000  uid 0
+    xlated 320B  jited 248B  memlock 4096B  map_ids 7,8
+    btf_id 45
+```

@@ -1,0 +1,279 @@
+## XDP — eXpress Data Path
+
+XDP là hook point ở tầng thấp nhất của Linux network stack: **ngay khi packet vừa đến NIC driver, trước khi kernel cấp phát sk_buff**. Đây là lý do XDP có thể đạt throughput hàng chục triệu packet/giây trên một CPU core.
+
+```text
+NIC hardware
+    |
+    | DMA transfer
+    v
+[XDP hook] <-- eBPF program runs HERE
+    | PASS / DROP / TX / REDIRECT / ABORTED
+    v
+sk_buff allocation
+    |
+    v
+Network stack (IP layer, TCP/UDP, ...)
+    |
+    v
+Socket receive buffer
+    |
+    v
+Application (read/recv)
+```
+
+### XDP Actions
+
+| Action | Ý nghĩa |
+|---|---|
+| `XDP_PASS` | Cho packet đi tiếp vào kernel network stack |
+| `XDP_DROP` | Drop packet ngay lập tức (cực nhanh) |
+| `XDP_TX` | Gửi packet trở lại interface (hairpin) |
+| `XDP_REDIRECT` | Redirect đến interface khác hoặc CPU khác |
+| `XDP_ABORTED` | Drop + generate tracepoint (debug only) |
+
+### Ví dụ 1: Packet Counter
+
+```c
+// xdp_counter.bpf.c
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 5);  // one slot per XDP action
+    __type(key, u32);
+    __type(value, u64);
+} action_stats SEC(".maps");
+
+SEC("xdp")
+int xdp_counter(struct xdp_md *ctx)
+{
+    u32 action = XDP_PASS;
+    u32 key = action;
+    u64 *count = bpf_map_lookup_elem(&action_stats, &key);
+    if (count)
+        (*count)++;
+    return action;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+
+```bash
+# Load và attach vào interface eth0
+sudo ip link set dev eth0 xdp obj xdp_counter.bpf.o sec xdp
+
+# Hoặc dùng xdp-loader
+sudo xdp-loader load eth0 xdp_counter.bpf.o
+
+# Remove
+sudo ip link set dev eth0 xdp off
+```
+
+### Ví dụ 2: IP Blocklist (DDoS mitigation)
+
+```c
+// xdp_blocklist.bpf.c
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+
+struct lpm_key {
+    __u32 prefixlen;
+    __u32 addr;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 65536);
+    __type(key, struct lpm_key);
+    __type(value, u64);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} blocklist SEC(".maps");
+
+// Stats: [0]=passed, [1]=dropped
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 2);
+    __type(key, u32);
+    __type(value, u64);
+} stats SEC(".maps");
+
+static __always_inline void update_stat(u32 key)
+{
+    u64 *val = bpf_map_lookup_elem(&stats, &key);
+    if (val)
+        (*val)++;
+}
+
+SEC("xdp")
+int xdp_block(struct xdp_md *ctx)
+{
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data     = (void *)(long)ctx->data;
+
+    // Parse Ethernet header
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    // Only process IPv4
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP) {
+        update_stat(0);
+        return XDP_PASS;
+    }
+
+    // Parse IP header
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return XDP_PASS;
+
+    // LPM lookup
+    struct lpm_key key = {
+        .prefixlen = 32,
+        .addr      = ip->saddr,
+    };
+
+    if (bpf_map_lookup_elem(&blocklist, &key)) {
+        update_stat(1);
+        return XDP_DROP;
+    }
+
+    update_stat(0);
+    return XDP_PASS;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+
+Quản lý blocklist từ userspace:
+
+```c
+// Thêm IP/network vào blocklist
+int add_to_blocklist(int map_fd, const char *cidr)
+{
+    struct lpm_key key;
+    u64 value = 1;
+    char ip_str[32];
+    int prefix;
+
+    sscanf(cidr, "%[^/]/%d", ip_str, &prefix);
+    key.prefixlen = prefix;
+    key.addr = inet_addr(ip_str) & htonl(~((1u << (32 - prefix)) - 1));
+
+    return bpf_map_update_elem(map_fd, &key, &value, BPF_ANY);
+}
+
+// Block toàn bộ /24
+add_to_blocklist(map_fd, "192.168.100.0/24");
+// Block IP cụ thể
+add_to_blocklist(map_fd, "10.0.0.1/32");
+```
+
+### Ví dụ 3: Rate Limiter
+
+```c
+// xdp_ratelimit.bpf.c — Giới hạn packet rate per source IP
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+
+#define RATE_LIMIT_PPS 1000  // packets per second per IP
+
+struct rate_limit_val {
+    u64 last_ts;   // timestamp of last reset
+    u64 pkt_count; // packets since last reset
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 100000);
+    __type(key, u32);   // source IP
+    __type(value, struct rate_limit_val);
+} rate_map SEC(".maps");
+
+SEC("xdp")
+int xdp_ratelimit(struct xdp_md *ctx)
+{
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data     = (void *)(long)ctx->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
+        return XDP_PASS;
+
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return XDP_PASS;
+
+    u32 src_ip = ip->saddr;
+    u64 now = bpf_ktime_get_ns();
+
+    struct rate_limit_val *val = bpf_map_lookup_elem(&rate_map, &src_ip);
+    if (val) {
+        // Reset counter every second
+        if (now - val->last_ts >= 1000000000ULL) {
+            val->last_ts = now;
+            val->pkt_count = 1;
+        } else if (val->pkt_count >= RATE_LIMIT_PPS) {
+            return XDP_DROP;  // Exceeded rate limit
+        } else {
+            val->pkt_count++;
+        }
+    } else {
+        // New IP
+        struct rate_limit_val new_val = {
+            .last_ts   = now,
+            .pkt_count = 1,
+        };
+        bpf_map_update_elem(&rate_map, &src_ip, &new_val, BPF_ANY);
+    }
+
+    return XDP_PASS;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+
+### XDP Redirect — Packet Forwarding
+
+```c
+// Redirect packet đến interface khác
+SEC("xdp")
+int xdp_redirect(struct xdp_md *ctx)
+{
+    // Redirect đến interface có index 3
+    return bpf_redirect(3, 0);
+}
+
+// Redirect đến CPU khác (XDP_REDIRECT + devmap)
+struct {
+    __uint(type, BPF_MAP_TYPE_DEVMAP);
+    __uint(max_entries, 64);
+    __type(key, u32);
+    __type(value, u32);
+} tx_port SEC(".maps");
+
+SEC("xdp")
+int xdp_redirect_map(struct xdp_md *ctx)
+{
+    u32 key = 0;
+    return bpf_redirect_map(&tx_port, key, XDP_PASS);
+}
+```
+
+### XDP Performance
+
+Cloudflare báo cáo XDP có thể drop **~10-20 million packets/second per CPU core** — so với iptables chỉ đạt ~1-2 Mpps. Đây là lý do XDP trở thành standard cho DDoS mitigation.
+
+```text
+Throughput comparison (single core, 10GbE NIC):
+
+  iptables DROP:  ~1-2 Mpps
+  XDP DROP:      ~10-20 Mpps
+  XDP (HW offload): ~100+ Mpps (with supported NIC)
+```

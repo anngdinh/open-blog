@@ -1,0 +1,264 @@
+## eBPF Maps — Shared Data Structures
+
+Maps là cơ chế để eBPF program (kernel) và userspace chia sẻ dữ liệu. Chúng cũng là cách eBPF program lưu state giữa các lần gọi.
+
+### Tất cả các loại Map
+
+| Map Type | Đặc điểm | Use Case |
+|---|---|---|
+| `HASH` | Hash table key→value | Counter theo PID, connection state |
+| `ARRAY` | Fixed-size array indexed by u32 | Global stats, per-CPU global counters |
+| `PERCPU_HASH` | Hash table nhưng mỗi CPU có bản riêng | High-frequency counters, no lock needed |
+| `PERCPU_ARRAY` | Array nhưng per-CPU | Per-CPU stats |
+| `LRU_HASH` | Hash với eviction LRU | Connection tracking với giới hạn memory |
+| `LPM_TRIE` | Longest Prefix Match trie | IP routing, CIDR matching |
+| `RINGBUF` | Ring buffer MPSC | Gửi events từ kernel lên userspace (preferred) |
+| `PERF_EVENT_ARRAY` | Perf event buffer | Legacy event streaming |
+| `QUEUE` / `STACK` | FIFO / LIFO | Packet queues |
+| `SOCKHASH` / `SOCKMAP` | Socket reference maps | Socket redirection |
+| `ARRAY_OF_MAPS` | Map chứa map khác | Dynamic dispatch |
+
+### Hash Map — Ví dụ thực tế: đếm syscall per-process
+
+```c
+// syscall_counter.bpf.c
+
+// Map: PID (u32) -> syscall count (u64)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, u32);
+    __type(value, u64);
+} syscall_count SEC(".maps");
+
+SEC("tracepoint/raw_syscalls/sys_enter")
+int count_syscalls(struct trace_event_raw_sys_enter *ctx)
+{
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 *count;
+
+    count = bpf_map_lookup_elem(&syscall_count, &pid);
+    if (count) {
+        // Atomic increment
+        __sync_fetch_and_add(count, 1);
+    } else {
+        // First time for this PID
+        u64 init = 1;
+        bpf_map_update_elem(&syscall_count, &pid, &init, BPF_NOEXIST);
+    }
+    return 0;
+}
+```
+
+Đọc từ userspace:
+
+```c
+// userspace
+#include <bpf/libbpf.h>
+
+void print_top_processes(int map_fd)
+{
+    u32 key = 0, next_key;
+    u64 value;
+
+    printf("%-8s %-20s %s\n", "PID", "COMM", "SYSCALLS");
+    while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
+        bpf_map_lookup_elem(map_fd, &next_key, &value);
+        // ... get comm from /proc/$pid/comm ...
+        printf("%-8u %-20s %llu\n", next_key, get_comm(next_key), value);
+        key = next_key;
+    }
+}
+```
+
+### Per-CPU Array — Counter hiệu năng cao
+
+Per-CPU arrays tránh contention vì mỗi CPU có bản riêng, không cần lock:
+
+```c
+// Khai báo
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 4); // 4 counters: rx_pkts, rx_bytes, tx_pkts, tx_bytes
+    __type(key, u32);
+    __type(value, u64);
+} stats SEC(".maps");
+
+// Trong XDP program
+SEC("xdp")
+int count_packets(struct xdp_md *ctx)
+{
+    u32 key = 0; // rx_pkts counter
+    u64 *count = bpf_map_lookup_elem(&stats, &key);
+    if (count)
+        (*count)++;  // No lock needed! Per-CPU
+
+    key = 1; // rx_bytes counter
+    u64 *bytes = bpf_map_lookup_elem(&stats, &key);
+    u32 pkt_size = ctx->data_end - ctx->data;
+    if (bytes)
+        *bytes += pkt_size;
+
+    return XDP_PASS;
+}
+```
+
+Đọc từ userspace — cần sum tất cả CPU:
+
+```c
+// Đọc per-CPU array từ userspace
+void read_percpu_stats(int map_fd)
+{
+    int num_cpus = libbpf_num_possible_cpus();
+    u64 *values = calloc(num_cpus, sizeof(u64));
+
+    // key=0 = rx_pkts
+    u32 key = 0;
+    bpf_map_lookup_elem(map_fd, &key, values);
+
+    u64 total_pkts = 0;
+    for (int i = 0; i < num_cpus; i++)
+        total_pkts += values[i];
+
+    printf("Total packets: %llu\n", total_pkts);
+    free(values);
+}
+```
+
+### Ring Buffer — Event Streaming
+
+Ring buffer là cách recommended để gửi events từ kernel lên userspace:
+
+```c
+// Kernel side
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20); // 1MB
+} rb SEC(".maps");
+
+struct net_event {
+    u64 ts;
+    u32 pid;
+    u32 daddr;
+    u16 dport;
+    u8  comm[16];
+};
+
+SEC("kprobe/tcp_connect")
+int BPF_KPROBE(on_connect, struct sock *sk)
+{
+    struct net_event *e;
+
+    // bpf_ringbuf_reserve: allocate space (lock-free)
+    e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+    if (!e)
+        return 0;  // ring buffer full, drop event
+
+    e->ts    = bpf_ktime_get_ns();
+    e->pid   = bpf_get_current_pid_tgid() >> 32;
+    e->daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+    e->dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    // bpf_ringbuf_submit: publish event (visible to userspace)
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+```
+
+```c
+// Userspace polling
+static int handle_event(void *ctx, void *data, size_t data_sz)
+{
+    const struct net_event *e = data;
+    char ip[16];
+    inet_ntop(AF_INET, &e->daddr, ip, sizeof(ip));
+    printf("[%llu] pid=%-6u comm=%-16s -> %s:%u\n",
+           e->ts, e->pid, e->comm, ip, e->dport);
+    return 0;
+}
+
+// Setup ring buffer
+struct ring_buffer *rb = ring_buffer__new(
+    bpf_map__fd(skel->maps.rb),
+    handle_event, NULL, NULL);
+
+// Event loop
+while (!stop) {
+    ring_buffer__poll(rb, 100);
+}
+```
+
+### LPM Trie — IP CIDR Matching
+
+Cực kỳ hữu ích cho firewall rules và routing:
+
+```c
+// IP blocklist với CIDR support
+struct lpm_key {
+    __u32 prefixlen;
+    __u32 addr;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 1024);
+    __type(key, struct lpm_key);
+    __type(value, u64);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} ip_blocklist SEC(".maps");
+
+// Trong XDP program
+SEC("xdp")
+int drop_blocked(struct xdp_md *ctx)
+{
+    // ... parse IP header ...
+    struct lpm_key key = {
+        .prefixlen = 32,
+        .addr = ip->saddr,  // Source IP
+    };
+    if (bpf_map_lookup_elem(&ip_blocklist, &key))
+        return XDP_DROP;
+    return XDP_PASS;
+}
+```
+
+Từ userspace, thêm network vào blocklist:
+
+```c
+// Block 192.168.1.0/24
+struct lpm_key key = {
+    .prefixlen = 24,
+    .addr = inet_addr("192.168.1.0"),
+};
+u64 value = 1;
+bpf_map_update_elem(map_fd, &key, &value, BPF_ANY);
+```
+
+### Map Operations từ userspace
+
+```c
+// CRUD operations trên map
+int map_fd = bpf_map__fd(skel->maps.my_map);
+
+// Lookup
+u32 key = pid;
+u64 value;
+int ret = bpf_map_lookup_elem(map_fd, &key, &value);
+if (ret == 0) printf("Found: %llu\n", value);
+
+// Update (BPF_ANY: create or update, BPF_NOEXIST: only create, BPF_EXIST: only update)
+u64 new_value = 100;
+bpf_map_update_elem(map_fd, &key, &new_value, BPF_ANY);
+
+// Delete
+bpf_map_delete_elem(map_fd, &key);
+
+// Iterate all entries
+u32 cur_key = 0, next_key;
+while (bpf_map_get_next_key(map_fd, &cur_key, &next_key) == 0) {
+    bpf_map_lookup_elem(map_fd, &next_key, &value);
+    // process entry
+    cur_key = next_key;
+}
+```

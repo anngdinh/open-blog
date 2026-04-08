@@ -1,0 +1,79 @@
+---
+title: "eBPF Deep Dive: Từ bpftrace one-liner đến XDP, LSM, và sched_ext"
+description: "Hướng dẫn toàn diện về eBPF cho kỹ sư hệ thống — từ bpftrace one-liner đến viết eBPF program bằng C với libbpf, XDP networking, BPF LSM security, verifier internals, và các tính năng mới nhất"
+date: 2026-04-08
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+import Introduction from "./_sections/01-introduction.mdx";
+import Architecture from "./_sections/02-architecture.mdx";
+import Bpftrace from "./_sections/03-bpftrace.mdx";
+import Libbpf from "./_sections/04-libbpf.mdx";
+import Maps from "./_sections/05-maps.mdx";
+import Xdp from "./_sections/06-xdp.mdx";
+import TcSecurity from "./_sections/07-tc-security.mdx";
+import Internals from "./_sections/08-internals.mdx";
+import Modern from "./_sections/09-modern.mdx";
+import Conclusion from "./_sections/10-conclusion.mdx";
+
+export const metadata = generateBlogMetadata({
+  title: "eBPF Deep Dive: Từ bpftrace one-liner đến XDP, LSM, và sched_ext",
+  description: "Hướng dẫn toàn diện về eBPF cho kỹ sư hệ thống — từ bpftrace one-liner đến viết eBPF program bằng C với libbpf, XDP networking, BPF LSM security, verifier internals, và các tính năng mới nhất",
+  date: "2026-04-08",
+  slug: "ebpf-deep-dive"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/ebpf-deep-dive/cover.jpg"
+    alt="Server data center representing high-performance Linux kernel programming with eBPF"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+<Introduction />
+<Architecture />
+<Bpftrace />
+<Libbpf />
+<Maps />
+<Xdp />
+<TcSecurity />
+<Internals />
+<Modern />
+<Conclusion />
+
+## References
+
+- [ebpf.io — What is eBPF?](https://ebpf.io/what-is-ebpf/)
+- [Brendan Gregg — Learn eBPF Tracing: Tutorial and Examples](https://www.brendangregg.com/blog/2019-01-01/learn-ebpf-tracing.html)
+- [Brendan Gregg — BPF Internals (USENIX LISA 2021)](https://www.brendangregg.com/blog/2021-06-15/bpf-internals.html)
+- [ARMO Security — Reverse Engineering eBPF Programs: A Deep Dive](https://www.armosec.io/blog/ebpf-reverse-engineering-programs/)
+- [Eunomia — The Past, Present, and Future of eBPF](https://eunomia.dev/en/blogs/ten-years/)
+- [Eunomia — eBPF Ecosystem Progress in 2024–2025](https://eunomia.dev/blog/2025/02/12/ebpf-ecosystem-progress-in-20242025-a-technical-deep-dive/)
+- [Cloudflare Blog — eBPF articles](https://blog.cloudflare.com/tag/ebpf/)
+- [OneUptime — How to Understand eBPF in Calico](https://oneuptime.com/blog/post/2026-03-13-calico-ebpf-overview/view)
+- [Nakame.dev — eBPF in Rust series](https://nakame.dev/ebpf/)
+- [Book: BPF Performance Tools — Brendan Gregg](https://www.brendangregg.com/bpf-performance-tools-book.html)
+- [Book: Learning eBPF — Liz Rice (O'Reilly)](https://isovalent.com/books/learning-ebpf/)
+- [libbpf-bootstrap — BPF development scaffold](https://github.com/libbpf/libbpf-bootstrap)
+- [Linux kernel BPF documentation](https://www.kernel.org/doc/html/latest/bpf/index.html)
+
+### Related posts
+
+- [Tổng hợp tài nguyên học eBPF](/blog/ebpf-learning-resources) - Curated list các blog, tutorial và sách tốt nhất để học eBPF
+- [Container Networking from Scratch](/blog/container-networking-from-scratch) - Xây dựng container networking từ đầu với veth pair, bridge, NAT và CNI plugin
+- [Kubernetes CNI Overview](/blog/kubernetes-cni-overview) - Tổng quan về các CNI plugin trong Kubernetes

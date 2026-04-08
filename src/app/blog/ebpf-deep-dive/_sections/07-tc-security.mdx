@@ -1,0 +1,290 @@
+## TC Hooks và eBPF cho Security
+
+### TC (Traffic Control) — Linh hoạt hơn XDP
+
+TC hooks attach ở một tầng cao hơn XDP — sau khi sk_buff đã được cấp phát, cho phép bạn đọc và sửa packet đầy đủ hơn, kể cả metadata.
+
+```text
+XDP hook  <-- packet vào, TRƯỚC sk_buff
+    |
+    v
+sk_buff allocation
+    |
+    v
+[TC ingress hook] <-- eBPF attach ở đây (ingress)
+    |
+    v
+IP layer (routing decision)
+    |
+    v
+[TC egress hook]  <-- eBPF attach ở đây (egress)
+    |
+    v
+NIC driver (transmit)
+```
+
+**So sánh XDP vs TC:**
+
+| Feature | XDP | TC |
+|---|---|---|
+| Khi packet | Vào NIC driver | Sau sk_buff cấp phát |
+| Overhead | Cực thấp | Thấp |
+| sk_buff access | Không | Có |
+| Egress support | Giới hạn | Đầy đủ (ingress + egress) |
+| Packet modification | Cơ bản | Đầy đủ |
+| Use case | DDoS drop, forwarding | Policy enforcement, packet mangling |
+
+### Ví dụ: TC ingress — log và modify packets
+
+```c
+// tc_trace.bpf.c
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+#include <linux/pkt_cls.h>  // TC_ACT_*
+
+struct pkt_info {
+    u32 src_ip;
+    u32 dst_ip;
+    u16 src_port;
+    u16 dst_port;
+    u8  proto;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 16);
+} events SEC(".maps");
+
+SEC("tc")
+int tc_ingress(struct __sk_buff *skb)
+{
+    void *data_end = (void *)(long)skb->data_end;
+    void *data     = (void *)(long)skb->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return TC_ACT_OK;
+
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
+        return TC_ACT_OK;
+
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return TC_ACT_OK;
+
+    struct pkt_info *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return TC_ACT_OK;
+
+    e->src_ip = ip->saddr;
+    e->dst_ip = ip->daddr;
+    e->proto  = ip->protocol;
+
+    if (ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp = (void *)(ip + 1);
+        if ((void *)(tcp + 1) <= data_end) {
+            e->src_port = bpf_ntohs(tcp->source);
+            e->dst_port = bpf_ntohs(tcp->dest);
+        }
+    }
+
+    bpf_ringbuf_submit(e, 0);
+    return TC_ACT_OK;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+
+```bash
+# Load TC eBPF program
+tc qdisc add dev eth0 clsact
+tc filter add dev eth0 ingress bpf da obj tc_trace.bpf.o sec tc
+
+# Xem current filters
+tc filter show dev eth0 ingress
+
+# Remove
+tc filter del dev eth0 ingress
+tc qdisc del dev eth0 clsact
+```
+
+### TC Return Values
+
+| Value | Số | Ý nghĩa |
+|---|---|---|
+| `TC_ACT_OK` | 0 | Tiếp tục xử lý |
+| `TC_ACT_SHOT` | 2 | Drop packet |
+| `TC_ACT_REDIRECT` | 7 | Redirect |
+| `TC_ACT_PIPE` | 3 | Chạy filter tiếp theo |
+
+---
+
+## eBPF cho Security — BPF LSM
+
+BPF LSM (Linux Security Module) cho phép viết security policy bằng eBPF, attach vào các security hook trong kernel.
+
+> **LSM (Linux Security Module)**: Framework trong Linux kernel cho phép thêm security policy. SELinux, AppArmor là LSM implementation. BPF LSM cho phép viết LSM bằng eBPF — flexible hơn SELinux, dễ triển khai hơn AppArmor.
+
+### Các LSM hooks phổ biến
+
+```c
+// Một số hook points của BPF LSM
+lsm/file_open        // Khi file được mở
+lsm/bprm_check_security  // Khi execute binary
+lsm/socket_connect   // Khi socket connect
+lsm/task_kill        // Khi signal được gửi
+lsm/socket_create    // Khi socket được tạo
+lsm/inode_mkdir      // Khi tạo directory
+```
+
+### Ví dụ: Chặn process không được phép mở file nhạy cảm
+
+```c
+// security_file.bpf.c
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+#include <errno.h>
+
+// Danh sách process được phép đọc /etc/shadow
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 64);
+    __type(key, u32);   // PID
+    __type(value, u8);
+} allowed_pids SEC(".maps");
+
+SEC("lsm/file_open")
+int BPF_PROG(restrict_shadow, struct file *file)
+{
+    char fname[32];
+    struct dentry *dentry;
+    struct qstr d_name;
+
+    // Get filename
+    dentry = BPF_CORE_READ(file, f_path.dentry);
+    d_name = BPF_CORE_READ(dentry, d_name);
+
+    // Check if accessing /etc/shadow
+    bpf_probe_read_kernel_str(&fname, sizeof(fname), d_name.name);
+
+    if (__builtin_memcmp(fname, "shadow", 6) != 0)
+        return 0;  // Not shadow file, allow
+
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    // Check if PID is in allowed list
+    u8 *allowed = bpf_map_lookup_elem(&allowed_pids, &pid);
+    if (allowed)
+        return 0;  // Allowed
+
+    // Block access - return EPERM
+    bpf_printk("Blocked access to shadow by pid=%u\n", pid);
+    return -EPERM;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+
+```bash
+# Enable BPF LSM (cần thêm vào kernel boot params)
+# GRUB_CMDLINE_LINUX="lsm=bpf,lockdown,capability,yama"
+# hoặc kiểm tra
+cat /sys/kernel/security/lsm
+```
+
+### Ví dụ: Chặn exec của binary không được phép
+
+```c
+// deny_exec.bpf.c — Cho phép chỉ specific binaries được run
+SEC("lsm/bprm_check_security")
+int BPF_PROG(check_exec, struct linux_binprm *bprm)
+{
+    char filename[256];
+    u8  comm[16];
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    // Get the binary being executed
+    bpf_probe_read_kernel_str(&filename, sizeof(filename),
+        BPF_CORE_READ(bprm, filename));
+
+    bpf_get_current_comm(&comm, sizeof(comm));
+
+    // Block execution of certain tools by non-root
+    if (__builtin_memcmp(filename, "/usr/bin/nc", 11) == 0) {
+        uid_t uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+        if (uid != 0) {
+            bpf_printk("Blocked: pid=%u comm=%s tried to exec nc\n",
+                       pid, comm);
+            return -EPERM;
+        }
+    }
+
+    return 0;
+}
+```
+
+### Ví dụ: Seccomp-BPF (lọc syscall)
+
+Seccomp-BPF là cách đơn giản hơn để restrict syscalls cho một process cụ thể:
+
+```c
+// Trong userspace — restrict syscalls cho process này
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <sys/prctl.h>
+
+static void apply_seccomp_filter(void)
+{
+    struct sock_filter filter[] = {
+        // Load architecture
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, arch)),
+        // Allow only x86-64
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
+
+        // Load syscall number
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+
+        // Allow read, write, exit, exit_group, brk
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_read, 4, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_write, 3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_exit, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_exit_group, 1, 0),
+        // Kill everything else
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+
+    struct sock_fprog prog = {
+        .len    = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+        .filter = filter,
+    };
+
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
+}
+```
+
+### Calico + eBPF: Kubernetes Security
+
+Calico eBPF mode implement network policy bằng TC hooks và eBPF maps — thay thế hoàn toàn iptables:
+
+```text
+Kubernetes NetworkPolicy -> Calico controller
+                                |
+                          translates to
+                                |
+                          eBPF TC hooks    +    eBPF Maps (LPM Trie for CIDR)
+                                |
+                          O(1) policy lookup per packet
+                          (vs O(n) linear iptables scan)
+```
+
+Với 1000 pods và nhiều NetworkPolicy:
+- **iptables**: hàng chục nghìn rules, linear scan O(n)
+- **Calico eBPF**: hash map + LPM trie, O(1) lookup, không phụ thuộc số rules

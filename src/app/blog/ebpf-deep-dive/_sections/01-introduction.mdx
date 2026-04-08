@@ -1,0 +1,37 @@
+## eBPF là gì và tại sao nó quan trọng?
+
+Hãy tưởng tượng bạn cần theo dõi mọi lần một process mở file, mọi TCP connection được tạo ra, hoặc mọi lần scheduler chọn một task để chạy — tất cả trong production, không ảnh hưởng đến performance. Trước eBPF, bạn có hai lựa chọn tệ:
+
+1. **Kernel module**: Hiệu quả nhưng nguy hiểm — một bug là crash cả server
+2. **strace / perf**: An toàn nhưng chậm — overhead lên đến 10x, không dùng được production
+
+eBPF tạo ra lựa chọn thứ ba: chạy code tùy ý trong kernel, **an toàn như user space, nhanh như kernel**.
+
+Brendan Gregg — tác giả "BPF Performance Tools" — tóm gọn điều này bằng một phép so sánh: *"eBPF làm với Linux điều mà JavaScript làm với HTML."* Cũng như JavaScript biến trang tĩnh thành ứng dụng động mà không cần thay đổi browser, eBPF cho phép bạn lập trình kernel đang chạy mà không cần reboot hay viết kernel module.
+
+> **eBPF (extended Berkeley Packet Filter)**: Là một virtual machine trong Linux kernel, cho phép chạy các chương trình sandbox được xác minh trước (verified). eBPF program được attach vào các hook point trong kernel — syscall, network path, scheduler, v.v. — và thực thi với overhead rất thấp khi sự kiện xảy ra.
+
+Trong bài này, chúng ta sẽ đi từ những bước đầu tiên cho đến những chi tiết kỹ thuật nhất:
+
+```text
+What we cover:
+
+  [Beginner]
+  1. Architecture overview
+  2. bpftrace one-liners
+  3. bcc tools ready-to-use
+
+  [Intermediate]
+  4. First eBPF program in C (libbpf)
+  5. eBPF Maps - all types with examples
+  6. Program types: kprobe, tracepoint, XDP, TC
+
+  [Advanced]
+  7. XDP for high-performance networking
+  8. TC hooks and packet modification
+  9. BPF LSM for security
+
+  [Deep Dive]
+  10. eBPF internals: verifier, JIT, instruction set
+  11. Modern eBPF: BTF, CO-RE, sched_ext
+```

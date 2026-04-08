@@ -1,0 +1,89 @@
+## eBPF Architecture
+
+Trước khi viết code, cần hiểu eBPF program chạy như thế nào trong kernel.
+
+### Vòng đời của một eBPF program
+
+```text
+User space                    Kernel space
+-----------                   ------------
+
+Source (.bpf.c)
+    |
+    | clang/LLVM
+    v
+eBPF bytecode (.o)
+    |
+    | bpf() syscall
+    v
+[BPF Verifier] ----FAIL----> EPERM / EINVAL
+    |
+   PASS
+    |
+    | JIT Compiler
+    v
+Native machine code
+    |
+    | bpf_prog_attach()
+    v
+Hook point (kprobe / XDP / tracepoint / ...)
+    |
+    | Event fires
+    v
+Program executes <-------> BPF Maps (shared with user space)
+```
+
+### Hook Points
+
+eBPF có thể attach vào nhiều điểm trong kernel:
+
+| Category | Hook Type | Use Case |
+|---|---|---|
+| Tracing | kprobe/kretprobe | Trace kernel functions |
+| Tracing | tracepoint | Stable kernel events |
+| Tracing | uprobe/uretprobe | Trace user space functions |
+| Tracing | USDT | User-defined static tracing |
+| Networking | XDP | Packet processing at driver level |
+| Networking | TC ingress/egress | Traffic control |
+| Networking | socket | Socket-level filtering |
+| Networking | sk_lookup | Custom socket dispatch |
+| Security | LSM | Linux Security Module hooks |
+| Scheduling | sched_ext | Custom CPU schedulers (kernel 6.12+) |
+
+### Tại sao eBPF an toàn?
+
+**BPF Verifier** là trái tim của safety model. Trước khi chạy, verifier kiểm tra:
+
+1. **No infinite loops**: Verifier yêu cầu chứng minh program luôn terminate. Backward jump chỉ được phép trong vòng lặp có bounded count.
+2. **No out-of-bounds memory access**: Mọi pointer đều phải được check bounds trước khi dereference.
+3. **No uninitialized reads**: Verifier track trạng thái của mọi register/stack slot.
+4. **No unsafe kernel function calls**: Chỉ được gọi các "helper functions" được phép, không thể gọi arbitrary kernel function.
+
+```text
+Verifier state machine (simplified):
+
+  For each instruction:
+    - Track type of every register (scalar, ptr-to-map, ptr-to-ctx, ...)
+    - Track value range (min/max bounds) for scalars
+    - For pointer arithmetic: verify result still in bounds
+    - For memory access: verify ptr type + offset is valid
+
+  If any check fails -> program rejected
+  If all paths terminate safely -> program approved
+```
+
+> **BPF Verifier**: Là static analyzer trong kernel, phân tích eBPF bytecode trước khi cho phép chạy. Nó thực hiện abstract interpretation — simulate tất cả các code path có thể — để đảm bảo program không bao giờ gây memory corruption hoặc vòng lặp vô tận.
+
+### Registers và Calling Convention
+
+eBPF có 11 registers 64-bit:
+
+| Register | Vai trò |
+|---|---|
+| r0 | Return value từ function call, kết quả của program |
+| r1–r5 | Argument cho function call |
+| r6–r9 | Callee-saved (phải restore sau khi dùng) |
+| r10 | Frame pointer (read-only), trỏ đến stack |
+| pc | Program counter (ẩn, không truy cập trực tiếp) |
+
+eBPF stack có kích thước cố định **512 bytes** — đây là giới hạn quan trọng cần nhớ khi viết program.
