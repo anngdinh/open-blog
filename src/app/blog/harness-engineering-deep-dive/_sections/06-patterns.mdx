@@ -1,71 +1,144 @@
 ## 12 Harness Patterns thực chiến từ Claude Code
 
-Lý thuyết giải phẫu đã đủ — bây giờ xem các pattern thực tế. Bài phân tích "12 Agentic Harness Patterns from Claude Code" tổng hợp các thiết kế được rút ngược từ (reverse-engineer) Claude Code. Chúng chia thành 4 nhóm.
+Lý thuyết giải phẫu đã đủ — bây giờ xem các pattern thực tế. Bài phân tích ["12 Agentic Harness Patterns from Claude Code"](https://generativeprogrammer.com/p/12-agentic-harness-patterns-from) của Generative Programmer tổng hợp các thiết kế được rút ngược (reverse-engineer) từ Claude Code, chia thành 4 nhóm. Mỗi pattern dưới đây kèm theo diagram gốc từ bài viết.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/hero-overview.png"
+    alt="Sơ đồ tổng quan 12 agentic harness patterns chia thành 4 nhóm: Memory & Context, Workflow & Orchestration, Tools & Permissions, và Automation"
+    style={{maxWidth: '760px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+*Ảnh: Tổng quan 12 pattern trong 4 nhóm — Nguồn: [Generative Programmer](https://generativeprogrammer.com/p/12-agentic-harness-patterns-from).*
 
 ### Nhóm A — Memory & Context (5 pattern)
 
 **1. Persistent Instruction File Pattern.** Một file như `CLAUDE.md` được auto-load ở đầu session, chứa convention, build command, coding standard của dự án. File đi kèm repo, không phải copy-paste mỗi lần.
 
+<div style={{display: 'flex', justifyContent: 'center', margin: '1.5rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/01-persistent-instruction.png"
+    alt="Diagram Persistent Instruction File Pattern — CLAUDE.md được auto-load đầu session và inject vào context"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
 **2. Scoped Context Assembly Pattern.** Instruction không chỉ nằm ở một chỗ — harness load theo hierarchy: organization → user → project → directory. Hỗ trợ `@import` để tránh duplicate. Agent "thấy" rule khác nhau tuỳ vị trí trong codebase.
 
-**3. Tiered Memory Pattern.** Tổ chức memory theo 3 tầng:
+<div style={{display: 'flex', justifyContent: 'center', margin: '1.5rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/02-scoped-context.png"
+    alt="Diagram Scoped Context Assembly Pattern — instruction được load theo hierarchy org/user/project/dir với import syntax"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
 
-```text
-┌───────────────────────────────────────────┐
-│ Layer 1: Compact Index   (~200 lines)     │  <- Always in context
-├───────────────────────────────────────────┤
-│ Layer 2: Topic files     (per-task)       │  <- Load on demand
-├───────────────────────────────────────────┤
-│ Layer 3: Full transcripts (on disk)       │  <- Search only
-└───────────────────────────────────────────┘
-```
+**3. Tiered Memory Pattern.** Tổ chức memory theo 3 tầng: compact index luôn trong context, topic file load on-demand, full transcript chỉ search khi cần.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '1.5rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/03-tiered-memory.png"
+    alt="Diagram Tiered Memory Pattern — 3 layer: compact index always in context, topic files on demand, full transcripts on disk"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
 
 **4. Dream Consolidation Pattern.** Một background process chạy trong thời gian idle để dedupe, prune và reorganize memory — "ngủ mơ" giống như con người củng cố trí nhớ. Claude Code có mode `autoDream` với 8 phase khác nhau.
 
+<div style={{display: 'flex', justifyContent: 'center', margin: '1.5rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/04-dream-consolidation.png"
+    alt="Diagram Dream Consolidation Pattern — background process dedupe, prune, reorganize agent memory during idle time"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
 **5. Progressive Context Compaction Pattern.** Nén theo tuổi đời: turn gần đây giữ nguyên, turn cũ nén nhẹ, turn rất cũ nén mạnh. Bốn layer: `HISTORY_SNIP`, `Microcompact`, `CONTEXT_COLLAPSE`, `Autocompact`.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '1.5rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/05-progressive-compaction.png"
+    alt="Diagram Progressive Context Compaction Pattern — staged compression by conversation age through 4 layers"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
 
 ### Nhóm B — Workflow & Orchestration (3 pattern)
 
-**6. Explore-Plan-Act Loop Pattern.** Tách công việc thành 3 giai đoạn với permission leo thang:
+**6. Explore-Plan-Act Loop Pattern.** Tách công việc thành 3 giai đoạn với permission leo thang: Explore (read-only) → Plan (discuss) → Act (full tool access). Tránh việc agent "edit trước khi hiểu" — một lỗi rất phổ biến.
 
-```text
-┌────────────┐  read-only  ┌────────────┐  discuss  ┌────────────┐  full tools
-│  EXPLORE   │ ──────────> │    PLAN    │ ────────> │    ACT     │
-│  (search,  │             │ (propose,  │           │ (edit,     │
-│   read)    │             │  review)   │           │  run, test)│
-└────────────┘             └────────────┘           └────────────┘
-```
-
-Tránh việc agent "edit trước khi hiểu" — một lỗi rất phổ biến.
+<div style={{display: 'flex', justifyContent: 'center', margin: '1.5rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/06-explore-plan-act.png"
+    alt="Diagram Explore-Plan-Act Loop Pattern — 3 phase với escalating permissions từ read-only đến full tool access"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
 
 **7. Context-Isolated Subagents Pattern.** Sub-agent có context window, system prompt và toolset *riêng*. Research agent không thể edit; planning agent không thể execute. Mỗi agent chỉ thấy thông tin liên quan.
 
+<div style={{display: 'flex', justifyContent: 'center', margin: '1.5rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/07-context-isolated.png"
+    alt="Diagram Context-Isolated Subagents Pattern — mỗi sub-agent có context, system prompt, tool set riêng và isolated"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
 **8. Fork-Join Parallelism Pattern.** Spawn nhiều sub-agent song song trong các git worktree độc lập — mỗi agent làm việc trên copy repo riêng. Cached context share giữa các fork giúp tiết kiệm token. Kết quả merge lại ở cuối.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '1.5rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/08-fork-join.png"
+    alt="Diagram Fork-Join Parallelism Pattern — multiple sub-agents in isolated git worktrees chạy song song, merge lại cuối cùng"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
 
 ### Nhóm C — Tools & Permissions (3 pattern)
 
 **9. Progressive Tool Expansion Pattern.** Khởi động với default nhỏ (&lt; 20 tool): `Read, Edit, Write, Bash, Grep, Glob`. Tool MCP và tool custom chỉ kích hoạt khi cần. Ít tool = ít phân tâm = model ra quyết định chính xác hơn.
 
-**10. Command Risk Classification Pattern.** Mỗi tool call đi qua một classifier xác định risk level trước khi thực thi:
+<div style={{display: 'flex', justifyContent: 'center', margin: '1.5rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/09-progressive-tool.png"
+    alt="Diagram Progressive Tool Expansion Pattern — small default tool set (<20), MCP và custom tools activate on demand"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
 
-```text
-              ┌───────────────────────┐
-tool call ──> │ Parse + Classify      │
-              └───────────┬───────────┘
-                          │
-            ┌─────────────┴─────────────┐
-            v             v             v
-          DENY          ASK           ALLOW
-          (block)    (ask human)    (execute)
-```
+**10. Command Risk Classification Pattern.** Mỗi tool call đi qua một classifier xác định risk level trước khi thực thi. Low-risk được auto-approve; high-risk chờ user approve. Rule `deny > ask > allow` — deny luôn thắng.
 
-Low-risk được auto-approve; high-risk chờ user approve. Deny luôn thắng.
+<div style={{display: 'flex', justifyContent: 'center', margin: '1.5rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/10-risk-classification.png"
+    alt="Diagram Command Risk Classification Pattern — mỗi tool call đi qua classifier trước khi execute, deny/ask/allow theo risk level"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
 
 **11. Single-Purpose Tool Design Pattern.** Thay vì một general shell, mỗi tool có mục đích riêng: `FileReadTool`, `FileEditTool`, `GrepTool`, `GlobTool`. Input có typing, scope bị giới hạn, permission riêng. General shell vẫn còn đó như fallback.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '1.5rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/11-single-purpose.png"
+    alt="Diagram Single-Purpose Tool Design Pattern — purpose-built tools thay cho general shell, mỗi tool có typed input và scoped permission"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
 
 ### Nhóm D — Automation (1 pattern)
 
 **12. Deterministic Lifecycle Hooks Pattern.** Harness expose các hook chạy deterministic ở các điểm vòng đời: `PreToolUse`, `PostToolUse`, `SessionStart`, `CwdChanged`... (Claude Code có 25+ hook point). Hook cho phép *đảm bảo* hành vi invariant mà không cần phụ thuộc vào trí nhớ của model — ví dụ: auto-format sau khi edit, auto-commit sau mỗi task.
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '1.5rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/patterns/12-deterministic-hooks.png"
+    alt="Diagram Deterministic Lifecycle Hooks Pattern — hooks chạy deterministic tại PreToolUse/PostToolUse/SessionStart và các lifecycle point"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
 
 ### Rút ra điều gì?
 
