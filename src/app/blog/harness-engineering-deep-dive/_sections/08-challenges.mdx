@@ -1,0 +1,75 @@
+## Những thách thức khó nuốt của harness engineering
+
+Harness không phải là một công thức sẵn. Có vài lớp vấn đề xuất hiện lặp lại ở mọi team xây harness — đây là checklist cần đối mặt.
+
+### 1. Context rot — kẻ thù thầm lặng
+
+Vấn đề số một của bất kỳ long-running agent nào. Khi context window phình ra, không phải "bao nhiêu token thì hết" mới là vấn đề — mà là *chất lượng suy luận đã giảm trước khi đạt giới hạn*. Không phải một lời phỏng đoán — đây là kết quả đo được trên **18 LLM hàng đầu** bởi report "Context Rot" (Hong et al., Chroma Research, 07/2025):
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/context-rot-chroma.png"
+    alt="Biểu đồ hiệu năng Claude Sonnet 4, GPT-4.1, Qwen3-32B và Gemini 2.5 Flash trên Repeated Words Task — accuracy suy giảm theo input length trên mọi model"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+*Ảnh: Accuracy của Claude Sonnet 4, GPT-4.1, Qwen3-32B, Gemini 2.5 Flash giảm dần khi input length tăng — ngay cả khi chưa chạm giới hạn context window. Nguồn: [Context Rot: How Increasing Input Tokens Impacts LLM Performance — Hong, Troynikov, Huber (Chroma Research, 14/07/2025)](https://www.trychroma.com/research/context-rot).*
+
+Điểm đáng chú ý nhất từ report: một model có 200K context window có thể bắt đầu xuống chất lượng **đáng kể ở ~50K token** — tức là 1/4 capacity. Ba cơ chế gây context rot:
+
+1. **Lost-in-the-middle** — model attention tốt ở đầu và cuối context, kém ở giữa. Drop accuracy >30% cho thông tin nằm giữa.
+2. **Attention dilution** — transformer attention quadratic, càng nhiều token càng loãng.
+3. **Distractor interference** — nội dung "liên quan về mặt semantic nhưng không đúng" chủ động *làm lạc* model.
+
+**Triệu chứng**: agent bắt đầu lặp lại việc cũ, quên instruction, hallucinate file path. **Biện pháp**: compaction sớm (không chờ đến 95%), sub-agent isolation, file-based memory.
+
+### 2. Over-ambition (one-shotting)
+
+Agent nhận yêu cầu lớn và cố làm *một nhát*, không chia nhỏ. Kết quả: code dở dang, context cạn giữa đường, và khi restart session thì không biết làm tiếp từ đâu.
+
+**Biện pháp Anthropic áp dụng**: Initializer Agent tạo cấu trúc ban đầu (feature list 200 mục, progress file, git repo) ngay từ session đầu. Mỗi session sau đó chỉ được phép hoàn thành một slice nhỏ — agent bị *cấu trúc* ép phải làm incremental, không phải *thuyết phục* bằng prompt.
+
+### 3. Premature completion — "đã làm xong rồi mà"
+
+Khi session thứ 2 khởi động, agent đọc progress file, thấy "nhiều thứ đã xong" và tự kết luận "project done". Trong khi thực tế, half-finished features vẫn còn bug, test chưa chạy, v.v.
+
+**Biện pháp**: Ép agent chạy end-to-end test *trước* khi tiếp tục — Evaluator Agent + Playwright. Nếu test fail, session đó bắt đầu bằng việc fix, không phải đóng project.
+
+### 4. Environmental degradation
+
+Agent để lại môi trường trong trạng thái lộn xộn: bug chưa fix, file không commit, format bị vỡ. Session sau kế thừa rác này và càng lún sâu hơn.
+
+**Biện pháp**: **Deterministic hook** sau mỗi tool call — auto-format, lint check, auto-commit với message descriptive. Không để "sạch sẽ" là thứ model phải nhớ thực hiện.
+
+### 5. Testing gap
+
+Agent thường bỏ qua end-to-end test vì "thấy code logic đúng". Nhưng logic đúng không có nghĩa là user flow đúng.
+
+**Biện pháp**: **Visual verification** là ranh giới cuối cùng — chụp screenshot bằng Puppeteer/Playwright, compare, và cho LLM-as-judge chấm điểm giao diện. Đây là lớp kiểm tra mà static analysis không bao giờ bắt được.
+
+### 6. Lost context qua session
+
+Mỗi session mới của agent là tabula rasa — không có ký ức gì từ session trước. Nếu không thiết kế bên ngoài, agent sẽ lặp lại những quyết định sai lầm vài lần.
+
+**Biện pháp**: **External memory** (git history + progress notes + feature list) phải là nguồn sự thật. Khi session mới bắt đầu, bước đầu tiên *bắt buộc* là "đọc progress file và git log" — không phải "bắt đầu code".
+
+### 7. Permission & risk — vấn đề cũng khó như code
+
+Khi agent có quyền chạy `bash`, `rm`, `kubectl`, `gh pr`, rủi ro thực tế không còn nằm ở chất lượng code nữa — mà ở **hành vi không thể rollback**. Một PR đã push, một file đã xoá, một DB migration đã chạy — không có "undo".
+
+**Biện pháp**:
+- Classifier risk cho từng command (regex + heuristic).
+- Rule `deny > ask > allow`.
+- Sandboxed environment — chạy trong container/VM, không chạm vào host.
+- Human-in-the-loop cho mọi action thay đổi state shared.
+
+### 8. Model drift
+
+Khi model được update, hành vi nhỏ có thể đổi — một prompt trước kia chạy tốt bây giờ hỏng. Nếu harness test không đầy đủ, bạn chỉ phát hiện khi user báo bug.
+
+**Biện pháp**: Dựng **regression test suite** cho chính harness — mỗi pattern có test case, chạy mỗi khi upgrade model. Anthropic public rằng họ *thiết kế lại* harness sau mỗi major model release.
+
+### Tổng kết phần thách thức
+
+Tám vấn đề trên đều có một điểm chung: **chúng không phải lỗi của model**, mà là lỗi của lớp xung quanh model. Càng đầu tư vào harness, tỉ lệ gặp các vấn đề này càng giảm. Đây chính là lý do người ta nói *"the harness makes or breaks an AI product"*.

@@ -1,0 +1,111 @@
+## Tương lai — Harness sẽ đi về đâu?
+
+Harness engineering còn rất trẻ. Dưới đây là những hướng đang định hình, và một số câu hỏi mở chưa có câu trả lời rõ.
+
+### Hướng 1 — Harness quality là moat mới
+
+Năm 2025 là năm của agent. Năm 2026 đang được gọi là **năm của harness**. Ngày càng nhiều sản phẩm chia sẻ cùng model nền (Claude, GPT-4.x, Gemini) nhưng cách xa nhau về chất lượng. Khoảng cách đó đến từ hàng nghìn giờ engineering đổ vào harness — không phải fine-tuning, không phải prompt. Các công ty đang hình thành đội ngũ chuyên trách "harness engineer".
+
+### Hướng 2 — Observability-driven harness
+
+Datadog và nhiều team vận hành agent đang đẩy hướng "harness-first observability" — coi mỗi lần chạy agent như một **distributed trace** với spans cho từng tool call, từng sub-agent, từng verification. Khi agent fail, debug không còn là đọc log mà là *xem replay có timeline*.
+
+```text
+Trace: "Fix bug #4521"
+│── session.start                           0ms
+│── tool: Grep("error handling")          120ms
+│── tool: Read("src/handler.ts")          180ms
+│── llm.call (gather)                     2.4s
+│── tool: Edit(handler.ts, patch)         3.1s
+│── tool: Bash("npm test")                8.5s  <- FAIL
+│── llm.call (recover)                    9.2s
+│── tool: Edit(handler.ts, patch2)       10.1s
+│── tool: Bash("npm test")               15.3s  <- PASS
+│── session.end                          16.0s
+```
+
+### Hướng 3 — Adaptive harness
+
+Harness tĩnh (cứng) đang bắt đầu tích hợp ML của chính nó:
+
+- Học được tool nào thường bị gọi sai → ẩn bớt hoặc viết lại description.
+- Học được pattern context nào dẫn đến context rot nhanh → nén sớm hơn.
+- Học được session nào dễ fail → routing sang model mạnh hơn.
+
+Đây là bước đi gần với self-improvement — nhưng ở *lớp harness*, không phải ở lớp model.
+
+### Hướng 4 — Multi-agent protocols chuẩn hoá
+
+Hiện tại mỗi harness tự thiết kế cách sub-agent giao tiếp. Một chuẩn mở (kiểu MCP — Model Context Protocol) cho **inter-agent communication** có khả năng xuất hiện, cho phép agent từ các vendor khác nhau cộng tác trên cùng một task.
+
+### Hướng 5 — Harness² (harness bọc harness)
+
+Một pattern mới đang nổi: thay vì xây harness từ đầu, developer stack **harness mới lên trên một harness đã có**. Ví dụ rõ nhất là **ClaudeKit** — một lớp harness build trên Claude Code (vốn đã là harness):
+
+```text
+┌───────────────────────────────────────────┐
+│           Your app / workflow             │
+├───────────────────────────────────────────┤
+│             ClaudeKit                     │  <- harness layer #2
+│  (structured workflows, quality gates,    │
+│   multi-agent coordination, state)        │
+├───────────────────────────────────────────┤
+│             Claude Code                   │  <- harness layer #1
+│  (tools, hooks, permissions, compaction)  │
+├───────────────────────────────────────────┤
+│                Claude                     │  <- model
+└───────────────────────────────────────────┘
+```
+
+Ý tưởng: harness layer dưới đã giải quyết tốt các vấn đề runtime-level (tool, memory, hook). Layer trên tập trung vào **domain-specific workflow** — ví dụ enforced "TDD flow", hay pipeline release có review bắt buộc. Khái niệm "Harness²" này gợi ý rằng ngành đang tiến dần tới mô hình stack hoá — giống OS-on-OS (container trên VM) trong infra.
+
+### Hướng 6 — Taxonomy 7 lớp của hệ sinh thái harness
+
+Cộng đồng bắt đầu map hoá stack harness thành 7 layer (theo Awesome Agent Harness repository):
+
+```text
+┌───────────────────────────────────────────────────┐
+│ Layer 7 │ Coding Agents (Claude Code, Codex, ...) │  <- commodity
+├─────────┼─────────────────────────────────────────┤
+│ Layer 6 │ Harness Frameworks & Runtimes           │
+│         │  (Claude Agent SDK, persistent runtime) │
+├─────────┼─────────────────────────────────────────┤
+│ Layer 5 │ Agent Orchestrators                     │
+│         │  (Vibe Kanban, Emdash, worktree isol.)  │
+├─────────┼─────────────────────────────────────────┤
+│ Layer 4 │ Task Runners                            │
+│         │  (issue tracker -> agent -> PR)         │
+├─────────┼─────────────────────────────────────────┤
+│ Layer 3 │ Full Lifecycle Platforms                │
+├─────────┼─────────────────────────────────────────┤
+│ Layer 2 │ Planning / Spec Tools                   │
+│         │  (Chorus, task DAG, spec-first)         │
+├─────────┼─────────────────────────────────────────┤
+│ Layer 1 │ Human Oversight                         │  <- top
+└─────────┴─────────────────────────────────────────┘
+```
+
+Luận điểm trung tâm của taxonomy này khá bạo: **Layer 7 (coding agent) là commodity**. Khả năng viết code không còn là moat. Giá trị durable nằm ở các layer cao hơn — đặc biệt là Layer 2 (spec-first) và Layer 5 (orchestration). Tổ chức nào đầu tư sâu vào các layer này sẽ có lợi thế cạnh tranh bền hơn là tổ chức đầu tư vào model.
+
+### Năm pattern xuyên suốt mọi harness nghiêm túc
+
+Từ SWE-agent, Anthropic, OpenAI Codex, và các framework open source — **5 pattern lặp lại** gần như không đổi:
+
+1. **Progressive Disclosure** — entry point nhỏ trỏ đến doc sâu hơn, không dump hết một lần.
+2. **Git Worktree Isolation** — một agent một worktree, song song không conflict.
+3. **Spec First + Repo là System of Record** — cái gì không ở trong repo thì không tồn tại với agent.
+4. **Mechanical Architecture Enforcement** — linter + structural test thay vì code review của người.
+5. **Integrated Feedback Loops** — closed-loop càng chặt, agent càng đáng tin.
+
+Nếu harness của bạn thiếu pattern nào trong 5 cái trên, đó là chỗ đầu tiên cần đầu tư.
+
+### Những câu hỏi mở
+
+Một số câu hỏi vẫn chưa có câu trả lời chung:
+
+1. **Model càng mạnh thì harness càng mỏng — đến đâu thì dừng?** Nếu một ngày model đủ self-disciplined, liệu toàn bộ harness có thu nhỏ còn vài trăm dòng code?
+2. **Harness có nên là product riêng?** Hay luôn luôn gắn chặt với model nền? Claude Agent SDK đã đi hướng *harness độc lập có thể dùng với nhiều model*.
+3. **Verification loop chi phí ra sao?** Evaluator agent đôi khi tốn token ngang Generator. Làm sao để verify mà không double chi phí?
+4. **Khi nào human-in-the-loop là bắt buộc?** Không phải mọi decision agent đều nên auto-approve, nhưng hỏi quá nhiều thì mất giá trị automation.
+
+Câu trả lời cho các câu hỏi này sẽ định hình 2-3 năm tới của ngành. Những team trả lời đúng sớm sẽ có sản phẩm khác biệt rõ rệt.

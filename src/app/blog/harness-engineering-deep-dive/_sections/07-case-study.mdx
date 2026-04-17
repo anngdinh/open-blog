@@ -1,0 +1,129 @@
+## Case study #1 — Three-Agent Harness của Anthropic
+
+Tháng 3/2026, Anthropic công bố một harness thực chiến cho tác vụ dài nhất mà họ thử nghiệm công khai: **build full-stack application chạy nhiều giờ liên tục**. Kiến trúc này là ví dụ hiếm hoi về một harness được thiết kế ở "cấp độ sản xuất" được chia sẻ rõ ràng.
+
+### Ba agent, ba vai trò tách biệt
+
+```text
+┌───────────────┐        spec         ┌───────────────┐
+│               │ ──────────────────> │               │
+│   PLANNER     │                     │   GENERATOR   │
+│  (product     │ <────── clarify ─── │   (builder)   │
+│   spec)       │                     │               │
+└───────────────┘                     └───────┬───────┘
+                                              │
+                                              │ build + self-check
+                                              v
+                                      ┌───────────────┐
+                                      │   EVALUATOR   │
+                                      │  (Playwright  │
+                                      │   tester)     │
+                                      └───────┬───────┘
+                                              │
+                     feedback back to Generator
+                                              │
+                                              v
+                                      ┌───────────────┐
+                                      │  Iterate      │
+                                      │  until pass   │
+                                      └───────────────┘
+```
+
+- **Planner Agent**: biến yêu cầu ngắn gọn của user thành product spec đầy đủ — scope, high-level design, feature list. Không đi vào detail implementation.
+- **Generator Agent**: thực hiện code iteratively với stack React + Vite + FastAPI + SQLite/PostgreSQL. Self-evaluate công việc trước khi hand-off. Commit git đều đặn.
+- **Evaluator Agent**: test bằng Playwright MCP (trình duyệt thật) — chấm điểm theo các tiêu chí product depth, functionality, visual design, code quality.
+
+### Tại sao lại là Generator vs Evaluator?
+
+Kiến trúc này lấy cảm hứng từ **GAN (Generative Adversarial Network)** trong ML — hai mạng đối kháng giúp lẫn nhau cải thiện. Ở đây, việc tách Generator và Evaluator giải quyết một thiên kiến khét tiếng của LLM: **self-evaluation bias**. Một agent luôn có xu hướng tự đánh giá công việc của mình là "đã xong". Ép một agent *khác* đánh giá, với tiêu chí cụ thể đo đạc được, khiến việc claim "done" trở nên khó khăn hơn.
+
+### Sprint contract — đàm phán trước khi code
+
+Trước mỗi sprint, Generator và Evaluator **đàm phán tiêu chí thành công**:
+
+- Generator đề xuất: "Tôi sẽ build feature X theo flow A/B/C."
+- Evaluator đồng ý hoặc yêu cầu thêm test case.
+- Cả hai đồng thuận → Generator mới bắt đầu code.
+- Evaluator chạy test → pass/fail theo contract.
+
+Cơ chế này bắt buộc cả hai agent phải *chung một mô hình* về "đúng" nghĩa là gì — một bước phòng thủ lớn chống lại drift của long-running session.
+
+### Số liệu thực tế — một mình agent đấu với full harness
+
+Anthropic chia sẻ metrics rất thẳng thắn. Ví dụ **Video Game Maker**:
+
+| Phương pháp | Thời gian | Chi phí | Chất lượng |
+|---|---|---|---|
+| Solo agent (không harness) | 20 phút | ~$9 | Core gameplay bị broken |
+| Full three-agent harness | 6 giờ | ~$200 | Gameplay đầy đủ, có thể chơi |
+
+Và **DAW (Digital Audio Workstation) Example**:
+
+- Runtime tổng: 3 giờ 50 phút
+- Chi phí: $124.70
+- Kết quả: một browser-based music production tool hoạt động đầy đủ, có tích hợp AI agent
+
+Có thể rút ra: **harness đắt hơn 20 lần nhưng đổi lại là output thực sự dùng được**. Với solo agent, bạn tiết kiệm được tiền nhưng sản phẩm không chạy — tức là *chi phí thực tế là vô hạn*.
+
+### File-based communication thay cho message passing
+
+Thay vì truyền message trực tiếp qua queue, ba agent giao tiếp qua **file trong repo**:
+
+- `claude-progress.txt` — log hoạt động, sống sót qua context reset.
+- Feature list JSON với ~200 requirement có cấu trúc.
+- Git commit message — mô tả *why* của mỗi thay đổi.
+- Output của Playwright — screenshot + test report.
+
+Triết lý: nếu thông tin quan trọng không nằm trong filesystem, nó sẽ mất khi context bị reset. Filesystem là memory bền nhất một harness có thể dựa vào.
+
+### Evolution của harness cùng model
+
+Một chi tiết thú vị: bản harness đầu tiên có một cơ chế "sprint decomposition" khá phức tạp cho Claude Opus 4.5. Khi nâng cấp lên Opus 4.6, Anthropic **gỡ bỏ hẳn** cơ chế này — model mới đủ self-disciplined để không cần chia sprint nhỏ. Output không giảm chất lượng, nhưng codebase harness đơn giản hẳn.
+
+Bài học: mỗi thế hệ model phải review lại harness. Một số "scaffolding" thành vô dụng; một số yếu điểm mới xuất hiện cần thêm guardrail. **Harness không phải thứ xây một lần rồi thôi — nó là một sản phẩm sống, phải tiến hoá song song với model.**
+
+## Case study #2 — OpenAI Codex và 1 triệu dòng code không do người viết
+
+Tháng 02/2026, team Codex của OpenAI công bố một thí nghiệm gây sốc: từ tháng 08/2025, họ khởi tạo một repository với một ràng buộc duy nhất — **không dòng code nào được người viết**. Mọi thứ, từ application logic, test, CI config, documentation, tới internal dev tools — do Codex agents viết. Con người chỉ steering.
+
+**Kết quả sau 5 tháng:**
+
+- **~1.000.000 dòng code** trong repo.
+- **~1.500 pull request** merged.
+- Team 3 engineer ban đầu đạt **3.5 PR/engineer/ngày**.
+- Khi mở rộng lên 7 engineer, throughput *per-engineer không giảm mà tăng*.
+- Sản phẩm có hàng trăm daily internal user + external alpha tester.
+
+Đây không phải demo — đây là sản phẩm nội bộ thật, đang chạy production. Thông điệp đúc kết: **bottleneck không bao giờ là capability của model, luôn luôn là environment design**.
+
+### Bài học quan trọng nhất — "one big AGENTS.md" đã fail
+
+Lúc đầu, team thử đưa toàn bộ convention, architecture, rule của project vào một file `AGENTS.md` duy nhất. Fail theo 4 cách:
+
+1. **Context là tài nguyên khan hiếm** — file quá lớn nuốt hết space, agent miss constraint chính.
+2. **Hướng dẫn quá nhiều = không hướng dẫn** — khi mọi thứ đều "important", không gì là important.
+3. **Stale nhanh** — monolithic doc trở thành nghĩa địa rule lỗi thời khi codebase evolve.
+4. **Không verify được** — không có cách nào đo coverage, freshness, cross-link của một blob khổng lồ.
+
+**Giải pháp**: structured `docs/` directory làm "system of record" + một `AGENTS.md` **ngắn (~100 dòng)** chỉ đóng vai trò *bản đồ* trỏ tới doc sâu hơn. Pattern này được gọi là **progressive disclosure**: agent khởi đầu với entry point nhỏ, stable, được dạy cách tìm context sâu hơn khi cần.
+
+### Làm cho application "legible" với agent
+
+Khi throughput tăng, bottleneck chuyển từ *sinh code* sang *verify code*. Giải pháp của OpenAI là cho **chính agent** verify — bằng cách expose toàn bộ runtime infrastructure cho Codex:
+
+- Application **bootable per git worktree** — mỗi task có một instance isolated.
+- **Chrome DevTools Protocol** wired vào agent runtime — agent tự navigate DOM, chụp screenshot.
+- Full observability stack: **LogQL, PromQL, TraceQL** — agent query logs, metrics, traces như một engineer thật.
+- **Custom linter do Codex tự viết** — error message format đặc biệt cho agent, kèm luôn remediation steps.
+
+Nguyên tắc giống hệt SWE-agent: *chất lượng công việc của agent bị giới hạn bởi chất lượng feedback loop*.
+
+### Triết lý throughput mới
+
+Khi agent sinh PR nhanh gấp 10 lần capacity review của con người, **conventional merge gate trở nên phản tác dụng**. OpenAI chọn cách đi ngược truyền thống:
+
+- PR kept short-lived, minimal blocking gate.
+- Test flake xử lý bằng **follow-up run**, không block PR vô thời hạn.
+- Corrections are cheap, waiting is expensive — trade-off phải đảo ngược.
+
+*"Looks irresponsible in low-throughput environment, obvious in a high-throughput one."* — đây là một shift lớn trong engineering culture mà các team chuẩn bị áp dụng agent cần hiểu.

@@ -1,0 +1,97 @@
+## Giai đoạn 3 — Harness Engineering (2025-2026+)
+
+"Harness" là một từ mượn từ ngành cưỡi ngựa — bộ dây đai giúp con người điều khiển và khai thác sức mạnh của một con vật mạnh hơn chính mình. Trong bối cảnh LLM, nghĩa ẩn dụ cũng tương tự:
+
+> **Agent Harness**: Toàn bộ hạ tầng phần mềm bao quanh LLM, chịu trách nhiệm cho mọi thứ *ngoại trừ* việc sinh token. Nó bao gồm vòng lặp điều phối (orchestration loop), tool registry, memory và state persistence, context management, verification loop, error handling, guardrails, và cơ chế spawn sub-agent. Model *sinh ra câu trả lời*; harness *làm mọi thứ còn lại* để biến câu trả lời đó thành hành động có ý nghĩa trong thế giới thực.
+
+Một cách hình dung khác, do architect Avi Chawla phát biểu: *"Harness is the operating system for the model."* Cùng một "CPU" (Claude, GPT, Gemini), nhưng "OS" khác nhau sẽ cho ra trải nghiệm hoàn toàn khác nhau.
+
+Còn theo Mitchell Hashimoto (đồng sáng lập HashiCorp, nay đang làm agent infra), định nghĩa vận hành của harness rất actionable:
+
+> *"When the agent makes a mistake, you build a solution so it never makes that mistake again."*
+
+Nói cách khác: harness là **hiện thân kỹ thuật của mọi bài học đau đớn** bạn rút ra trong quá trình cho agent chạy. Mỗi guardrail, mỗi tool được viết lại rõ hơn, mỗi permission rule — đều là một vết sẹo có tên.
+
+### Harness khác gì với agent framework?
+
+Nhiều người nhầm harness với LangChain/LlamaIndex/CrewAI. Thực tế chúng ở các lớp trừu tượng khác nhau:
+
+```text
+┌───────────────────┬──────────────────────────┬─────────────────────────┐
+│                   │ Agent Framework          │ Agent Harness           │
+├───────────────────┼──────────────────────────┼─────────────────────────┤
+│ What it is        │ A library of building    │ A complete, opinionated │
+│                   │ blocks                   │ runtime system          │
+├───────────────────┼──────────────────────────┼─────────────────────────┤
+│ You get           │ Abstractions to wire up  │ A working loop out of   │
+│                   │ your own loop            │ the box                 │
+├───────────────────┼──────────────────────────┼─────────────────────────┤
+│ Example           │ LangChain, LlamaIndex    │ Claude Code, Cursor,    │
+│                   │                          │ Aider, Devin            │
+├───────────────────┼──────────────────────────┼─────────────────────────┤
+│ Analogy           │ Lego bricks              │ Fully assembled robot   │
+└───────────────────┴──────────────────────────┴─────────────────────────┘
+```
+
+Framework cho bạn *viên gạch*. Harness là *toà nhà đã xây xong*, với hệ thống điện nước và thang máy đã chạy ổn định.
+
+### Tại sao harness trở thành "moat" mới
+
+Với các sản phẩm AI coding hiện nay, lợi thế cạnh tranh hầu như không còn ở model nữa — Claude, GPT, Gemini đều ở đẳng cấp tương đương. Khoảng cách chất lượng giữa các sản phẩm lại ngày càng rõ. Lý do nằm ở chất lượng harness:
+
+- Harness quyết định **agent "thấy" gì mỗi turn** — context nào được inject, tool nào được expose.
+- Harness quyết định **điều gì xảy ra khi model gọi sai tool** — retry, escalate, hay abort.
+- Harness quyết định **khi nào gọi human** — permission model, risk classification.
+- Harness quyết định **agent có memory qua session hay không** — và memory đó có còn chính xác sau vài ngày.
+
+Anthropic công khai rằng nội bộ họ mất hàng ngàn engineering hour để xây harness cho Claude Code. Đây không còn là "prompt kỹ thuật" nữa — đây là một sản phẩm phần mềm phức tạp.
+
+### Bằng chứng sống: vụ leak source code Claude Code (31/03/2026)
+
+Nếu cần một bằng chứng trực quan cho luận điểm "moat nằm ở harness", vụ leak Claude Code là câu trả lời. Ngày 31/03/2026, khoảng **512.000 dòng TypeScript** của Claude Code bị công khai trên internet.
+
+Điểm đặc biệt: **thứ bị leak không phải model weights** (vì model nằm trên server Anthropic). Thứ bị leak là **toàn bộ harness** — tool definition, permission logic, compaction algorithm, hook system, prompt orchestration. Nói cách khác, đối thủ có trong tay *toàn bộ công thức* trừ model. Nhưng không ai clone được Claude Code chỉ từ đống code đó — vì harness chỉ hoạt động tốt khi *khớp* với hành vi cụ thể của model, mà hành vi đó lại phụ thuộc vào hàng ngàn tinh chỉnh nhỏ mà người khác không biết.
+
+Thông điệp rút ra: **harness là tài sản kỹ thuật phức tạp ngang một hệ điều hành**, và việc copy không đảm bảo tái hiện được chất lượng.
+
+### Context engineering là con của harness, hay chị em của harness?
+
+Có một cuộc tranh luận nhỏ trong cộng đồng: context engineering và harness engineering là hai mức khác nhau (quan điểm của HumanLayer), hay context engineering chỉ là **một phần con của harness engineering** (quan điểm của nhiều engineer khác)?
+
+Trong bài này tôi khung theo hướng "ba thế hệ kế tiếp", nhưng cũng nên thừa nhận: **về mặt technical, context engineering đúng là một sub-discipline của harness engineering**. Một harness đầy đủ sẽ bao gồm context management như một trong 11 thành phần (xem phần giải phẫu bên dưới). Cách kể "ba thế hệ" phản ánh *lịch sử phát triển của tư duy*, còn "harness bao trùm context" phản ánh *cấu trúc kỹ thuật hiện tại*. Cả hai đều đúng ở góc độ của nó.
+
+### Ranh giới giữa model và harness
+
+Một câu hỏi thú vị: khi model càng ngày càng giỏi, harness có teo lại không? Anthropic cho biết với Claude Opus 4.6, họ đã **xoá bỏ sprint decomposition** vốn rất phức tạp ở các harness cho model cũ. Model mới đủ "self-disciplined" để không cần chia sprint nhỏ.
+
+Bài học: harness không phải là một thiết kế đứng yên. Nó phải **tiến hoá ngược lại** khi model thay đổi — gỡ bỏ những "cọc đỡ" không còn cần, giữ lại những thành phần vẫn bổ sung cho điểm yếu còn lại của model. Harness engineering là một nghề phải học lại mỗi lần có model mới ra.
+
+### Bằng chứng học thuật — SWE-agent và khái niệm ACI
+
+Một trong những nghiên cứu thuyết phục nhất về tầm quan trọng của harness là paper **SWE-agent** của Princeton NLP (NeurIPS 2024). Tác giả đặt ra câu hỏi đơn giản: nếu giữ nguyên model và chỉ thay đổi *giao diện* mà model dùng để tương tác với codebase, performance thay đổi thế nào?
+
+> **ACI (Agent-Computer Interface)**: Thuật ngữ do SWE-agent đặt ra cho tập hợp các tool/view/command mà một LLM agent dùng để "nhìn" và "thao tác" với máy tính. ACI giống "human-computer interface" trong HCI, nhưng được tối ưu cho *cách LLM suy nghĩ*, không phải cho mắt người.
+
+Kết quả cụ thể: cùng GPT-4, cùng benchmark SWE-bench, cùng compute budget. **Standard bash shell đạt 3.97% issue resolved. Purpose-built ACI đạt 12.47%** — tức **+64% relative improvement** chỉ từ redesign interface, không đổi model. Ablation studies chỉ ra **linter integration và capped search là hai thành phần đòn bẩy cao nhất**. Bốn thay đổi cụ thể:
+
+```text
+┌────────────────────┬───────────────────────────────────────────────┐
+│ ACI change         │ Why it helps                                  │
+├────────────────────┼───────────────────────────────────────────────┤
+│ Search with cap    │ Limit to 50 results. Agent can't drown in     │
+│  (max 50 items)    │ thousands of grep matches anymore.            │
+├────────────────────┼───────────────────────────────────────────────┤
+│ File viewer with   │ Show 100 lines with line numbers. Agent       │
+│  line numbers      │ references edits by line, less hallucination. │
+├────────────────────┼───────────────────────────────────────────────┤
+│ Editor + linter    │ Reject the edit at write-time if syntax       │
+│  gate              │ breaks. Agent fixes immediately, not later.   │
+├────────────────────┼───────────────────────────────────────────────┤
+│ Context compaction │ Summarize old tool outputs, keep recent       │
+│                    │ ones. Reasoning stays sharp in long sessions. │
+└────────────────────┴───────────────────────────────────────────────┘
+```
+
+Đây là bằng chứng **định lượng** cho luận điểm chính của bài viết: *harness quyết định hơn model*. Cùng một model base, chỉ cần thiết kế giao diện sao cho khớp với "cách LLM suy nghĩ" — limit kết quả search, expose line number, reject sớm khi syntax sai — performance nhảy vọt. Không có tinh chỉnh model, không có fine-tune, không có prompt engineering nào trong list trên.
+
+Nhiều thiết kế trong Claude Code sau này (single-purpose tool, progressive tool expansion) có thể xem là **hiện thực hoá bài học SWE-agent ở quy mô lớn**.

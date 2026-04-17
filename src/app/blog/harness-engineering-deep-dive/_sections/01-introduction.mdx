@@ -1,0 +1,29 @@
+## Mở đầu — Ba thế hệ kỹ thuật làm việc với LLM
+
+> *"Model là thứ suy nghĩ. Harness là thứ mà nó suy nghĩ VỀ."*  
+> — Rohit Verma
+
+Cùng một model, cùng một API, nhưng tại sao một sản phẩm có thể viết code hàng giờ không ngừng nghỉ, trong khi sản phẩm khác lại "loạn trí" sau 10 phút? Câu trả lời không nằm ở trọng số của model — nó nằm ở lớp hạ tầng bao quanh model.
+
+Trong ba năm qua, kỹ thuật làm việc với LLM đã đi qua ba thế hệ rõ rệt. Mỗi thế hệ giải quyết một vấn đề mà thế hệ trước không đủ sức xử lý:
+
+```text
+┌──────────────────────────┬──────────────────────────┬──────────────────────────┐
+│   PROMPT ENGINEERING     │   CONTEXT ENGINEERING    │   HARNESS ENGINEERING    │
+│        2020 - 2023       │        2024 - 2025       │        2025 - 2026+      │
+├──────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ "How do I phrase this?"  │ "What info does the      │ "What system surrounds   │
+│                          │  model need right now?"  │  the model at runtime?"  │
+├──────────────────────────┼──────────────────────────┼──────────────────────────┤
+│ Single-turn, static text │ Multi-turn, dynamic      │ Long-running, autonomous │
+│ Few-shot, CoT, ReAct     │ Memory, compaction, RAG  │ Tools, loops, guardrails │
+└──────────────────────────┴──────────────────────────┴──────────────────────────┘
+```
+
+Bài viết này là một deep dive kỹ thuật về cả ba thế hệ — nhưng trọng tâm là **harness engineering**, khái niệm đang được Anthropic, OpenAI và các team AI hàng đầu xem là "moat" mới của ngành. Chúng ta sẽ đi qua:
+
+- **Phần 1 — Hành trình**: Tại sao prompt engineering không đủ, tại sao context engineering lại sinh ra, và tại sao harness engineering là bước tiếp theo tất yếu.
+- **Phần 2 — Giải phẫu**: 11 thành phần bắt buộc của một agent harness, cùng các pattern thực chiến rút ra từ Claude Code.
+- **Phần 3 — Thực tế**: Case study về three-agent harness của Anthropic cho việc build full-stack app chạy hàng giờ, những thất bại phổ biến, và câu hỏi mở cho tương lai.
+
+Nếu bạn đang xây agent, viết plugin cho Claude Code, hoặc chỉ đơn giản muốn hiểu tại sao các AI coding tool ngày càng khác nhau về chất lượng dù dùng cùng model nền, bài viết này dành cho bạn.

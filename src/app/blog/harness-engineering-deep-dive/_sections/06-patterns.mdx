@@ -1,0 +1,77 @@
+## 12 Harness Patterns thực chiến từ Claude Code
+
+Lý thuyết giải phẫu đã đủ — bây giờ xem các pattern thực tế. Bài phân tích "12 Agentic Harness Patterns from Claude Code" tổng hợp các thiết kế được rút ngược từ (reverse-engineer) Claude Code. Chúng chia thành 4 nhóm.
+
+### Nhóm A — Memory & Context (5 pattern)
+
+**1. Persistent Instruction File Pattern.** Một file như `CLAUDE.md` được auto-load ở đầu session, chứa convention, build command, coding standard của dự án. File đi kèm repo, không phải copy-paste mỗi lần.
+
+**2. Scoped Context Assembly Pattern.** Instruction không chỉ nằm ở một chỗ — harness load theo hierarchy: organization → user → project → directory. Hỗ trợ `@import` để tránh duplicate. Agent "thấy" rule khác nhau tuỳ vị trí trong codebase.
+
+**3. Tiered Memory Pattern.** Tổ chức memory theo 3 tầng:
+
+```text
+┌───────────────────────────────────────────┐
+│ Layer 1: Compact Index   (~200 lines)     │  <- Always in context
+├───────────────────────────────────────────┤
+│ Layer 2: Topic files     (per-task)       │  <- Load on demand
+├───────────────────────────────────────────┤
+│ Layer 3: Full transcripts (on disk)       │  <- Search only
+└───────────────────────────────────────────┘
+```
+
+**4. Dream Consolidation Pattern.** Một background process chạy trong thời gian idle để dedupe, prune và reorganize memory — "ngủ mơ" giống như con người củng cố trí nhớ. Claude Code có mode `autoDream` với 8 phase khác nhau.
+
+**5. Progressive Context Compaction Pattern.** Nén theo tuổi đời: turn gần đây giữ nguyên, turn cũ nén nhẹ, turn rất cũ nén mạnh. Bốn layer: `HISTORY_SNIP`, `Microcompact`, `CONTEXT_COLLAPSE`, `Autocompact`.
+
+### Nhóm B — Workflow & Orchestration (3 pattern)
+
+**6. Explore-Plan-Act Loop Pattern.** Tách công việc thành 3 giai đoạn với permission leo thang:
+
+```text
+┌────────────┐  read-only  ┌────────────┐  discuss  ┌────────────┐  full tools
+│  EXPLORE   │ ──────────> │    PLAN    │ ────────> │    ACT     │
+│  (search,  │             │ (propose,  │           │ (edit,     │
+│   read)    │             │  review)   │           │  run, test)│
+└────────────┘             └────────────┘           └────────────┘
+```
+
+Tránh việc agent "edit trước khi hiểu" — một lỗi rất phổ biến.
+
+**7. Context-Isolated Subagents Pattern.** Sub-agent có context window, system prompt và toolset *riêng*. Research agent không thể edit; planning agent không thể execute. Mỗi agent chỉ thấy thông tin liên quan.
+
+**8. Fork-Join Parallelism Pattern.** Spawn nhiều sub-agent song song trong các git worktree độc lập — mỗi agent làm việc trên copy repo riêng. Cached context share giữa các fork giúp tiết kiệm token. Kết quả merge lại ở cuối.
+
+### Nhóm C — Tools & Permissions (3 pattern)
+
+**9. Progressive Tool Expansion Pattern.** Khởi động với default nhỏ (&lt; 20 tool): `Read, Edit, Write, Bash, Grep, Glob`. Tool MCP và tool custom chỉ kích hoạt khi cần. Ít tool = ít phân tâm = model ra quyết định chính xác hơn.
+
+**10. Command Risk Classification Pattern.** Mỗi tool call đi qua một classifier xác định risk level trước khi thực thi:
+
+```text
+              ┌───────────────────────┐
+tool call ──> │ Parse + Classify      │
+              └───────────┬───────────┘
+                          │
+            ┌─────────────┴─────────────┐
+            v             v             v
+          DENY          ASK           ALLOW
+          (block)    (ask human)    (execute)
+```
+
+Low-risk được auto-approve; high-risk chờ user approve. Deny luôn thắng.
+
+**11. Single-Purpose Tool Design Pattern.** Thay vì một general shell, mỗi tool có mục đích riêng: `FileReadTool`, `FileEditTool`, `GrepTool`, `GlobTool`. Input có typing, scope bị giới hạn, permission riêng. General shell vẫn còn đó như fallback.
+
+### Nhóm D — Automation (1 pattern)
+
+**12. Deterministic Lifecycle Hooks Pattern.** Harness expose các hook chạy deterministic ở các điểm vòng đời: `PreToolUse`, `PostToolUse`, `SessionStart`, `CwdChanged`... (Claude Code có 25+ hook point). Hook cho phép *đảm bảo* hành vi invariant mà không cần phụ thuộc vào trí nhớ của model — ví dụ: auto-format sau khi edit, auto-commit sau mỗi task.
+
+### Rút ra điều gì?
+
+Bốn observation chính từ danh sách này:
+
+1. **Memory là đa tầng, không phải một cục đồng nhất**. Mỗi tầng có chính sách load/unload riêng.
+2. **Quyền của agent phải được giới hạn theo ngữ cảnh**. Không phải mọi lúc mọi nơi agent cần mọi tool.
+3. **Deterministic hooks là bạn, không phải model**. Thứ gì phải *đúng 100% lần* thì đưa ra khỏi quyết định của LLM.
+4. **Isolation giữa sub-agent là tính năng, không phải overhead**. Context sạch của một agent mới spawn thường cho output tốt hơn một agent context đã "rotten".

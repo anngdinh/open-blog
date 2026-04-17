@@ -1,0 +1,55 @@
+## Kết luận
+
+Ba thế hệ kỹ thuật với LLM kể một câu chuyện có hậu về **nơi mà giá trị dịch chuyển**:
+
+- **Prompt Engineering** (2020-2023): giá trị ở *câu chữ bạn gõ vào*.
+- **Context Engineering** (2024-2025): giá trị ở *những gì lấp đầy context window*.
+- **Harness Engineering** (2025-2026+): giá trị ở *toàn bộ hệ thống phần mềm bao quanh model*.
+
+Mỗi thế hệ không thay thế thế hệ trước — mà *bao hàm*. Harness tốt vẫn cần prompt tốt; context engineering giỏi vẫn cần vài kỹ thuật CoT cổ điển. Nhưng trọng tâm của kỹ sư AI ngày nay đã dịch hẳn về phía "xây dựng hạ tầng quanh model", chứ không còn ở "chọn từ nào" nữa.
+
+### Take-aways
+
+Nếu chỉ nhớ được ba điều từ bài viết này, hãy nhớ:
+
+1. **Context là tài nguyên, không phải không gian trống.** Thêm token *không* làm model thông minh hơn sau một ngưỡng — nó làm model rối hơn. Nhiệm vụ engineering là *tối thiểu hoá token, tối đa hoá signal*.
+
+2. **Model sinh ra câu trả lời; harness làm mọi thứ còn lại.** Tool execution, verification, memory, error recovery, permission control, sub-agent orchestration — đây là nơi 90% công sức engineering của một AI product đi về.
+
+3. **Harness phải tiến hoá cùng model.** Mỗi lần model nâng cấp, harness phải được review — có thành phần trở thành thừa, có lỗ hổng mới xuất hiện. Harness engineering là một nghề học lại liên tục.
+
+### Shift tư duy — những câu hỏi bạn nên đổi
+
+Harness engineering không chỉ là một kỹ thuật mới. Nó là một *mindset* mới. Khi agent fail, các câu hỏi bạn tự đặt ra nên thay đổi:
+
+| Thay vì hỏi... | Hãy hỏi... |
+|---|---|
+| *"Làm sao viết prompt tốt hơn?"* | *"Thông tin gì agent cần mà hiện tại chưa truy cập được?"* |
+| *"Sao model mắc lỗi này?"* | *"Feedback loop nào thiếu để bắt lỗi này trước khi lan rộng?"* |
+| *"Sao agent không làm theo chỉ dẫn?"* | *"Constraint nào trong môi trường đang ngăn agent làm đúng?"* |
+
+Chuyển từ cột trái sang cột phải là bước tiến hoá quan trọng nhất một AI engineer có thể thực hiện. Đầu tư cho prompt là local và tạm thời; đầu tư cho harness là general và bền vững.
+
+### Minimal Harness — công thức khởi đầu
+
+Bạn không cần xây full observability stack kiểu OpenAI để hưởng lợi từ tư duy này. Minimal effective harness cho một coding agent chỉ cần 4 thành phần:
+
+1. **Persistent progress file** — agent đọc ở đầu session, viết ở cuối. Đây là cái ngăn "declare victory too early" và đảm bảo continuity qua context boundary.
+2. **Structured task list (JSON)** — không phải mô tả mơ hồ, mà là enumerated list với verifiable criteria và status. Mỗi item chỉ được đánh dấu `passes=true` sau khi verify end-to-end.
+3. **Git commit ở cuối mọi session** — với message descriptive. Commit không chỉ là checkpoint, nó là recovery mechanism.
+4. **Browser automation (nếu build web app)** — Puppeteer/Playwright MCP. Khoảng cách giữa "agent đọc code" và "agent dùng app" bằng khoảng cách giữa "dev đọc code" và "dev chạy app".
+
+Nếu đã có agent hoạt động nhưng underperforming, chạy một **environment audit**: với mỗi lần agent stuck, hỏi *"thông tin/feedback/constraint nào đang thiếu?"*. Mỗi câu trả lời là một hạng mục cải tiến cụ thể cho harness.
+
+### Đi tiếp từ đâu?
+
+Nếu bạn đang bắt đầu xây một agent:
+
+- **Đừng viết harness từ số 0**. Dùng Claude Agent SDK, OpenAI Agents SDK, LangGraph — chọn một, tập trung build giá trị trên lớp đó.
+- **Đầu tư sớm vào verification loop**. Test, lint, screenshot — càng sớm càng tốt. Agent không có verification = agent không dùng được.
+- **File-based memory trước message-passing memory**. File tồn tại qua mọi context reset.
+- **Đo, đo, và đo.** Trace từng tool call, từng session. Không có observability thì không debug được.
+
+Và trên hết: **đọc bài post gốc của Anthropic** về context engineering và harness design — hai bài đó gần như là "giáo trình chính thức" của ngành lúc này. Link ở phần References.
+
+Chúc bạn build được một harness khiến model của bạn *thực sự hữu dụng* trong thế giới thực.

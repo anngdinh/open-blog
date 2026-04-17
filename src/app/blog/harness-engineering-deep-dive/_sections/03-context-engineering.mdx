@@ -1,0 +1,83 @@
+## Giai đoạn 2 — Context Engineering (2024-2025)
+
+Khi Claude Sonnet 4.5 phát hành tháng 9/2025, Anthropic cùng lúc công bố bài post "Effective context engineering for AI agents" đánh dấu một chuyển dịch quan trọng về tư duy:
+
+> **Context Engineering**: Tập hợp các chiến lược nhằm **curate và duy trì** tập token tối ưu (information) trong context window tại mỗi lượt inference của LLM. Khác với prompt engineering vốn chỉ quan tâm những gì bạn *viết ra*, context engineering quan tâm mọi thứ cuối cùng *đổ vào* context: system prompt, tool definitions, message history, RAG output, memory files, trạng thái task.
+
+Câu tóm gọn nhất: **Prompt Engineering là những gì bạn làm bên trong context window. Context Engineering là cách bạn quyết định cái gì sẽ lấp đầy nó.**
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/prompt-vs-context.png"
+    alt="Sơ đồ so sánh prompt engineering và context engineering từ Anthropic — prompt engineering tập trung vào system prompt, còn context engineering bao trùm cả tools, message history, và external data"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+*Ảnh: So sánh phạm vi của prompt engineering (chỉ system prompt) và context engineering (bao trùm toàn bộ information state) — Nguồn: [Anthropic Engineering Blog](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents).*
+
+### Vấn đề gốc — Context Rot
+
+Context engineering không sinh ra vì thời thượng. Nó sinh ra vì một hiện tượng đo lường được trên mọi LLM hiện tại:
+
+> **Context Rot**: Khi số lượng token trong context window tăng lên, khả năng model gợi nhớ và suy luận chính xác trên tập token đó *giảm dần*. Nhồi càng nhiều thông tin vào context không làm model thông minh hơn — nó làm model *rối* hơn.
+
+Điều này có nghĩa là: context không phải là tài nguyên miễn phí. Mỗi token thêm vào đều là một khoản "thuế" lên chất lượng output. Mục tiêu của context engineering, theo lời Anthropic, là:
+
+> "Tìm tập **nhỏ nhất** các token **có tín hiệu cao** (high-signal tokens) nhằm tối đa hoá xác suất đạt được outcome mong muốn."
+
+Đây là bài toán tối ưu hoàn toàn khác với prompt engineering — nơi người ta thường *thêm* detail để giúp model.
+
+### Hiệu chỉnh "độ cao" cho system prompt
+
+Một đóng góp trực quan của bài blog Anthropic là khái niệm **altitude** của system prompt:
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/system-prompt-altitude.png"
+    alt="Sơ đồ system prompt altitude từ Anthropic — quá chung chung dẫn đến model đoán mò, quá chi tiết lại khiến brittle và khó bảo trì, điểm tối ưu nằm ở giữa"
+    style={{maxWidth: '720px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+*Ảnh: Phổ "altitude" của system prompt — quá thấp (quá cụ thể, brittle) hay quá cao (quá mơ hồ) đều phản tác dụng — Nguồn: [Anthropic](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents).*
+
+- Prompt quá **chi tiết, rule-based cứng nhắc**: hoạt động tốt trong các case đã nghĩ đến, nhưng sụp đổ khi gặp case mới; đồng thời khó bảo trì.
+- Prompt quá **chung chung**: model không có định hướng, phải đoán mò, kết quả không nhất quán.
+- Điểm tối ưu: **đủ cụ thể để định hướng, đủ linh hoạt để model tự suy luận heuristic**. Tổ chức thành các section rõ ràng (background, instructions, tool guidance, output description) bằng XML tag hoặc Markdown heading.
+
+### Ba chiến lược cốt lõi cho long-horizon
+
+Khi agent chạy trong vòng lặp nhiều lượt (long-horizon), context sẽ phình ra không giới hạn: tool outputs, intermediate reasoning, file reads, history. Anthropic đề xuất ba chiến lược xử lý:
+
+```text
+┌───────────────────────┬────────────────────────────────────────────────┐
+│ Strategy              │ What it does                                   │
+├───────────────────────┼────────────────────────────────────────────────┤
+│ 1. Compaction         │ Summarize old history into a short digest.     │
+│                       │ Keep architectural decisions & open questions. │
+│                       │ Drop redundant tool outputs.                   │
+├───────────────────────┼────────────────────────────────────────────────┤
+│ 2. Structured Notes   │ Write state to a NOTES.md / progress.json      │
+│                       │ file OUTSIDE the context window.               │
+│                       │ Re-read when needed. Works across sessions.    │
+├───────────────────────┼────────────────────────────────────────────────┤
+│ 3. Sub-Agents         │ Spawn a worker with a CLEAN context for a      │
+│                       │ focused sub-task. Worker does heavy lifting,   │
+│                       │ returns a 1-2k token summary to the main loop. │
+└───────────────────────┴────────────────────────────────────────────────┘
+```
+
+### Tool design cũng là context engineering
+
+Một insight quan trọng: tool definitions *là một phần của context*. Mỗi tool schema tốn token, mỗi parameter mơ hồ làm model khó chọn đúng tool. Hướng dẫn của Anthropic:
+
+- **Giảm overlap**: nếu hai tool làm việc gần giống nhau, gộp lại hoặc loại bỏ một.
+- **Tên và mô tả rõ ràng, không lưỡng nghĩa**.
+- **Nếu một người kinh nghiệm không thể chọn đúng tool chỉ nhìn vào schema, agent cũng sẽ không thể.**
+
+Đây là lý do Claude Code xuất phát với **ít hơn 20 tool mặc định** — phần còn lại được kích hoạt on-demand.
+
+### Context engineering chạm giới hạn của chính nó
+
+Context engineering giải quyết được rất nhiều vấn đề *bên trong một context window*. Nhưng khi task kéo dài hàng giờ, vượt qua nhiều session, tương tác với nhiều service bên ngoài, bản thân context engineering lại trở thành một *thành phần* trong một hệ thống lớn hơn. Hệ thống đó có tên: **harness**.

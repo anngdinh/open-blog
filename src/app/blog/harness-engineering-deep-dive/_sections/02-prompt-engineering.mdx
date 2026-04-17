@@ -1,0 +1,47 @@
+## Giai đoạn 1 — Prompt Engineering (2020-2023)
+
+Khi GPT-3 xuất hiện cuối năm 2020, hầu hết mọi người tương tác với model thông qua một ô text duy nhất. Chất lượng kết quả phụ thuộc gần như hoàn toàn vào cách bạn *phát biểu* yêu cầu. Từ đó sinh ra một ngành học mới: **prompt engineering**.
+
+> **Prompt Engineering**: Tập hợp các kỹ thuật viết và tổ chức câu lệnh (prompt) gửi tới LLM để tối ưu hoá đầu ra. Đây là một tác vụ rời rạc (discrete task) — bạn viết một chuỗi text, model trả về kết quả, và bạn lặp lại cho đến khi kết quả đạt yêu cầu.
+
+### Những cột mốc của prompt engineering
+
+Ba năm từ 2020 đến 2023 chứng kiến một loạt kỹ thuật phát minh liên tục, mỗi kỹ thuật giải quyết một lớp bài toán khó hơn:
+
+| Năm | Kỹ thuật | Ý tưởng cốt lõi |
+|---|---|---|
+| 2020 | **Zero-shot / Few-shot** (Brown et al., GPT-3 paper) | Đưa 0 hoặc vài ví dụ vào prompt để dạy model task mới mà không cần fine-tune |
+| 2022 | **Chain-of-Thought** (Wei et al., Google) | Yêu cầu model "think step by step" để mở khả năng suy luận nhiều bước |
+| 2022 | **Zero-shot CoT** (Kojima et al.) | Chỉ cần thêm một câu thần chú "Let's think step by step" là đủ |
+| 2022 | **ReAct** (Yao et al.) | Kết hợp reasoning với action (tool use) trong cùng một chuỗi prompt |
+| 2023 | **Tree-of-Thoughts** (Yao et al.) | Khám phá nhiều nhánh suy luận song song, có backtracking |
+| 2023 | **Self-Consistency, Reflexion, v.v.** | Sampling nhiều đáp án rồi vote, hoặc yêu cầu model tự phê bình lại |
+
+### Ví dụ kinh điển — Chain-of-Thought
+
+Đây là một ví dụ minh hoạ vì sao CoT lại là bước nhảy lớn:
+
+```text
+PROMPT (standard):
+Q: Roger has 5 tennis balls. He buys 2 more cans of 3 balls each.
+   How many tennis balls does he have now?
+A: 11
+
+PROMPT (chain-of-thought):
+Q: Roger has 5 tennis balls. He buys 2 more cans of 3 balls each.
+   How many tennis balls does he have now?
+A: Roger started with 5 balls. 2 cans of 3 tennis balls each is 6
+   tennis balls. 5 + 6 = 11. The answer is 11.
+```
+
+Trên các bài toán nhiều bước, CoT có thể tăng độ chính xác từ ~18% lên ~57% mà không cần đổi model — chỉ bằng cách bắt model "nói ra suy nghĩ" trước khi trả lời.
+
+### Những hạn chế lộ ra
+
+Prompt engineering rất mạnh trong bối cảnh **single-turn** — bạn hỏi một câu, model trả một lần. Nhưng khi thế giới bắt đầu xây các hệ thống chạy nhiều lượt, kết nối tool, truy xuất tài liệu, duy trì state qua session, nó bộc lộ điểm yếu căn bản:
+
+1. **Prompt là tĩnh, task thì động.** Một prompt hay cho task A không chắc hoạt động khi input biến đổi theo thời gian.
+2. **Prompt không giải được bài toán "model cần biết gì *ngay lúc này*".** Thông tin không nằm sẵn trong prompt — nó có thể ở database, file hệ thống, output của một tool khác, hay ở lượt trò chuyện trước.
+3. **Prompt không quản lý tài nguyên.** Khi task dài, context window sẽ đầy — và không có khái niệm "dọn dẹp" nào trong phạm vi prompt engineering.
+
+Nói cách khác: prompt engineering tối ưu một lần gửi đi. Nhưng các hệ thống sản xuất gọi model *hàng trăm, hàng nghìn lần* trong một vòng đời tác vụ. Kỹ thuật phải mở rộng sang cấp độ khác. Đó là lúc context engineering bước vào.

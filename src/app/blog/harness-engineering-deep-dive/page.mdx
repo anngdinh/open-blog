@@ -1,0 +1,83 @@
+---
+title: "Từ Prompt Engineering đến Harness Engineering: Hành trình xây dựng AI Agent hiện đại"
+description: "Deep dive về ba giai đoạn tiến hoá của kỹ thuật làm việc với LLM — prompt engineering, context engineering, và harness engineering. Phân tích giải phẫu một agent harness, các pattern thực chiến từ Claude Code, và lý do vì sao harness trở thành 'moat' mới của ngành AI."
+date: 2026-04-17
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+import Introduction from "./_sections/01-introduction.mdx";
+import PromptEngineering from "./_sections/02-prompt-engineering.mdx";
+import ContextEngineering from "./_sections/03-context-engineering.mdx";
+import HarnessEngineering from "./_sections/04-harness-engineering.mdx";
+import Anatomy from "./_sections/05-anatomy.mdx";
+import Patterns from "./_sections/06-patterns.mdx";
+import CaseStudy from "./_sections/07-case-study.mdx";
+import Challenges from "./_sections/08-challenges.mdx";
+import Future from "./_sections/09-future.mdx";
+import Conclusion from "./_sections/10-conclusion.mdx";
+
+export const metadata = generateBlogMetadata({
+  title: "Từ Prompt Engineering đến Harness Engineering: Hành trình xây dựng AI Agent hiện đại",
+  description: "Deep dive về ba giai đoạn tiến hoá của kỹ thuật làm việc với LLM — prompt engineering, context engineering, và harness engineering. Phân tích giải phẫu một agent harness, các pattern thực chiến từ Claude Code, và lý do vì sao harness trở thành 'moat' mới của ngành AI.",
+  date: "2026-04-17",
+  slug: "harness-engineering-deep-dive"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/harness-engineering-deep-dive/cover.jpg"
+    alt="Minh hoạ robot AI và mạng neural đại diện cho agent harness và hạ tầng vận hành LLM"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+<Introduction />
+<PromptEngineering />
+<ContextEngineering />
+<HarnessEngineering />
+<Anatomy />
+<Patterns />
+<CaseStudy />
+<Challenges />
+<Future />
+<Conclusion />
+
+## References
+
+- [Effective context engineering for AI agents — Anthropic](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+- [Effective harnesses for long-running agents — Anthropic](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
+- [Harness design for long-running application development — Anthropic](https://www.anthropic.com/engineering/harness-design-long-running-apps)
+- [How Claude Code works — Anthropic Docs](https://code.claude.com/docs/en/how-claude-code-works)
+- [12 Agentic Harness Patterns from Claude Code — Generative Programmer](https://generativeprogrammer.com/p/12-agentic-harness-patterns-from)
+- [The Anatomy of an Agent Harness — Daily Dose of DS](https://blog.dailydoseofds.com/p/the-anatomy-of-an-agent-harness)
+- [What is an agent harness — Parallel Web Systems](https://parallel.ai/articles/what-is-an-agent-harness)
+- [Context Engineering vs Prompt Engineering — Elasticsearch Labs](https://www.elastic.co/search-labs/blog/context-engineering-vs-prompt-engineering)
+- [Chain-of-Thought Prompting — Prompt Engineering Guide](https://www.promptingguide.ai/techniques/cot)
+- [Skill Issue: Harness Engineering for Coding Agents — HumanLayer](https://www.humanlayer.dev/blog/skill-issue-harness-engineering-for-coding-agents)
+- [Closing the verification loop — Datadog Blog](https://www.datadoghq.com/blog/ai/harness-first-agents/)
+- [Anthropic Designs Three-Agent Harness — InfoQ](https://www.infoq.com/news/2026/04/anthropic-three-agent-harness-ai/)
+- [SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering — Yang et al., NeurIPS 2024](https://arxiv.org/abs/2405.15793)
+- [Context Rot: How Increasing Input Tokens Impacts LLM Performance — Hong, Troynikov, Huber (Chroma Research, 07/2025)](https://www.trychroma.com/research/context-rot)
+- [Harness Engineering là gì? — goonnguyen (Substack)](https://goonnguyen.substack.com/p/harness-engineering-la-gi)
+- [The Harness Is Everything: What Cursor, Claude Code, and Perplexity Actually Built — Rohit Verma (@rohit4verse)](https://x.com/rohit4verse/status/2033945654377283643)
+- [Awesome Agent Harness — GitHub (AutoJunjie / ai-boost)](https://github.com/ai-boost/awesome-harness-engineering)
+
+### Ảnh sử dụng trong bài
+
+- Cover image: [Unsplash — Possessed Photography](https://unsplash.com/photos/U3sOwViXhkY)
+- Sơ đồ "Prompt vs Context Engineering" và "System Prompt Altitude": từ bài [Effective context engineering for AI agents — Anthropic](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+- Biểu đồ "Context Rot — accuracy vs input length": từ [Context Rot technical report — Chroma Research (07/2025)](https://www.trychroma.com/research/context-rot)

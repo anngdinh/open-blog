@@ -1,0 +1,123 @@
+## Giải phẫu một agent harness
+
+Một harness thực tế có bao nhiêu thành phần? Tổng hợp từ bài "The Anatomy of an Agent Harness" (LangChain / Daily Dose of DS) và tài liệu Claude SDK, có thể rút ra **11 thành phần cốt lõi**:
+
+```text
+┌───────────────────────────────────────────────────────────────┐
+│                      AGENT HARNESS                            │
+│                                                               │
+│   ┌───────────────────┐      ┌───────────────────┐            │
+│   │ Prompt            │ ───> │ Orchestration     │            │
+│   │ Construction      │      │ Loop              │            │
+│   └───────────────────┘      │  (Thought/Action/ │            │
+│                              │   Observation)    │            │
+│   ┌───────────────────┐      └─────────┬─────────┘            │
+│   │ Memory            │ <──┐           │                      │
+│   │  - short-term     │    │           v                      │
+│   │  - long-term      │    │  ┌───────────────────┐           │
+│   │  - file-based     │    │  │ LLM (model API)   │           │
+│   └───────────────────┘    │  └─────────┬─────────┘           │
+│                            │            │                     │
+│   ┌───────────────────┐    │            v                     │
+│   │ Context           │    │  ┌───────────────────┐           │
+│   │ Management        │    │  │ Output Parsing    │           │
+│   │  - compaction     │    │  │  (tool calls or   │           │
+│   │  - masking        │    │  │   final answer)   │           │
+│   │  - JIT retrieval  │    │  └─────────┬─────────┘           │
+│   └───────────────────┘    │            │                     │
+│                            │            v                     │
+│   ┌───────────────────┐    │  ┌───────────────────┐           │
+│   │ Tools             │ <──┼──│ Tool Execution    │           │
+│   │  - schemas        │    │  │  + Guardrails     │           │
+│   │  - registry       │    │  └─────────┬─────────┘           │
+│   └───────────────────┘    │            │                     │
+│                            │            v                     │
+│   ┌───────────────────┐    │  ┌───────────────────┐           │
+│   │ State Mgmt        │    │  │ Verification      │           │
+│   │  + checkpoints    │    │  │  - tests / lint   │           │
+│   └───────────────────┘    │  │  - screenshots    │           │
+│                            │  │  - LLM-as-judge   │           │
+│   ┌───────────────────┐    │  └─────────┬─────────┘           │
+│   │ Error Handling    │    │            │                     │
+│   │  - transient      │    │            v                     │
+│   │  - recoverable    │    │  ┌───────────────────┐           │
+│   │  - user-fixable   │    │  │ Subagent          │           │
+│   └───────────────────┘    └──│ Orchestration     │           │
+│                               └───────────────────┘           │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### 1. Orchestration Loop — "trái tim" của harness
+
+Vòng lặp cơ bản thực thi chu trình **Thought → Action → Observation** (pattern ReAct). Mọi trí thông minh nằm ở model; vòng lặp chỉ quyết định: *nhận output, kiểm tra có phải tool call không, nếu có thì thực thi, thu thập kết quả, feed ngược lại*. Lặp cho đến khi model trả text thuần (kết thúc) hoặc chạm điều kiện dừng.
+
+### 2. Tools — "tay chân" của model
+
+Tool được khai báo qua schema (thường là JSON Schema). Harness chịu trách nhiệm: **đăng ký tool, validate input, thực thi trong sandbox, format output**. Model hiện đại dùng *native tool calling* — trả về cấu trúc `tool_calls` thay vì free-text, giúp parsing an toàn hơn.
+
+Tập hợp các tool cùng với cách trình bày output của chúng được SWE-agent paper gọi là **ACI (Agent-Computer Interface)** — và đây chính là lớp thiết kế có đòn bẩy cao nhất trong toàn bộ harness. Tool không chỉ là "API cho model gọi"; nó là **giao diện**, và như mọi giao diện, nó được thiết kế cho *một loại user cụ thể*. User ở đây là LLM — nên nguyên tắc thiết kế khác hẳn so với CLI hay GUI cho con người: giới hạn kết quả, hiển thị line number, reject sớm khi input sai, format output ngắn và deterministic.
+
+### 3. Memory — ngắn hạn, dài hạn, file-based
+
+Memory vận hành ở nhiều thang thời gian:
+
+- **Short-term**: conversation history trong context window.
+- **Long-term**: lưu persistent vào file/DB, truy xuất khi cần.
+- **File-based external memory**: một kỹ thuật phổ biến là viết `NOTES.md` hoặc `progress.json` — agent tự đọc lại đầu session.
+
+### 4. Context Management
+
+Đây là nơi các chiến lược từ context engineering được hiện thực:
+
+- **Compaction**: tóm tắt history cũ khi gần đầy window (Claude Code auto-compact ở ~98% context).
+- **Observation masking**: che bớt output tool không còn liên quan.
+- **Just-in-time retrieval**: chỉ kéo tài liệu về đúng lúc cần, thay vì nhồi hết từ đầu.
+
+### 5. Prompt Construction
+
+Lắp ráp prompt theo thứ tự có chủ ý: system prompt → tool definitions → memory files → conversation history → user input hiện tại. Thứ tự này ảnh hưởng đến hiệu quả cache và attention của model.
+
+### 6. Output Parsing
+
+Với native tool calling, model trả về structured object chứ không phải text thuần, nên parse nhẹ nhàng hơn thời GPT-3. Tuy nhiên harness vẫn cần xử lý edge case: tool call hợp lệ nhưng arg sai kiểu, nhiều tool call song song, hallucinated tool name.
+
+### 7. State Management
+
+Harness hiện đại (như LangGraph) mô hình hoá trạng thái dưới dạng **typed dict chảy qua các node của graph**, kèm **checkpoint** ở từng ranh giới để có thể resume nếu crash. Với Claude Code, state persistence được hiện thực bằng file trên đĩa (progress notes, git commit history).
+
+### 8. Error Handling
+
+Phân loại lỗi và xử lý tương ứng:
+
+- **Transient** (network flaky) → retry với backoff.
+- **LLM-recoverable** (tool trả lỗi): feed lỗi lại cho model, model tự sửa.
+- **User-fixable** (hết credit, hết permission) → thông báo user.
+- **Unexpected** → abort, log, escalate.
+
+### 9. Guardrails & Safety — ba lớp
+
+- **Input guardrails**: lọc input độc hại trước khi đưa vào model.
+- **Output guardrails**: kiểm tra output trước khi trả về user.
+- **Tool guardrails**: đánh giá tool call trước khi thực thi — với cơ chế "tripwire" dừng ngay khi vi phạm.
+
+Claude Code sử dụng thứ tự ưu tiên nghiêm ngặt: **deny > ask > allow** — một rule deny luôn thắng bất kể các rule allow khác.
+
+### 10. Verification Loops
+
+Sau khi model sinh ra thay đổi, phải có cơ chế *xác minh*:
+
+- **Rules-based**: chạy test, linter, type checker.
+- **Visual**: screenshot + so sánh (Claude Code dùng Puppeteer/Playwright MCP).
+- **LLM-as-judge**: dùng một model khác đánh giá kết quả theo tiêu chí định sẵn.
+
+### 11. Subagent Orchestration
+
+Ba mô hình phổ biến:
+
+- **Fork**: copy byte-identical tiến trình, chạy song song, merge lại.
+- **Teammate**: spawn agent riêng với context window riêng, giao task rồi nhận về summary ngắn.
+- **Worktree**: dùng git worktree để mỗi sub-agent làm việc trên branch độc lập, cuối cùng merge PR.
+
+Điểm nhấn của Claude Code: **cached context reuse khi fork** — các sub-agent chia sẻ cache prefix, tiết kiệm đáng kể token cost.
+
+Tóm lại, một câu nói đáng ghi nhớ: *"Harness không phải là wrapper quanh một prompt. Nó là toàn bộ hệ thống làm cho hành vi agent tự chủ trở nên khả thi."*
