@@ -1,0 +1,143 @@
+## Tokens — access, refresh, ID
+
+Cuối Authorization Code Flow, client nhận được một JSON với (có thể) ba token khác nhau. Nhiều người gộp chúng làm một rồi dùng sai. Ba token này phục vụ ba mục đích hoàn toàn khác nhau.
+
+### Access token
+
+> **Access Token**: Credential mà client đính kèm vào mọi request gọi resource server để chứng minh quyền truy cập. Là "vé" dùng để gọi API. Thời hạn ngắn (thường 15 phút đến 1 giờ). Nếu bị lộ, kẻ tấn công có thể gọi API của user trong khoảng thời gian còn lại của token — nên phải bảo vệ nghiêm ngặt.
+
+Format access token không được chuẩn hoá trong OAuth 2.0 — spec coi nó là "opaque" (không minh bạch), client không được phép phán đoán nội dung. Trong thực tế có hai dạng:
+
+- **Opaque token**: Chuỗi ngẫu nhiên không mang thông tin. RS phải gọi AS qua endpoint `/introspect` để verify. Ưu: thu hồi dễ (AS chỉ cần đánh dấu invalid). Nhược: mỗi lần verify là một network call.
+- **JWT (JSON Web Token)**: Chuỗi tự mang thông tin, có chữ ký. RS verify chữ ký nội tại, không cần gọi AS. Ưu: scale tốt, không phụ thuộc AS khi verify. Nhược: thu hồi khó — token vẫn hợp lệ đến hết hạn kể cả khi AS đánh dấu revoked (trừ khi RS có blocklist).
+
+JWT nhìn như vậy:
+
+```text
+eyJhbGciOiJSUzI1NiIsImtpZCI6Im...  .  eyJpc3MiOiJodHRwczovL2FjY29...  .  NQiL4GBKo1V...
+|-------- Header --------|          |---------- Payload ----------|      |- Signature -|
+base64url({                          base64url({                          RSA-SHA256 of
+  "alg": "RS256",                      "iss": "https://as.example",       header.payload
+  "kid": "abc"                         "sub": "user123",                   using AS's
+})                                     "aud": "photoprint",                private key
+                                       "exp": 1713782400,
+                                       "scope": "drive.readonly"
+                                     })
+```
+
+RS verify bằng cách lấy public key của AS (qua JWKS endpoint), check chữ ký, rồi đọc claims. `exp` kiểm tra chưa hết hạn, `aud` kiểm tra token được cấp cho đúng RS này, `sub` cho biết user nào.
+
+**Nguyên tắc vàng**: client tuyệt đối không parse nội dung access token. Kể cả khi biết nó là JWT, token được cấp cho RS, không phải cho client. Muốn biết thông tin user → dùng ID token hoặc gọi `/userinfo`.
+
+### Refresh token
+
+> **Refresh Token**: Credential dùng để đổi lấy access token mới khi access token hết hạn — mà không cần user đăng nhập lại. Thời hạn dài (ngày, tháng, thậm chí vô hạn). Chỉ dùng với endpoint `/token` của AS, không bao giờ gửi cho resource server.
+
+Vì sao cần? Access token thời hạn ngắn (1 giờ) — nếu user phải login mỗi giờ thì quá khổ. Refresh token cho phép client tự động lấy access token mới trong nền.
+
+```text
+  Client                    Auth Server
+    |                           |
+    | POST /token               |
+    | grant_type=refresh_token  |
+    | refresh_token=1//0gKJ...  |
+    | client_id=...             |
+    | client_secret=...  (if confidential)
+    |-------------------------->|
+    |                           |
+    | new access_token          |
+    | (optionally new refresh)  |
+    |<--------------------------|
+```
+
+Refresh token quyền lực hơn access token — ai có refresh token có thể tạo access token vô thời hạn. Bảo mật cực kỳ chặt:
+
+- **Không gửi ra resource server.** Không gửi vào browser nếu có thể tránh.
+- **Lưu ở nơi an toàn nhất** — với backend, là database có encryption at rest. Với SPA, tránh luôn nếu được (dùng refresh token rotation hoặc BFF pattern).
+- **Rotation**: AS trả refresh token mới mỗi lần refresh và invalidate cái cũ. Nếu thấy cái cũ được dùng lại → đó là dấu hiệu token bị đánh cắp, revoke toàn bộ session.
+
+### ID token (OpenID Connect)
+
+OAuth 2.0 là framework **authorization** — trả lời câu hỏi "app này có quyền gì?". Nó **không** phải framework **authentication** — không trả lời "user này là ai?". Rất nhiều người triển khai OAuth cho "login" nhưng thực ra đang dùng sai tool.
+
+**OpenID Connect (OIDC)** là layer mỏng trên OAuth 2.0 để thêm authentication. Thay đổi chính: khi scope bao gồm `openid`, AS trả thêm một **ID token**.
+
+> **ID Token**: JWT chứa thông tin danh tính của user (sub, email, name, ...). Được cấp cho **client** (không phải cho resource server), client verify nó để biết user là ai. ID token là của OIDC, không phải OAuth thuần.
+
+Payload ví dụ:
+
+```json
+{
+  "iss": "https://accounts.google.com",
+  "sub": "10769150350006150715113082367",
+  "aud": "123456-abc.apps.googleusercontent.com",
+  "exp": 1713782400,
+  "iat": 1713778800,
+  "email": "user@example.com",
+  "email_verified": true,
+  "name": "Nguyen Van A",
+  "picture": "https://lh3.googleusercontent.com/..."
+}
+```
+
+Ba điểm dễ sai với ID token:
+
+1. **aud phải trùng client_id của client.** Không check, client accept token được cấp cho app khác → attacker đăng nhập nick người khác vào app.
+2. **ID token để client dùng, không để gửi lên backend như access token.** Access token cho gọi API; ID token cho biết user là ai. Trộn lẫn là anti-pattern.
+3. **ID token không thay thế session.** Sau khi verify ID token lần đầu, backend nên tạo session riêng (cookie, JWT nội bộ) để quản lý đăng nhập. Không gửi ID token qua mỗi request.
+
+### So sánh ba token
+
+Cách dễ nhất để nhớ ba token là nhớ **mỗi token đi về một đích khác nhau**:
+
+```text
+  +-------------------------------------------------------------------+
+  |                                                                   |
+  |  +------------+                                                   |
+  |  |            | --- access_token -----> [ Resource Server ]       |
+  |  |            |     (Bearer header)                               |
+  |  |            |                                                   |
+  |  |   Client   | --- refresh_token ----> [ Authorization Server ]  |
+  |  |            |     (POST /token)                                 |
+  |  |            |                                                   |
+  |  |            | --- id_token -------> (stays inside client,       |
+  |  +------------+                        never sent anywhere)       |
+  |                                                                   |
+  +-------------------------------------------------------------------+
+```
+
+Ba đích, ba mục đích, ba token — không đổi chỗ.
+
+| | Access Token | Refresh Token | ID Token |
+|---|---|---|---|
+| **Cho ai dùng?** | Resource Server | Authorization Server | Client |
+| **Mục đích** | Gọi API | Lấy access token mới | Biết user là ai |
+| **Thời hạn** | Ngắn (phút-giờ) | Dài (ngày-tháng) | Ngắn (phút-giờ) |
+| **Format** | Opaque hoặc JWT | Opaque (thường) | JWT (luôn) |
+| **Client có parse không?** | Không | Không | Có — verify và đọc claims |
+| **Gửi đi đâu?** | `Authorization: Bearer ...` đến RS | POST `/token` | Không gửi đi đâu cả — chỉ client đọc |
+| **Thuộc spec nào?** | OAuth 2.0 | OAuth 2.0 | OpenID Connect |
+
+### Token lifecycle thực tế
+
+```text
+  t=0:      User logs in via 3LO
+            Client gets: access_token (1h), refresh_token (30d), id_token (1h)
+            Client verifies id_token, creates app session
+
+  t=0..1h:  Client calls API with access_token
+
+  t=1h:     access_token expires (401 from RS)
+            Client silently calls /token with refresh_token
+            Gets new access_token (1h), new refresh_token (30d, old one invalidated)
+
+  t=1h..2h: Client calls API with new access_token
+
+  ...continue until...
+
+  t=30d:    Refresh token expires (if not used) OR user clicks "Logout"
+            Client clears all tokens, deletes app session
+            Next time: full 3LO flow again
+```
+
+Chi tiết nhỏ nhưng quan trọng: refresh token rotation. Nếu AS cấp refresh token mới mỗi lần refresh và invalidate cái cũ, một token rò rỉ chỉ còn hại đến lần refresh kế tiếp. Đây là "refresh token rotation with reuse detection" — best practice hiện đại.

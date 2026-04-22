@@ -1,0 +1,73 @@
+---
+title: "3-Legged OAuth (3LO) Deep Dive: Từ cơ bản đến thực chiến"
+description: "Deep dive về 3-Legged OAuth — flow chuẩn để một ứng dụng truy cập dữ liệu người dùng ở dịch vụ bên thứ ba mà không cần password. Bao gồm Authorization Code Flow, PKCE, token lifecycle, các lỗ hổng bảo mật thường gặp, và code thực chiến."
+date: 2026-04-22
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+import Introduction from "./_sections/01-introduction.mdx";
+import Foundations from "./_sections/02-oauth-foundations.mdx";
+import AuthCodeFlow from "./_sections/03-authorization-code-flow.mdx";
+import Pkce from "./_sections/04-pkce.mdx";
+import Tokens from "./_sections/05-tokens.mdx";
+import Security from "./_sections/06-security.mdx";
+import Implementation from "./_sections/07-implementation.mdx";
+import Pitfalls from "./_sections/08-pitfalls.mdx";
+import Conclusion from "./_sections/09-conclusion.mdx";
+
+export const metadata = generateBlogMetadata({
+  title: "3-Legged OAuth (3LO) Deep Dive: Từ cơ bản đến thực chiến",
+  description: "Deep dive về 3-Legged OAuth — flow chuẩn để một ứng dụng truy cập dữ liệu người dùng ở dịch vụ bên thứ ba mà không cần password. Bao gồm Authorization Code Flow, PKCE, token lifecycle, các lỗ hổng bảo mật thường gặp, và code thực chiến.",
+  date: "2026-04-22",
+  slug: "3-legged-oauth-deep-dive"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/3-legged-oauth-deep-dive/cover.jpg"
+    alt="Hình ảnh ổ khoá số tượng trưng cho uỷ quyền và bảo mật trong OAuth"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+<Introduction />
+<Foundations />
+<AuthCodeFlow />
+<Pkce />
+<Tokens />
+<Security />
+<Implementation />
+<Pitfalls />
+<Conclusion />
+
+## References
+
+- [RFC 6749 — The OAuth 2.0 Authorization Framework](https://datatracker.ietf.org/doc/html/rfc6749)
+- [RFC 7636 — Proof Key for Code Exchange (PKCE)](https://datatracker.ietf.org/doc/html/rfc7636)
+- [RFC 6819 — OAuth 2.0 Threat Model and Security Considerations](https://datatracker.ietf.org/doc/html/rfc6819)
+- [RFC 8252 — OAuth 2.0 for Native Apps](https://datatracker.ietf.org/doc/html/rfc8252)
+- [RFC 9700 — Best Current Practice for OAuth 2.0 Security](https://datatracker.ietf.org/doc/html/rfc9700)
+- [OAuth 2.1 Draft — IETF](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1)
+- [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html)
+- [Google Identity — Using OAuth 2.0 for Web Server Applications](https://developers.google.com/identity/protocols/oauth2/web-server)
+- [Atlassian — OAuth 2.0 (3LO) apps](https://developer.atlassian.com/cloud/jira/platform/oauth-2-3lo-apps/)
+- [Auth0 — Authorization Code Flow with PKCE](https://auth0.com/docs/get-started/authentication-and-authorization-flow/authorization-code-flow-with-pkce)
+- [OAuth 2.0 Simplified — Aaron Parecki](https://www.oauth.com/)
+
+### Ảnh sử dụng trong bài
+
+- Cover image: [Unsplash — Digital padlock / security](https://unsplash.com/s/photos/digital-security)

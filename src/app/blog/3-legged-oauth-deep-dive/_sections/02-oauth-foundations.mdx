@@ -1,0 +1,99 @@
+## Nền tảng OAuth 2.0
+
+Trước khi đi sâu vào Authorization Code Flow, cần nắm rõ ai là ai trong OAuth. Spec (RFC 6749) định nghĩa bốn vai trò — và bốn cái tên này sẽ quay lại xuyên suốt bài viết, nên hãy đọc kỹ phần này.
+
+### Bốn vai trò
+
+> **Resource Owner**: Chủ sở hữu dữ liệu — thường là **người dùng cuối** (end user). Trong ví dụ PhotoPrint, resource owner là người có tài khoản Google và ảnh trong Drive. Chỉ resource owner mới có quyền phê duyệt (consent) việc cấp quyền truy cập.
+
+> **Client**: Ứng dụng muốn truy cập dữ liệu thay mặt resource owner. Có thể là web app (PhotoPrint), mobile app, SPA, hoặc backend service. OAuth chia client làm hai loại: **confidential** (có thể giữ bí mật, như backend) và **public** (không thể giữ bí mật, như SPA hoặc mobile — vì code chạy trên máy user).
+
+> **Authorization Server (AS)**: Máy chủ phát hành token. Nó xác thực user, hiển thị consent screen, và cấp authorization code / access token. Trong ví dụ, AS là `accounts.google.com`.
+
+> **Resource Server (RS)**: Máy chủ giữ dữ liệu được bảo vệ — chấp nhận access token và trả dữ liệu về. Trong ví dụ, RS là API Google Drive (`www.googleapis.com/drive/...`). AS và RS có thể là cùng một công ty nhưng thường là hai hệ thống tách biệt.
+
+Một điểm dễ nhầm: **authorization server xử lý cấp quyền**, còn **resource server xử lý dữ liệu**. Access token là "vé" mà AS phát, và RS kiểm tra.
+
+### Kiến trúc tổng quan
+
+```text
+  +------------------------------------------------------------+
+  |                                                            |
+  |                     +------------------+                   |
+  |                     |  Resource Owner  |                   |
+  |                     |     (user)       |                   |
+  |                     +--------+---------+                   |
+  |                              |                             |
+  |                              | 1. Grant authorization      |
+  |                              | (via consent screen)        |
+  |                              v                             |
+  |  +-----------+      +--------+---+       +---------------+ |
+  |  |           | auth |            |  get  |               | |
+  |  |  Client   +----->+    Auth    +<------+   Resource    | |
+  |  |  (app)    | code | Server (AS)| token |   Server (RS) | |
+  |  |           |      |            | verify|               | |
+  |  +-----+-----+      +------------+       +-------+-------+ |
+  |        |                                         ^         |
+  |        |       4. Call API with access token     |         |
+  |        +-----------------------------------------+         |
+  |                                                            |
+  +------------------------------------------------------------+
+```
+
+**Điều cực kỳ quan trọng:** user chỉ đăng nhập ở **AS**, không bao giờ ở **Client**. Client không thấy password của user. Nó chỉ thấy một **token** mà AS đưa cho — và token đó có scope giới hạn, có thời hạn, có thể thu hồi.
+
+### Các grant type chính
+
+OAuth 2.0 định nghĩa nhiều "grant type" — mỗi cái là một cách lấy token khác nhau cho các tình huống khác nhau:
+
+| Grant type | Người dùng tham gia? | Dùng khi nào | Trạng thái |
+|---|---|---|---|
+| Authorization Code | Có (3LO) | Web app, mobile, SPA | **Khuyên dùng** |
+| Authorization Code + PKCE | Có (3LO) | Public client (SPA, mobile, native) | **Bắt buộc** với public client |
+| Implicit | Có (3LO) | SPA (trước đây) | **Deprecated** — không dùng |
+| Resource Owner Password | Có (user đưa password cho client) | Legacy | **Deprecated** |
+| Client Credentials | Không (2LO) | Machine-to-machine | Đúng use case |
+| Refresh Token | Không (chỉ refresh) | Làm mới access token | Dùng kèm các grant trên |
+| Device Code | Có (3LO) | Thiết bị không có browser (TV, CLI) | Đúng use case |
+
+Với 3LO hiện đại, chỉ có **hai** grant type đáng dùng:
+
+- **Authorization Code + PKCE** — cho hầu hết mọi trường hợp có user
+- **Device Code** — cho thiết bị không có browser
+
+Implicit flow và Resource Owner Password đã bị **OAuth 2.1** loại bỏ hoàn toàn. Chúng ta sẽ thấy vì sao ở section Security.
+
+### 2LO vs 3LO: khi nào dùng cái nào
+
+Nhiều người nhầm lẫn 2LO và 3LO, nhưng câu hỏi đơn giản để phân biệt:
+
+> *Dữ liệu thuộc về ai — user hay ứng dụng?*
+
+Nếu dữ liệu thuộc về **user** (ảnh của user trong Drive, email của user trong Gmail, repos của user trên GitHub) → **3LO**. User phải consent.
+
+Nếu dữ liệu thuộc về **ứng dụng** (server A cần đọc config của chính nó từ server B, cron job đồng bộ dữ liệu nội bộ giữa hai service của cùng công ty) → **2LO**. Không cần user.
+
+```text
+  +---------------------------------------+
+  |            2LO vs 3LO                 |
+  +-----------------+---------------------+
+  |       2LO       |        3LO          |
+  +-----------------+---------------------+
+  | Machine-to-     | User-to-service     |
+  | machine         |                     |
+  |                 |                     |
+  | No user         | User logs in at AS  |
+  |                 | and clicks "Allow"  |
+  |                 |                     |
+  | Grant:          | Grant:              |
+  | client_creds    | authorization_code  |
+  |                 | (+ PKCE)            |
+  |                 |                     |
+  | Use: internal   | Use: 3rd-party      |
+  | backend sync,   | integrations,       |
+  | service mesh    | social login,       |
+  |                 | SaaS connectors     |
+  +-----------------+---------------------+
+```
+
+Phần còn lại của bài sẽ tập trung vào **3LO với Authorization Code + PKCE** — flow phổ biến nhất và cũng phức tạp nhất. Nếu nắm được nó, các flow khác chỉ là biến thể.

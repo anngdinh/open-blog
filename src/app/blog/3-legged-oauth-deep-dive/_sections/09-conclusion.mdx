@@ -1,0 +1,43 @@
+## Kết luận
+
+3-Legged OAuth không phải "redirect sang Google rồi lấy token". Nó là một hệ thống được cân nhắc kỹ để trả lời một câu hỏi khó: *làm thế nào để uỷ quyền truy cập mà không trao password — trong một môi trường mà mọi kênh đều có thể nghe lén hoặc bị chiếm quyền?*
+
+Những điểm đáng nhớ nhất:
+
+- **Ba token khác nhau, ba mục đích khác nhau.** Access token để gọi RS. Refresh token để lấy access token mới. ID token (OIDC) để client biết user là ai. Trộn lẫn là lỗi.
+- **PKCE cho mọi client.** Không chỉ public client — OAuth 2.1 yêu cầu PKCE cho cả confidential client. Chi phí thấp, lợi ích lớn.
+- **state là bắt buộc.** Random, unique mỗi flow, verify ở callback. Thiếu state = cửa sau cho CSRF.
+- **redirect_uri exact match.** Không wildcard, không substring, không chỗ cho open redirect.
+- **Token storage là phần khó nhất của frontend.** BFF pattern là câu trả lời đúng cho SPA; secure storage của OS là câu trả lời cho native.
+- **Đừng tự làm crypto.** Dùng thư viện OIDC đã qua kiểm định. Verify signature, `aud`, `exp`, `iss` theo spec — không bỏ qua bất cứ cái nào.
+
+### Khi nào dùng 3LO, khi nào không
+
+```text
+  Scenario                                 Recommended
+  ---------------------------------------  -----------------
+  Web app với backend + login user         3LO Auth Code + PKCE
+  SPA gọi API thay mặt user                3LO + BFF pattern
+  Mobile app đọc dữ liệu user              3LO + PKCE + Keychain/Keystore
+  CLI tool có user đăng nhập               3LO Device Code grant
+  TV / IoT không có browser tốt            3LO Device Code grant
+
+  Backend A gọi backend B (cùng tổ chức)   2LO Client Credentials
+  Cron job đồng bộ dữ liệu nội bộ          2LO Client Credentials
+  Microservice mesh bên trong              mTLS hoặc SPIFFE, không OAuth
+```
+
+Quy tắc thực dụng: **có user cuối tham gia → 3LO; chỉ có server-to-server → 2LO; nội bộ trust zone → có thể không cần OAuth gì cả**, mTLS đơn giản hơn.
+
+### Đi tiếp
+
+Nếu bài này là điểm khởi đầu, dưới đây là những hướng mở rộng đáng đào sâu:
+
+- **OpenID Connect đầy đủ**: scope `openid`, `profile`, `email`, `offline_access`; UserInfo endpoint; discovery document; session management và logout; front-channel vs back-channel logout. OIDC là chuẩn authentication thực tế trên internet.
+- **OAuth 2.1** (draft đang hoàn thiện): hợp nhất RFC 6749 + 7636 + 8252 + 9700, loại implicit và password grant, yêu cầu PKCE mặc định. Khi finalize, đây sẽ là baseline.
+- **DPoP và mTLS** (RFC 8705, 9449): sender-constrained token. Cần cho financial-grade và healthcare APIs.
+- **Token exchange** (RFC 8693): đổi một token thành token khác với scope/audience khác. Dùng trong API gateway và service mesh.
+- **Resource Indicators** (RFC 8707): xin token nhắm đúng RS cụ thể, chống token reuse giữa RS.
+- **FAPI** (Financial-grade API): profile siết chặt của OAuth 2 cho banking — bắt buộc PKCE, mTLS hoặc DPoP, signed request object, v.v.
+
+OAuth vừa đủ đơn giản để triển khai nhanh, vừa đủ phức tạp để triển khai sai. Phần lớn vụ rò rỉ "OAuth vulnerability" trong tin tức không phải lỗi của spec — mà là lỗi triển khai sai một chi tiết mà spec đã cảnh báo từ năm 2012. Đọc spec, hiểu các attack mà mỗi phần chống, và dùng thư viện đã được cộng đồng kiểm định. Đó là con đường an toàn nhất để đi qua "3 legs" này.

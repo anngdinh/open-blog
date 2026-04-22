@@ -1,0 +1,282 @@
+## Thực chiến — Go backend với PKCE
+
+Chúng ta sẽ triển khai một client OAuth 3LO đầy đủ với PKCE, state, và refresh token. Kịch bản: backend Go làm confidential client, xin scope `openid email profile` từ Google để đăng nhập user.
+
+Code bên dưới dùng thư viện chuẩn `golang.org/x/oauth2` + `crypto/rand`. Trong thực tế, bạn có thể dùng trực tiếp gói này — nó xử lý hầu hết boilerplate. Ở đây mình viết explicit để làm rõ từng bước.
+
+### Khởi tạo config
+
+```go
+package main
+
+import (
+    "context"
+    "crypto/rand"
+    "crypto/sha256"
+    "encoding/base64"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "time"
+
+    "golang.org/x/oauth2"
+)
+
+var oauthConfig = &oauth2.Config{
+    ClientID:     mustEnv("GOOGLE_CLIENT_ID"),
+    ClientSecret: mustEnv("GOOGLE_CLIENT_SECRET"),
+    RedirectURL:  "https://app.example.com/oauth/callback",
+    Scopes:       []string{"openid", "email", "profile"},
+    Endpoint: oauth2.Endpoint{
+        AuthURL:  "https://accounts.google.com/o/oauth2/v2/auth",
+        TokenURL: "https://oauth2.googleapis.com/token",
+    },
+}
+```
+
+### Tạo code_verifier và code_challenge
+
+```go
+func generatePKCE() (verifier, challenge string, err error) {
+    // 32 random bytes -> base64url -> 43-char string (spec-compliant length)
+    raw := make([]byte, 32)
+    if _, err = rand.Read(raw); err != nil {
+        return "", "", err
+    }
+    verifier = base64.RawURLEncoding.EncodeToString(raw)
+
+    sum := sha256.Sum256([]byte(verifier))
+    challenge = base64.RawURLEncoding.EncodeToString(sum[:])
+    return verifier, challenge, nil
+}
+
+func generateState() (string, error) {
+    raw := make([]byte, 32)
+    if _, err := rand.Read(raw); err != nil {
+        return "", err
+    }
+    return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+```
+
+Ba điểm chú ý:
+
+- Dùng `crypto/rand`, **không** phải `math/rand` — math/rand không đủ entropy cho crypto.
+- `base64.RawURLEncoding` — URL-safe, không padding, đúng format spec yêu cầu.
+- 32 byte input cho ra chuỗi 43 ký tự, nằm trong khoảng 43-128 mà spec cho phép.
+
+### Handler: bắt đầu flow
+
+```go
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+    verifier, challenge, err := generatePKCE()
+    if err != nil {
+        http.Error(w, "internal error", 500)
+        return
+    }
+    state, err := generateState()
+    if err != nil {
+        http.Error(w, "internal error", 500)
+        return
+    }
+
+    // Lưu state + verifier vào server-side session (redis, cookie signed, v.v.)
+    // Đây là demo — production cần session store thực.
+    session := getOrCreateSession(w, r)
+    session.Set("oauth_state", state)
+    session.Set("pkce_verifier", verifier)
+    session.Set("oauth_ts", time.Now().Unix())
+    session.Save()
+
+    authURL := oauthConfig.AuthCodeURL(
+        state,
+        oauth2.AccessTypeOffline,                                    // xin refresh token
+        oauth2.SetAuthURLParam("code_challenge", challenge),
+        oauth2.SetAuthURLParam("code_challenge_method", "S256"),
+        oauth2.SetAuthURLParam("prompt", "consent"),                 // ép show consent
+    )
+
+    http.Redirect(w, r, authURL, http.StatusFound)
+}
+```
+
+`AccessTypeOffline` là cách Google đánh dấu "xin refresh token". Không có nó, Google chỉ trả access token (không đủ để duy trì session dài hạn).
+
+Một lưu ý nhỏ về `prompt=consent`: tham số này **bắt buộc Google hiện consent screen mỗi lần login**, kể cả khi user đã đồng ý trước đó. Trong demo đây hữu ích để đảm bảo Google luôn cấp refresh token mới. Nhưng với production UX, thường chỉ cần dùng `prompt=consent` ở **lần đầu** user cấp quyền (để lấy refresh token) — các lần đăng nhập sau bỏ tham số này để UX mượt hơn. Một cách phổ biến: nếu database đã có refresh token của user → omit `prompt`; nếu chưa có → thêm `prompt=consent`.
+
+### Handler: callback
+
+```go
+func callbackHandler(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+
+    // 1. Check error trả về từ AS
+    if errParam := r.URL.Query().Get("error"); errParam != "" {
+        http.Error(w, "oauth error: "+errParam, 400)
+        return
+    }
+
+    // 2. Verify state
+    session := getSession(r)
+    expectedState := session.GetString("oauth_state")
+    if expectedState == "" || expectedState != r.URL.Query().Get("state") {
+        http.Error(w, "invalid state", 400)
+        return
+    }
+
+    // 3. Lấy verifier từ session
+    verifier := session.GetString("pkce_verifier")
+    if verifier == "" {
+        http.Error(w, "missing pkce verifier", 400)
+        return
+    }
+
+    // 4. Cleanup ngay — state và verifier chỉ dùng một lần
+    session.Delete("oauth_state")
+    session.Delete("pkce_verifier")
+    session.Save()
+
+    // 5. Đổi code lấy token
+    code := r.URL.Query().Get("code")
+    token, err := oauthConfig.Exchange(
+        ctx, code,
+        oauth2.SetAuthURLParam("code_verifier", verifier),
+    )
+    if err != nil {
+        http.Error(w, "token exchange failed: "+err.Error(), 500)
+        return
+    }
+
+    // 6. Xử lý ID token (OIDC)
+    rawIDToken, _ := token.Extra("id_token").(string)
+    claims, err := verifyIDToken(ctx, rawIDToken)
+    if err != nil {
+        http.Error(w, "invalid id_token: "+err.Error(), 401)
+        return
+    }
+
+    // 7. Tạo app session gắn với user
+    userSession := createUserSession(w, r, claims.Subject, claims.Email)
+    userSession.StoreRefreshToken(token.RefreshToken) // encrypt at rest
+    userSession.Save()
+
+    http.Redirect(w, r, "/dashboard", http.StatusFound)
+}
+```
+
+Bảy bước trên là mẫu chuẩn. Đừng thiếu bước nào.
+
+### Verify ID token (OIDC)
+
+```go
+import "github.com/coreos/go-oidc/v3/oidc"
+
+var oidcProvider *oidc.Provider
+var idTokenVerifier *oidc.IDTokenVerifier
+
+func init() {
+    ctx := context.Background()
+    var err error
+    oidcProvider, err = oidc.NewProvider(ctx, "https://accounts.google.com")
+    if err != nil {
+        panic(err)
+    }
+    idTokenVerifier = oidcProvider.Verifier(&oidc.Config{
+        ClientID: oauthConfig.ClientID,
+    })
+}
+
+type idClaims struct {
+    Subject       string `json:"sub"`
+    Email         string `json:"email"`
+    EmailVerified bool   `json:"email_verified"`
+    Name          string `json:"name"`
+}
+
+func verifyIDToken(ctx context.Context, raw string) (*idClaims, error) {
+    tok, err := idTokenVerifier.Verify(ctx, raw)
+    if err != nil {
+        return nil, err
+    }
+    var c idClaims
+    if err := tok.Claims(&c); err != nil {
+        return nil, err
+    }
+    if !c.EmailVerified {
+        return nil, fmt.Errorf("email not verified")
+    }
+    return &c, nil
+}
+```
+
+`oidc.NewProvider` đọc metadata từ `/.well-known/openid-configuration` để biết JWKS URL, issuer, các endpoint. Verifier tự cache key và rotate. `Verify` kiểm tra đủ thứ: signature, `iss`, `aud`, `exp`, `iat`, `nonce` (nếu có).
+
+### Refresh token khi cần
+
+```go
+func callGoogleAPI(ctx context.Context, s *UserSession, url string) ([]byte, error) {
+    tokenSource := oauthConfig.TokenSource(ctx, &oauth2.Token{
+        RefreshToken: s.RefreshToken(),
+    })
+    // TokenSource tự động refresh khi access token hết hạn
+    // và trả về access token mới.
+
+    client := oauth2.NewClient(ctx, tokenSource)
+    resp, err := client.Get(url)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    // Nếu token source trả refresh token mới, lưu lại
+    newTok, err := tokenSource.Token()
+    if err == nil && newTok.RefreshToken != s.RefreshToken() {
+        s.StoreRefreshToken(newTok.RefreshToken) // rotation
+        s.Save()
+    }
+
+    return readAll(resp.Body)
+}
+```
+
+`oauth2.TokenSource` xử lý refresh ngầm. Bạn chỉ cần theo dõi xem refresh token có rotate không để lưu giá trị mới.
+
+### SPA variant — BFF thay vì expose token
+
+Nếu frontend là SPA (React/Vue/Svelte), khuyến nghị không đưa token xuống browser. Luồng:
+
+```text
+  SPA (browser)         BFF (backend)         Google AS           Google API
+      |                       |                   |                   |
+      | GET /auth/login       |                   |                   |
+      |---------------------->|                   |                   |
+      |                       | build auth URL,   |                   |
+      |                       | save state/verif  |                   |
+      |                       | in server session |                   |
+      |   302 redirect to AS  |                   |                   |
+      |<----------------------|                   |                   |
+      |-------------------------->(standard OAuth flow at AS)         |
+      |<--------------------------302 back to BFF with code + state   |
+      |                       |                   |                   |
+      |                       | exchange code     |                   |
+      |                       |------------------>|                   |
+      |                       |<------------------| tokens            |
+      |                       | store tokens      |                   |
+      |                       | server-side       |                   |
+      |   Set-Cookie session  |                   |                   |
+      |<----------------------|                   |                   |
+      |                       |                   |                   |
+      | GET /api/drive/files  |                   |                   |
+      | (with session cookie) |                   |                   |
+      |---------------------->|                   |                   |
+      |                       | inject Bearer     |                   |
+      |                       | from stored token |                   |
+      |                       |------------------------------------>|
+      |                       |<------------------------------------|
+      |    response data      |                                      |
+      |<----------------------|                                      |
+```
+
+SPA code chỉ gọi API "của mình" (BFF), không bao giờ gọi Google trực tiếp. Session cookie đi kèm request vì browser tự làm (HttpOnly, SameSite=Lax). Token ở nguyên trong BFF. XSS trên SPA không đọc được token.
+
+Đây là kiến trúc mình khuyến nghị cho 95% app web có frontend SPA. Chỉ native mobile app và một số CLI thực sự cần giữ token local.

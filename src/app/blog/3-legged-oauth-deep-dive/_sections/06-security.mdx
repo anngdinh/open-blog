@@ -1,0 +1,147 @@
+## Security considerations
+
+OAuth được thiết kế cẩn thận, nhưng nó là **framework** — triển khai sai một chi tiết là phá vỡ cả chuỗi bảo mật. Section này điểm qua các tuyến tấn công quan trọng nhất và cách triển khai đúng.
+
+### state — chống CSRF và giữ context
+
+Không dùng `state` là lỗi phổ biến nhất. Tấn công như sau:
+
+```text
+  Victim browser              Attacker           Auth Server
+      |                          |                   |
+      |                          | 1. Start OAuth flow
+      |                          |  with attacker's account
+      |                          |------------------>|
+      |                          |                   |
+      |                          |<---code=attacker's|
+      |                          |                   |
+      |    2. Attacker crafts link:                  |
+      |    https://victim-app/oauth/callback         |
+      |       ?code=<attacker's code>                |
+      |                                              |
+      |<-- attacker tricks victim to click link ---- |
+      |                                              |
+      | 3. Victim's browser sends code to victim-app |
+      |--------------------------------------------->|
+      |                                              |
+      | victim-app exchanges code, binds             |
+      | attacker's account to victim's session       |
+      | => Victim is now logged into ATTACKER'S acct |
+```
+
+Victim vào app, nghĩ rằng mình đang dùng tài khoản của mình — thực ra đang ngồi trong tài khoản attacker. Nếu victim upload dữ liệu nhạy cảm (ảnh, tài liệu), attacker đọc được ngay sau đó bằng cách đăng nhập lại bình thường.
+
+**Cách chống**:
+
+1. Tạo `state` ngẫu nhiên (≥128 bits entropy) trước khi bắt đầu flow.
+2. Lưu ở phía client — cookie signed, sessionStorage, hoặc server-side session.
+3. Ở callback, so sánh `state` trả về với giá trị đã lưu. Không khớp → huỷ flow.
+
+state cũng có công dụng thứ hai: giữ **context** của flow. Ví dụ, user đang ở trang `/checkout` thì bấm "Login with Google". Sau khi callback, app cần biết đưa user về `/checkout`. Có thể encode destination URL vào state (hoặc tốt hơn, lưu server-side, dùng một state ID random tham chiếu record đó).
+
+### redirect_uri — exact match, không đàm phán
+
+AS kiểm tra redirect_uri trong authorize request khớp với danh sách đã đăng ký của client. Điểm chết người: **so khớp chính xác, không phải "startsWith" hay "contains"**.
+
+Các lỗi triển khai phổ biến và hệ quả:
+
+```text
+  Registered: https://app.com/callback
+  
+  BAD  1: AS allows https://app.com/callback/anything
+          -> attacker opens /callback/../evil -> redirect to evil
+  
+  BAD  2: AS allows *.app.com
+          -> attacker finds XSS on static.app.com -> exfil code
+  
+  BAD  3: AS allows any subpath on app.com
+          -> attacker finds open redirect at /search?url=...
+             -> redirect_uri=https://app.com/search?url=evil.com
+             -> AS redirects victim to evil.com with code in URL
+  
+  GOOD 1: Exact match only
+          https://app.com/callback  ==  https://app.com/callback
+  
+  GOOD 2: For localhost (dev only) - allow variable port
+          http://127.0.0.1:<any>/callback
+```
+
+RFC 9700 (OAuth Best Practice, 2025) nói rất rõ: AS **phải** so khớp redirect_uri kiểu exact-string, trừ trường hợp localhost đặc biệt. Nếu AS của bạn cho wildcard hay substring — đó là lỗi.
+
+Từ phía client, đảm bảo:
+
+- Không cho user chọn redirect_uri qua query param.
+- Endpoint callback **không** được là open redirect — đừng đọc `?next=...` rồi redirect mù. Whitelist cứng.
+
+### Token storage — đau đầu nhất với frontend
+
+Với backend confidential client, lưu token rất đơn giản: database có encryption at rest. Với SPA hoặc mobile, chọn lựa đều có đánh đổi:
+
+```text
+  +----------------+-----------------------+-----------------+
+  | Storage        | XSS resilience        | Verdict         |
+  +----------------+-----------------------+-----------------+
+  | localStorage   | NONE - any XSS reads  | AVOID           |
+  |                | tokens in plain view  |                 |
+  +----------------+-----------------------+-----------------+
+  | sessionStorage | NONE - same           | AVOID for       |
+  |                |                       | refresh tokens  |
+  +----------------+-----------------------+-----------------+
+  | Cookie         | Blocked from JS if    | Good IF         |
+  | HttpOnly +     | HttpOnly; need CSRF   | combined with   |
+  | Secure +       | defense (SameSite,    | SameSite=Lax    |
+  | SameSite       | double-submit, etc.)  | or Strict       |
+  +----------------+-----------------------+-----------------+
+  | Memory-only    | XSS can still read    | OK for short-   |
+  | (JS variable)  | while running, but    | lived access    |
+  |                | gone on reload        | token in SPA    |
+  +----------------+-----------------------+-----------------+
+  | BFF pattern    | Tokens never touch    | BEST for SPA    |
+  | (proxy backend)| browser at all        |                 |
+  +----------------+-----------------------+-----------------+
+```
+
+> **BFF (Backend-For-Frontend) pattern**: SPA không trực tiếp giữ token. Thay vào đó, có một backend nhỏ làm proxy — backend làm OAuth flow, giữ token, đặt session cookie (HttpOnly) cho browser. SPA gọi API qua backend, backend gắn access token vào request. Token không bao giờ vào JavaScript context → XSS không steal được token (mặc dù XSS vẫn có thể abuse session qua proxy calls). Đây là khuyến nghị hiện tại của OAuth 2.1 cho web app có UI SPA.
+
+Với mobile và desktop native, dùng secure storage của OS:
+
+- iOS: Keychain Services
+- Android: EncryptedSharedPreferences hoặc Android Keystore
+- Desktop: OS keyring (Windows Credential Manager, macOS Keychain, libsecret)
+
+### Scope và least privilege
+
+Xin scope tối thiểu đủ dùng. Không xin `drive.full` khi chỉ cần đọc một folder. Hai lý do:
+
+1. **User tin tưởng hơn**: consent screen gọn, user đồng ý dễ hơn.
+2. **Thiệt hại khi token rò rỉ thấp hơn**: kẻ tấn công có token nhưng không làm được gì ngoài scope đó.
+
+Nếu app có tính năng phân vùng (một phần cần drive, một phần cần calendar), cân nhắc **incremental authorization** — chỉ xin scope khi user dùng tính năng đó, thay vì xin tất cả từ lúc login.
+
+### Token binding và mTLS — kỹ thuật nâng cao
+
+Một access token bị lộ → attacker dùng được thoải mái cho đến hết hạn. Không có cách nào RS phân biệt request hợp lệ với request đánh cắp.
+
+**Sender-constrained tokens** giải quyết vấn đề này: token chỉ dùng được nếu request đi kèm chứng cứ "đúng client". Hai cơ chế phổ biến:
+
+- **mTLS (Mutual TLS)**: client dùng TLS client cert khi gọi AS. Token gắn với fingerprint cert — chỉ request từ client có đúng private key mới dùng được.
+- **DPoP (Demonstrating Proof-of-Possession)** — RFC 9449: client tạo key pair, ký mỗi request đến RS bằng private key, gửi public key thumbprint kèm token. AS gắn token với public key đó. Không có private key → token vô dụng kể cả khi bị lộ.
+
+Đây là tuyến phòng thủ cuối cùng — không phải ai cũng cần, nhưng với app xử lý tài chính hay dữ liệu nhạy cảm, DPoP là best practice 2025.
+
+### Checklist ngắn trước khi deploy
+
+```text
+  [ ] PKCE (S256) trên tất cả client, kể cả có client_secret
+  [ ] state random >=128 bits, verify ở callback
+  [ ] redirect_uri exact match ở AS
+  [ ] Callback endpoint không phải open redirect
+  [ ] Refresh token rotation bật, reuse detection revoke session
+  [ ] Access token TTL ngắn (15-60m)
+  [ ] HTTPS-only, không HTTP trên production
+  [ ] HttpOnly + Secure + SameSite cho cookie session
+  [ ] Token storage đúng chỗ (BFF / Keychain / Keystore)
+  [ ] Scope tối thiểu đủ dùng
+  [ ] Log không chứa token, code, hay verifier
+  [ ] Rate limit /token và /authorize
+```

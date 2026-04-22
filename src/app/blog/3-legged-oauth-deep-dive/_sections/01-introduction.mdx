@@ -1,0 +1,44 @@
+## Vì sao chúng ta cần 3-Legged OAuth?
+
+Hãy tưởng tượng bạn đang xây một ứng dụng tên là **PhotoPrint** — dịch vụ in ảnh. Để tiện cho người dùng, bạn muốn họ chọn thẳng ảnh từ Google Drive thay vì phải tải về máy rồi upload lại. Vậy PhotoPrint cần quyền đọc ảnh trong Drive của người dùng.
+
+Cách làm ngây thơ — và cực kỳ tệ — là hỏi thẳng username + password Google của họ. Vừa sai về bảo mật, vừa không scale: nếu Google bật 2FA, hoặc người dùng đổi password, ứng dụng của bạn chết. Chưa kể việc lưu password của người dùng là một quả bom nổ chậm — rò rỉ database là mất credentials Google của tất cả khách hàng.
+
+Vấn đề cốt lõi ở đây là **delegated authorization** (uỷ quyền): làm sao để người dùng có thể nói với Google rằng *"hãy cho PhotoPrint đọc ảnh của tôi, nhưng đừng cho nó làm gì khác, và tôi có thể thu hồi quyền này bất cứ lúc nào"* — mà không phải đưa password cho PhotoPrint.
+
+Đây chính xác là vấn đề mà **OAuth 2.0** ra đời để giải quyết. Và khi flow có sự tham gia của **người dùng cuối** (không phải chỉ hai máy chủ giao tiếp với nhau), chúng ta gọi đó là **3-Legged OAuth** — viết tắt 3LO.
+
+> **3-Legged OAuth (3LO)**: Flow OAuth có ba bên (three legs) tham gia — **người dùng cuối**, **ứng dụng khách (client)**, và **authorization server**. Người dùng đăng nhập trực tiếp vào authorization server để uỷ quyền cho client, không bao giờ chia sẻ password với client. Tên "legs" ám chỉ ba đoạn tương tác riêng biệt trong flow.
+
+> **2-Legged OAuth (2LO)**: Flow không có người dùng cuối — client tự xác thực với authorization server bằng credentials của chính nó (client_id + client_secret) để truy cập dữ liệu do chính nó sở hữu, không phải dữ liệu của user cụ thể nào. Điển hình dùng cho **machine-to-machine** (M2M): một backend service gọi API của service khác.
+
+Sự khác biệt quan trọng nhất giữa 2LO và 3LO là **consent screen**: 3LO luôn có một bước người dùng thấy trang "App X wants to access: Read your photos" và bấm **Allow** hoặc **Deny**. Không có consent screen, không phải 3LO.
+
+### Bài này sẽ đi đến đâu
+
+3LO không chỉ là "redirect user đến Google rồi lấy token". Nó là cả một hệ thống được thiết kế để chống lại hàng loạt lớp tấn công — và nếu triển khai sai một chi tiết nhỏ, toàn bộ hệ thống có thể đổ vỡ. Chúng ta sẽ đi qua các lớp đó từ ngoài vào trong:
+
+```text
+Roadmap:
+
+  [Foundations]
+  1. OAuth 2.0 roles, grant types, 2LO vs 3LO
+
+  [The canonical flow]
+  2. Authorization Code Flow - step by step
+  3. Parameters: client_id, redirect_uri, scope, state
+
+  [Security hardening]
+  4. PKCE - why "public clients" need extra armor
+  5. Tokens: access, refresh, ID token (OIDC)
+  6. Security considerations: CSRF, redirect URI, token storage
+
+  [Practice]
+  7. Implementation walkthrough (Go backend + SPA)
+  8. Common pitfalls and anti-patterns
+
+  [Wrap up]
+  9. Conclusion and next steps (OAuth 2.1, OIDC, DPoP)
+```
+
+Mục tiêu là sau khi đọc xong, bạn có thể tự đánh giá một triển khai OAuth bất kỳ — từ Google Sign-In đến một vendor nội bộ — và nói chính xác chỗ nào đúng, chỗ nào sai, và tại sao.

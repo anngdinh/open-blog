@@ -1,0 +1,156 @@
+## Authorization Code Flow — từng bước một
+
+Đây là flow chính của 3LO. Spec nằm ở RFC 6749 section 4.1. Nếu chỉ được nhớ một flow duy nhất trong OAuth, nhớ cái này.
+
+Ý tưởng lõi: client **không** bao giờ nhận trực tiếp access token qua browser. Thay vào đó, nó nhận một **authorization code** — một chuỗi ngắn, dùng một lần — và sau đó đổi code đó lấy access token qua một **request backend** (server-to-server). Lý do sẽ rõ ở section PKCE.
+
+### Sơ đồ flow
+
+```text
+  User          Client (PhotoPrint)       Auth Server (Google)      Resource Server
+   |                   |                          |                        |
+   | 1. Click "Login"  |                          |                        |
+   |------------------>|                          |                        |
+   |                   |                          |                        |
+   |                   | 2. Redirect to AS with   |                        |
+   |                   |    client_id, redirect,  |                        |
+   |                   |    scope, state          |                        |
+   |                   |                          |                        |
+   |          3. Browser follows redirect         |                        |
+   |<---------------------------------------------|                        |
+   |                                              |                        |
+   | 4. Login + see consent screen                |                        |
+   |--------------------------------------------->|                        |
+   |                                              |                        |
+   | 5. Click "Allow"                             |                        |
+   |--------------------------------------------->|                        |
+   |                                              |                        |
+   |           6. Redirect back to client with    |                        |
+   |              authorization code + state      |                        |
+   |<---------------------------------------------|                        |
+   |                                              |                        |
+   |                   |<-------------------------|                        |
+   |                   |                          |                        |
+   |                   | 7. POST /token           |                        |
+   |                   |    code + client_secret  |                        |
+   |                   |------------------------->|                        |
+   |                   |                          |                        |
+   |                   | 8. access_token,         |                        |
+   |                   |    refresh_token         |                        |
+   |                   |<-------------------------|                        |
+   |                   |                          |                        |
+   |                   | 9. GET /drive/files      |                        |
+   |                   |    Authorization: Bearer <token>                  |
+   |                   |-------------------------------------------------->|
+   |                   |                          |                        |
+   |                   | 10. Photo data           |                        |
+   |                   |<--------------------------------------------------|
+```
+
+Tám bước chia thành **hai đoạn**:
+
+- **Front-channel** (bước 1-6): Xảy ra qua browser của user. Dữ liệu đi qua URL (query string). Ai nhìn được browser đều đọc được.
+- **Back-channel** (bước 7-10): Xảy ra server-to-server. Không qua browser. An toàn hơn nhiều.
+
+Thiết kế này tách **nhận dạng user** (front-channel, cần browser) khỏi **trao đổi credentials bí mật** (back-channel, không ai nghe lén được). Đây là lý do flow có bước trung gian "authorization code" — để biên giới hai kênh.
+
+### Bước 1-2: Authorization Request
+
+Client redirect browser của user đến endpoint `/authorize` của AS với các tham số:
+
+```text
+https://accounts.google.com/o/oauth2/v2/auth
+  ?response_type=code
+  &client_id=123456-abc.apps.googleusercontent.com
+  &redirect_uri=https://photoprint.app/oauth/callback
+  &scope=https://www.googleapis.com/auth/drive.readonly
+  &state=xyz789randomvalue
+  &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+  &code_challenge_method=S256
+```
+
+Từng tham số có vai trò riêng:
+
+> **response_type**: Loại response mong muốn. Với Authorization Code Flow, giá trị luôn là `code`. (Giá trị `token` là Implicit flow — đã deprecated, đừng dùng.)
+
+> **client_id**: ID định danh của client, được AS cấp khi đăng ký ứng dụng. Giá trị **public** — ai cũng có thể nhìn thấy trong URL. Bản thân client_id không phải bí mật; việc xác thực client là client_secret (cho confidential client) hoặc PKCE (cho public client).
+
+> **redirect_uri**: URL mà AS sẽ redirect browser về sau khi user đồng ý. **Bắt buộc** phải trùng chính xác với một URI đã đăng ký trước ở AS — đây là một trong những lớp bảo mật quan trọng nhất (xem section Security).
+
+> **scope**: Danh sách quyền mà client xin. Cách phân tách tuỳ provider — Google dùng space-separated URL, GitHub dùng space-separated keyword. Scope xuất hiện trên consent screen để user duyệt.
+
+> **state**: Giá trị ngẫu nhiên do client tạo, sẽ được AS trả về nguyên văn ở bước callback. Dùng để **chống CSRF** và **giữ context** của user. Bắt buộc dùng — sẽ phân tích kỹ ở section Security.
+
+> **code_challenge / code_challenge_method**: Thuộc về PKCE. Giải thích ở section 4.
+
+### Bước 3-6: User authentication và consent
+
+AS hiển thị form đăng nhập (nếu user chưa đăng nhập) rồi đến **consent screen**: *"PhotoPrint wants to: View your Google Drive files. Allow / Deny?"*
+
+Nếu user bấm **Allow**, AS tạo một **authorization code** — chuỗi ngẫu nhiên ngắn, thời hạn thường chỉ 30–60 giây, và **dùng được đúng một lần** — rồi redirect browser về `redirect_uri` kèm code và state:
+
+```text
+https://photoprint.app/oauth/callback
+  ?code=4/0AX4XfWj...long_random_string
+  &state=xyz789randomvalue
+```
+
+Client phải kiểm tra `state` trả về có khớp với giá trị đã gửi đi hay không. Không khớp → huỷ flow (có thể là CSRF attack).
+
+### Bước 7-8: Token exchange
+
+Đây là phần "ma thuật" của Authorization Code Flow. Client **backend** (không phải browser) gửi POST request đến endpoint `/token` của AS:
+
+```text
+POST https://oauth2.googleapis.com/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code
+&code=4/0AX4XfWj...
+&redirect_uri=https://photoprint.app/oauth/callback
+&client_id=123456-abc.apps.googleusercontent.com
+&client_secret=GOCSPX-abc123xyz               <-- confidential client only
+&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+```
+
+AS kiểm tra ba thứ:
+
+1. **Code hợp lệ** — tồn tại, chưa hết hạn, chưa được đổi.
+2. **Client đúng** — client_id khớp với code, client_secret đúng (nếu là confidential client).
+3. **PKCE đúng** — code_verifier băm ra đúng code_challenge đã gửi ở bước 2.
+
+Nếu mọi thứ ok, AS trả về JSON:
+
+```json
+{
+  "access_token": "ya29.a0AfH6...",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "refresh_token": "1//0gKJ3k...",
+  "scope": "https://www.googleapis.com/auth/drive.readonly",
+  "id_token": "eyJhbGciOi..."       // optional — chỉ có nếu scope chứa openid
+}
+```
+
+**Lưu ý**: access_token là thứ để gọi API. refresh_token là thứ để lấy access_token mới khi cái cũ hết hạn — không phải để gọi API trực tiếp. ID token là thứ của OpenID Connect (OIDC), không phải OAuth thuần. Section Tokens sẽ giải thích chi tiết.
+
+### Bước 9-10: Gọi API
+
+Client gắn access_token vào header `Authorization` khi gọi resource server:
+
+```text
+GET https://www.googleapis.com/drive/v3/files
+Authorization: Bearer ya29.a0AfH6...
+```
+
+Resource server verify token (thường bằng cách gọi AS hoặc verify JWT signature nội tại) rồi trả dữ liệu. Token không hợp lệ → `401 Unauthorized`. Token không đủ scope → `403 Forbidden`.
+
+### Tại sao không giao thẳng access token ở bước 6?
+
+Câu hỏi hay. Vì sao không để AS redirect thẳng về client với access_token trong URL, thay vì cái vòng vèo "code rồi đổi code lấy token"?
+
+Câu trả lời: **URL không an toàn cho secret**. Browser history, server access log, HTTP Referer header, extensions — tất cả đều có thể log URL. Nếu access_token nằm trong URL, bất kỳ thành phần nào trong chain đó rò rỉ đều là lộ token (và token có thể dùng để gọi API trực tiếp trong cả giờ đồng hồ).
+
+Authorization code thì ngắn hạn (vài chục giây), chỉ dùng một lần, và cần client_secret hoặc PKCE để đổi — rò rỉ code gần như vô hại. Access token thì ngược lại: thời hạn dài, dùng được trực tiếp.
+
+Đó chính là lý do **Implicit Flow** (trả access token thẳng qua URL fragment) bị deprecated. Authorization Code Flow tách biệt rõ ràng: URL chỉ chứa "vé đổi token", token thật đi qua kênh server-to-server.

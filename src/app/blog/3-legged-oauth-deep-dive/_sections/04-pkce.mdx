@@ -1,0 +1,118 @@
+## PKCE — Proof Key for Code Exchange
+
+Authorization Code Flow gốc giả định client có thể giữ **client_secret** bí mật. Với backend server, giả định này đúng — code chạy trên máy chủ, không ai tiếp cận được file env. Nhưng với **public client** (SPA, mobile app, native app), giả định này sụp đổ hoàn toàn:
+
+- **SPA** (Single Page App): tất cả code JavaScript chạy trên browser của user. Bất kỳ secret nào nhúng trong JS đều xem được qua DevTools.
+- **Mobile app**: file `.apk`/`.ipa` có thể decompile, lôi secret ra trong 5 phút.
+- **Native desktop**: tương tự, binary có thể reverse engineer.
+
+Nếu không có client_secret, điều gì ngăn một **app độc hại** chặn authorization code của user rồi tự đổi code lấy token? Vấn đề này gọi là **authorization code injection/interception attack**, và giải pháp là **PKCE** (đọc là "pixy").
+
+> **PKCE (Proof Key for Code Exchange)**: Cơ chế bổ sung cho Authorization Code Flow, chuẩn hoá ở RFC 7636. Client tạo một "bí mật dùng một lần" (code_verifier) ngay trước khi bắt đầu flow, gửi bản băm của nó (code_challenge) lên AS ở bước authorize, rồi gửi bản gốc ở bước token exchange. AS kiểm tra hash trùng khớp — nếu kẻ tấn công chặn được code, chúng không có verifier nên không đổi được code lấy token.
+
+### Attack mà PKCE chống được
+
+Tình huống trên mobile: user có hai app cài cùng máy — một app hợp pháp "MyBank" và một app độc hại "EvilApp" đã đăng ký cùng custom URL scheme `com.mybank://callback` với OS. Khi MyBank khởi động flow OAuth:
+
+```text
+Without PKCE:
+
+  1. MyBank -> AS: authorize request (client_id, redirect_uri)
+  2. User logs in at AS, approves
+  3. AS -> OS: redirect to com.mybank://callback?code=ABC
+  4. OS -> ??? : which app registered this scheme? <-- race!
+  5. EvilApp wins the race, captures code=ABC
+  6. EvilApp -> AS: POST /token with code=ABC + client_id
+  7. AS -> EvilApp: access_token
+  8. EvilApp now has user's bank data. Game over.
+```
+
+Bước 7 thành công vì AS chỉ kiểm tra client_id — mà client_id là public, EvilApp biết. Không có cách nào AS phân biệt được request đến từ MyBank thật hay EvilApp giả.
+
+PKCE chèn một **bí mật phụ thuộc session** vào flow:
+
+```text
+With PKCE:
+
+  1. MyBank generates random code_verifier (kept in memory)
+  2. MyBank computes code_challenge = SHA256(code_verifier)
+  3. MyBank -> AS: authorize request (+ code_challenge)
+  4. AS stores code_challenge with the issued code
+  5. User logs in, approves
+  6. AS -> OS: redirect with code=ABC
+  7. EvilApp intercepts code=ABC
+  8. EvilApp -> AS: POST /token with code=ABC + (what code_verifier??)
+  9. EvilApp doesn't have the verifier. Request fails.
+```
+
+Điểm mấu chốt: **code_verifier** chỉ tồn tại trong memory của MyBank — nó chưa từng đi ra ngoài qua bất kỳ kênh nào mà EvilApp có thể chặn. Code_challenge đi qua AS nhưng nó là hash; EvilApp không đảo ngược được SHA-256.
+
+### Cơ chế cụ thể
+
+Client tạo code_verifier — chuỗi ngẫu nhiên 43–128 ký tự, URL-safe:
+
+```text
+code_verifier  = dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+                 (43+ chars from [A-Z] [a-z] [0-9] - . _ ~)
+```
+
+Rồi tính code_challenge theo một trong hai method:
+
+- `plain`: `code_challenge = code_verifier` (chỉ dùng khi không thể tính SHA-256 — gần như không bao giờ trong thực tế)
+- `S256`: `code_challenge = BASE64URL(SHA256(code_verifier))` — **luôn dùng cái này**
+
+```text
+Verifier:   dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+            |
+            | SHA-256
+            v
+Hash bytes: 0x13 0xdc 0x9a ... (32 bytes)
+            |
+            | base64url encode, no padding
+            v
+Challenge:  E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+```
+
+### PKCE trong flow
+
+```text
+  CLIENT                   AUTH SERVER    STORE
+   |                            |             |
+   | 1. Generate verifier       |             |
+   |    challenge = hash(v)     |             |
+   |                            |             |
+   | 2. GET /authorize?         |             |
+   |    challenge=H             |             |
+   |--------------------------->|             |
+   |                            |  save H     |
+   |                            |------------>|
+   |                            |             |
+   |         ...consent...      |             |
+   |                            |             |
+   | 3. redirect back w/ code   |             |
+   |<---------------------------|             |
+   |                            |             |
+   | 4. POST /token             |             |
+   |    code + verifier=V       |             |
+   |--------------------------->|             |
+   |                            |  read H     |
+   |                            |<------------|
+   |                            |             |
+   |                            |  check      |
+   |                            |  hash(V)==H |
+   |                            |             |
+   | 5. access_token            |             |
+   |<---------------------------|             |
+```
+
+Ba chi tiết quan trọng cần nhớ:
+
+1. **Verifier chỉ tồn tại trong memory của client** giữa bước 1 và bước 4. Với SPA, thường lưu ở `sessionStorage` (cùng tab) hoặc memory. Không bao giờ log, không bao giờ gửi analytics.
+2. **Mỗi flow tạo verifier mới**. Tái sử dụng verifier phá hỏng mục đích.
+3. **S256 là bắt buộc với public client**. `plain` có trong spec chỉ cho tương thích ngược.
+
+### Confidential client có cần PKCE không?
+
+**Có.** OAuth 2.1 (bản cập nhật đang hoàn thiện) yêu cầu PKCE cho **mọi** client, không chỉ public. Lý do: PKCE chống được cả **authorization code injection** — một attack mà confidential client cũng bị, trong đó attacker có code của nạn nhân và cố inject vào session riêng của mình để đăng nhập thành user khác.
+
+Best practice hiện tại: **luôn dùng PKCE**, kể cả khi client có client_secret. Chi phí thêm là vài dòng code và 0 request; lợi ích là miễn nhiễm với cả một họ attack.

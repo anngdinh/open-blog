@@ -1,0 +1,109 @@
+## Những cạm bẫy thường gặp
+
+Ba section trước đã vẽ "đường đúng". Section này là "bảo tàng sai lầm" — những lỗi mình đã thấy trong code review, pentest report, hoặc incident post-mortem. Nếu đang triển khai 3LO, đọc list này như checklist ngược: bạn đang làm bất kỳ cái nào?
+
+### 1. Dùng Implicit Flow
+
+Triệu chứng: `response_type=token` trong authorize URL, access token trả thẳng qua URL fragment.
+
+Tại sao sai: access token nằm trong `location.hash` — bị log ở browser history, có thể leak qua `document.referrer` nếu redirect lại. Không có token exchange, nên không có cách cấp refresh token an toàn. PKCE không áp dụng được.
+
+Sửa: đổi sang Authorization Code Flow + PKCE. OAuth 2.1 chính thức gỡ bỏ Implicit Flow.
+
+### 2. Thiếu state (hoặc state dễ đoán)
+
+Triệu chứng: không có tham số `state`, hoặc `state=userId123` (đoán được).
+
+Tại sao sai: CSRF attack — attacker inject authorization code của mình vào session của victim. Section Security đã diễn giải kỹ.
+
+Sửa: `state` phải random ≥128 bit, tạo mới mỗi flow, lưu server-side (hoặc cookie có signature), verify exact match ở callback.
+
+### 3. redirect_uri quá lỏng
+
+Triệu chứng: AS đăng ký `https://app.com/*`, hoặc client tự xây redirect_uri từ query param.
+
+Tại sao sai: attacker dùng open redirect trên domain bạn, hoặc XSS trên subdomain, để exfiltrate authorization code.
+
+Sửa: AS whitelist exact match. Client hardcode redirect_uri, không bao giờ lấy từ input.
+
+### 4. Lưu token trong localStorage
+
+Triệu chứng: `localStorage.setItem('access_token', token)`.
+
+Tại sao sai: mọi XSS trong app (hoặc trong dependency) đều đọc được localStorage. Một lần npm install package lừa đảo là mất sạch token của mọi user đang online.
+
+Sửa: với SPA, dùng BFF pattern, token ở backend, SPA dùng session cookie HttpOnly. Nếu **phải** giữ token ở SPA, dùng memory-only (biến JS, mất khi reload) và short-lived access token không refresh token.
+
+### 5. Không kiểm tra `aud` của ID token
+
+Triệu chứng: decode ID token, đọc `email`, log user vào — không check `aud`.
+
+Tại sao sai: attacker có ID token do Google cấp cho app khác (có thể là app của chính attacker). Gửi token đó đến app bạn, nếu bạn tin "Google đã ký = hợp lệ" và login user đó, bạn đang cho attacker đăng nhập vào account trùng email trong app bạn.
+
+Sửa: `aud` phải trùng client_id của bạn. Dùng thư viện OIDC verify đúng chuẩn, đừng tự decode JWT.
+
+### 6. Gửi access token ra ngoài RS được cấp
+
+Triệu chứng: frontend gọi analytics, Sentry, hoặc third-party API có gắn `Authorization: Bearer ...` do nhầm lẫn.
+
+Tại sao sai: third-party giờ có token, có thể gọi RS của bạn. Token cho Google Drive thì không dùng gọi Sentry được, nhưng log của Sentry sẽ chứa token plaintext — leak.
+
+Sửa: separate HTTP client cho các target khác nhau. Chỉ client "gọi RS" mới gắn token.
+
+### 7. Không rotate refresh token, hoặc rotate mà không revoke cái cũ
+
+Triệu chứng: AS trả refresh token như nhau mọi lần; hoặc trả token mới nhưng cái cũ vẫn dùng được.
+
+Tại sao sai: nếu refresh token rò rỉ, attacker giữ quyền truy cập vô thời hạn (thời hạn refresh token có thể là tháng/năm). Không có cơ chế phát hiện.
+
+Sửa: refresh token rotation — AS phát token mới, invalidate token cũ. Nếu thấy token cũ được dùng lại sau khi đã rotate → revoke toàn bộ family (cả refresh chain và active access token) vì có dấu hiệu bị đánh cắp.
+
+### 8. Access token sống quá lâu
+
+Triệu chứng: access token 7 ngày, 30 ngày.
+
+Tại sao sai: token rò rỉ qua log, qua browser extension, qua MitM, qua screenshot — attacker có cả tuần/tháng để khai thác. Revoke khó vì token thường là JWT stateless.
+
+Sửa: access token 15-60 phút là đủ. Client dùng refresh token để lấy mới. Cân bằng giữa overhead (refresh nhiều) và nguy cơ (token leak).
+
+### 9. Consent screen không nói rõ scope
+
+Triệu chứng: scope name obscure, user không hiểu đang đồng ý gì.
+
+Tại sao sai: đây là vấn đề UX nhưng cũng là vấn đề đạo đức. User "click fatigue" — bấm Allow theo quán tính, không hiểu trao quyền gì. Khi có sự cố, họ không biết truy trách nhiệm.
+
+Sửa: với AS riêng, scope phải có `description` rõ ràng, hiển thị consent screen liệt kê từng quyền. Với AS bên thứ ba (Google, GitHub), chọn scope hẹp nhất đủ dùng.
+
+### 10. Log chứa secret
+
+Triệu chứng: server log có `code=...`, `code_verifier=...`, `refresh_token=...`, full `Authorization:` header.
+
+Tại sao sai: log thường được forward đi nhiều nơi — SIEM, log aggregator, backup. Mỗi nơi là một bề mặt tấn công. Một engineer vô tình download log về máy, máy bị infect → lộ.
+
+Sửa: redact ở middleware trước khi log. Whitelist fields được log, đen list query params nhạy cảm. Không bao giờ trust "tôi chỉ log header khi debug, prod không bật".
+
+### 11. Không validate nonce với OIDC
+
+Triệu chứng: dùng OIDC nhưng không gửi `nonce`, hoặc không verify.
+
+Tại sao sai: nonce trong OIDC đóng vai trò giống state nhưng cho **ID token** — chống token replay. Không có nonce, ID token cũ có thể được reuse.
+
+Sửa: tạo nonce random mỗi flow, include trong authorize URL, verify claim `nonce` trong ID token khớp.
+
+### 12. Tin implicit grant khi AS của mình là custom
+
+Triệu chứng: xây AS riêng, hỗ trợ implicit flow vì "dễ cho SPA".
+
+Tại sao sai: thế giới đã tiến bộ — OAuth 2.1 loại implicit, mọi client hiện đại đều hỗ trợ Authorization Code + PKCE. Giữ implicit là cố tình tạo bề mặt tấn công.
+
+Sửa: không hỗ trợ implicit ở AS mới. Nếu có legacy client đang dùng, migrate sớm — document ngưng hỗ trợ có timeline.
+
+### Tóm lại
+
+Phần lớn các lỗi trên đến từ một trong ba nguyên nhân:
+
+1. **Triển khai theo tutorial cũ** (Implicit flow, localStorage token — phổ biến trong tutorial 2015-2018).
+2. **Copy-paste không hiểu** (state = constant, không PKCE).
+3. **"Tối ưu" sai chỗ** (access token dài hạn cho "đỡ refresh").
+
+Cách phòng vệ tốt nhất: đọc RFC 9700 (Best Current Practice 2025), dùng thư viện được cộng đồng review (`oauth2`, `go-oidc`, `oidc-client-ts`), và đừng tự implement JWT verify trừ khi biết rõ mình làm gì.
