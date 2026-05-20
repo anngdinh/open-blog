@@ -1,0 +1,41 @@
+## Tại sao index là câu hỏi phỏng vấn kinh điển?
+
+Nếu bạn từng đi phỏng vấn backend hoặc database engineer, gần như chắc chắn sẽ gặp câu hỏi dạng: *"Index hoạt động thế nào?"*, *"Tại sao truy vấn `LIKE '%abc'` không dùng được index?"*, hoặc *"Khi nào nên dùng B-Tree, khi nào dùng Hash?"*. Lý do rất đơn giản — index là nơi mà **lý thuyết cấu trúc dữ liệu gặp thực tế phần cứng**. Nó kiểm tra cả ba thứ cùng lúc:
+
+1. Bạn có hiểu **cây cân bằng**, **hash table**, **trade-off giữa cấu trúc dữ liệu**?
+2. Bạn có biết **disk I/O đắt hơn memory hàng nghìn lần** và điều đó định hình design ra sao?
+3. Bạn có viết được câu query nhanh trong production, hay chỉ biết `SELECT *`?
+
+Đa số ứng viên trả lời ở mức bề mặt: *"Index giống mục lục sách, giúp tìm nhanh hơn."* Đúng — nhưng quá đủ để cho ra ngoài. Người phỏng vấn muốn xem bạn có thể đi sâu hơn: cấu trúc cây B+ trông như thế nào trên đĩa, tại sao InnoDB lưu data trong leaf node còn PostgreSQL thì không, tại sao Cassandra dùng LSM-Tree thay vì B-Tree, và làm sao một index sai design có thể khiến database chậm đi 100 lần.
+
+Bài này không phải là *cheat sheet*. Tôi sẽ đi từ những điều cơ bản về cách database tổ chức dữ liệu trên đĩa, rồi mổ xẻ từng loại index quan trọng — B+Tree, Hash, LSM-Tree, Bitmap, GIN/GiST, BRIN — kèm **cách chúng được hiện thực thật sự trong MySQL InnoDB và PostgreSQL**. Cuối bài là phần "interview gold": những bẫy thường gặp khi thiết kế index mà câu trả lời chuẩn sẽ làm bạn nổi bật.
+
+> **Index (chỉ mục database)**: Là một cấu trúc dữ liệu phụ trợ được duy trì bên cạnh bảng, cho phép database tìm các hàng thỏa mãn điều kiện mà không phải quét toàn bộ bảng. Đánh đổi là **chi phí ghi tăng lên** (mỗi `INSERT/UPDATE/DELETE` phải cập nhật cả index) và **chi phí lưu trữ thêm**, để đổi lấy **chi phí đọc giảm mạnh**.
+
+Lộ trình của bài:
+
+```text
+What we cover:
+
+  [Foundations]
+  1. Why indexes exist — disk vs memory
+  2. Page-based storage and the cost of random I/O
+
+  [Core data structures]
+  3. B-Tree / B+Tree — the universal workhorse
+  4. Hash indexes — O(1) but limited
+  5. LSM-Tree — write-optimized for modern workloads
+
+  [Specialized]
+  6. Bitmap, GIN, GiST, BRIN — when B-Tree is wrong
+
+  [Implementation]
+  7. MySQL InnoDB clustered index vs PostgreSQL heap+index
+  8. Page splits, fill factor, WAL, and vacuum
+
+  [Interview gold]
+  9. Leftmost prefix, selectivity, covering indexes,
+     index-only scan, function-based indexes, and pitfalls
+```
+
+Nếu bạn đã biết B-Tree căn bản, hãy bỏ qua section 2-3 và nhảy thẳng vào LSM-Tree hoặc phần implementation — ở đó là chỗ nhiều người ngộ ra "à hóa ra nó hoạt động kiểu này".

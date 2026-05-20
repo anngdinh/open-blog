@@ -1,0 +1,102 @@
+## Index chuyên dụng — khi B+Tree là câu trả lời sai
+
+B+Tree đa năng đến mức nhiều người tưởng đó là loại index duy nhất. Sự thật là **PostgreSQL hỗ trợ ít nhất 6 loại** (`btree`, `hash`, `gin`, `gist`, `brin`, `spgist`), Oracle có bitmap index, MongoDB có geospatial, Elasticsearch có inverted index. Mỗi loại được sinh ra để giải bài toán B+Tree không làm tốt.
+
+### Bitmap Index — cardinality thấp, OLAP
+
+Cột "gender" chỉ có 2-3 giá trị. Cột "status" có 10 giá trị. Cột "country" có vài trăm giá trị. Trên cột như vậy, B+Tree gần như vô dụng — một giá trị `gender = 'M'` match nửa bảng, optimizer sẽ chọn full scan.
+
+Bitmap index lưu một **bitmap (vector bit)** cho mỗi giá trị riêng biệt: bit thứ i là 1 nếu hàng i có giá trị đó, ngược lại 0.
+
+> **Bitmap Index**: Index biểu diễn mỗi giá trị riêng biệt bằng một vector bit có độ dài = số hàng. Truy vấn với điều kiện phức tạp (`gender = 'M' AND status = 'active' AND country = 'VN'`) được giải bằng **AND giữa các bitmap** — cực kỳ nhanh trên CPU hiện đại.
+
+```text
+Table 8 rows, column "status":
+  Row:    1 2 3 4 5 6 7 8
+  status: A B A C B A B C
+
+Bitmap for "A":    1 0 1 0 0 1 0 0
+Bitmap for "B":    0 1 0 0 1 0 1 0
+Bitmap for "C":    0 0 0 1 0 0 0 1
+
+Query: status = 'A' OR status = 'B'
+  -> Bitmap_A OR Bitmap_B
+  -> 1 1 1 0 1 1 1 0
+  -> Hàng 1,2,3,5,6,7
+```
+
+Ưu/nhược:
+
+- **Cực nhỏ** cho cardinality thấp (vài bit/hàng).
+- **Truy vấn boolean cực nhanh** — AND/OR/NOT bitmap bằng SIMD instruction.
+- **Tệ với write** — mỗi update phải sửa N bitmap. Lock toàn bộ index cho ngay cả 1 row update.
+
+→ Phù hợp **OLAP / data warehouse** (đọc nhiều, write theo batch). Oracle hỗ trợ trực tiếp; PostgreSQL không có bitmap index lưu trữ nhưng có **bitmap heap scan**, một technique optimizer dùng để kết hợp nhiều B-Tree index tại runtime.
+
+### GIN — Generalized Inverted Index, full-text & JSONB
+
+GIN là **inverted index**: với mỗi *element* của giá trị (mỗi từ trong text, mỗi key/value trong JSONB, mỗi item trong array), lưu danh sách các hàng có chứa element đó. Đây chính là cấu trúc đằng sau Lucene, Elasticsearch, và full-text search của PostgreSQL.
+
+> **GIN (Generalized Inverted Index)**: Index từ "element" tới danh sách các hàng. Tối ưu cho cột có nhiều giá trị bên trong (array, JSONB, tsvector). Nhanh khi query "tài liệu nào chứa từ X", chậm khi update vì một row có thể đụng nhiều entry.
+
+```sql
+-- PostgreSQL full-text search
+CREATE INDEX idx_docs_fts ON documents
+  USING GIN (to_tsvector('english', body));
+
+SELECT * FROM documents
+  WHERE to_tsvector('english', body) @@ to_tsquery('database & index');
+-- Dùng GIN để liệt kê doc ID chứa cả "database" và "index"
+
+-- JSONB index
+CREATE INDEX idx_meta ON events USING GIN (metadata jsonb_path_ops);
+
+SELECT * FROM events WHERE metadata @> '{"action": "login"}';
+```
+
+GIN có **pending list** — một buffer cho các update gần đây, được merge vào index chính định kỳ. Đây là LSM-Tree thu nhỏ bên trong PostgreSQL.
+
+### GiST — Generalized Search Tree, geospatial & range
+
+GiST là một **framework** cho phép tạo index theo loại dữ liệu tùy ý — geometry, range, IP network — bằng cách định nghĩa các operator như "overlaps", "contains", "distance".
+
+> **GiST (Generalized Search Tree)**: Cây search có cấu trúc tương tự B-Tree, nhưng các node lưu **bounding box** (hoặc tương đương) thay vì key. Mỗi loại dữ liệu plug-in cung cấp hàm để tính "có thể chứa kết quả?". Dùng cho PostGIS, range type, IP, ...
+
+PostGIS dùng GiST để answer "tất cả các điểm trong vòng 10km quanh điểm X". Trên một bảng GPS hàng triệu hàng, GiST nhanh hơn full scan vài bậc.
+
+```sql
+CREATE INDEX idx_locations_geom ON locations USING GIST (geom);
+
+-- Tìm điểm gần (10km) một địa điểm
+SELECT * FROM locations
+  WHERE ST_DWithin(geom, ST_MakePoint(106.7, 10.8), 10000);
+```
+
+### BRIN — Block Range Index, dùng cho bảng cực lớn
+
+Một bảng log có 10 tỷ hàng, sort theo `created_at`. B+Tree index trên `created_at` cũng có thể vài chục GB. BRIN giải vấn đề này bằng cách **chỉ lưu min/max cho mỗi range các page**, thay vì chỉ từng hàng.
+
+> **BRIN (Block Range INdex)**: Cho mỗi khối liên tục các page (mặc định 128 page = 1 MB), BRIN lưu min/max của các cột được index. Index BRIN nhỏ hơn B-Tree hàng nghìn lần. Chỉ hữu ích khi data **có thứ tự physical** theo cột index (như timestamp tăng dần).
+
+```sql
+CREATE INDEX idx_logs_time_brin ON logs USING BRIN (created_at);
+
+-- Khi query, BRIN nhanh chóng loại block nào KHÔNG thể chứa kết quả
+SELECT * FROM logs WHERE created_at BETWEEN '2026-05-01' AND '2026-05-02';
+```
+
+Một BRIN index cho 1 tỷ hàng có thể chỉ tốn vài MB. Đánh đổi là **độ chính xác thấp hơn** — sau khi BRIN gợi ý các block khả thi, PostgreSQL vẫn phải scan từng hàng trong các block đó.
+
+### So sánh nhanh
+
+| Loại index | Trường hợp dùng | Insert | Read equality | Read range | Kích thước |
+|---|---|---|---|---|---|
+| B+Tree | Default | Khá | Tốt | **Rất tốt** | Trung bình |
+| Hash | Equality cardinality cao | Tốt | **Tốt nhất** | Không hỗ trợ | Nhỏ |
+| LSM | Write-heavy | **Tốt nhất** | Trung bình | Trung bình | Lớn (trước compaction) |
+| Bitmap | Cardinality thấp, OLAP | Tệ | Trung bình | Trung bình | **Rất nhỏ** |
+| GIN | Full-text, JSONB, array | Tệ | Tốt | Không áp dụng | Lớn |
+| GiST | Geospatial, range | Trung bình | Tốt | **Tốt** | Trung bình |
+| BRIN | Bảng cực lớn sorted | **Tốt nhất** | Yếu (false positive) | **Tốt** với data sorted | **Rất nhỏ** |
+
+Quan trọng nhất là hiểu rằng: **chọn loại index = chọn trade-off**. Không có "best", chỉ có "best for this workload on this hardware".

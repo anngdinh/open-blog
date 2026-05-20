@@ -1,0 +1,174 @@
+## Interview gold — thiết kế index đúng và những cái bẫy phổ biến
+
+Đây là section mà câu trả lời "chuẩn" sẽ làm bạn nổi bật khi phỏng vấn. Mỗi mục là một câu hỏi thường gặp và bẫy đằng sau nó.
+
+### 1. Leftmost prefix rule — vì sao composite index không phải lúc nào cũng dùng được
+
+Index `(a, b, c)` thực ra là một B+Tree sort lexicographically theo `(a, b, c)`. Tức là dữ liệu trên đĩa được sắp xếp:
+
+```text
+(1, 1, 5)
+(1, 1, 9)
+(1, 2, 3)
+(1, 2, 8)
+(2, 1, 1)
+(2, 3, 4)
+...
+```
+
+Index này dùng được cho:
+
+- `WHERE a = ?`
+- `WHERE a = ? AND b = ?`
+- `WHERE a = ? AND b = ? AND c = ?`
+- `WHERE a = ? AND b > ?` (range cuối cùng)
+- `WHERE a = ? ORDER BY b, c`
+
+**Không dùng được hoàn toàn cho**:
+
+- `WHERE b = ?` — không có `a` ở đầu, index vô dụng (trừ khi index skip scan, hiếm)
+- `WHERE c = ?` — tương tự
+- `WHERE a = ? AND c = ?` — chỉ dùng được phần `a`, phần `c` filter sau khi đọc
+
+**Bẫy phỏng vấn**: Nhiều người tưởng "có index trên a,b,c thì query nào liên quan tới a, b, c đều dùng được". Sai. Quy luật là **leftmost prefix** — phải dùng tiền tố trái của index.
+
+> **Leftmost Prefix Rule**: Một composite index `(a, b, c)` chỉ có thể được dùng cho các query có điều kiện trên `a`, hoặc `a` và `b`, hoặc `a` và `b` và `c` — luôn phải bắt đầu từ cột bên trái nhất. Lý do là B+Tree sort theo thứ tự lexicographic.
+
+### 2. Selectivity — index trên cột cardinality thấp gần như vô dụng
+
+Cột `gender` chỉ có Y/N. Index trên nó về mặt lý thuyết có thể tìm "tất cả nam giới", nhưng optimizer sẽ làm gì?
+
+- B-Tree tìm `gender = 'M'`. Match nửa bảng.
+- Cho mỗi entry, phải lookup heap (PostgreSQL) hoặc clustered (InnoDB) → **random I/O cho nửa bảng**.
+- Random I/O 50% bảng đắt hơn sequential scan toàn bảng → **optimizer bỏ index, full scan**.
+
+> **Selectivity**: Tỉ số `cardinality / row_count`. Selectivity gần 1 = mỗi giá trị gần như unique (email, UUID) → index rất hữu ích. Selectivity gần 0 = ít giá trị riêng biệt (gender, status) → index thường vô dụng cho B+Tree.
+
+Quy tắc thực dụng: B+Tree đáng dùng khi **selectivity < 5-10%** của bảng. Dưới ngưỡng đó, optimizer chọn full scan.
+
+**Ngoại lệ**: Cardinality thấp + WHERE rất rare combination (`status = 'archived'` chiếm 0.1%) → vẫn cần một **partial index**:
+
+```sql
+-- PostgreSQL
+CREATE INDEX idx_archived ON orders (id) WHERE status = 'archived';
+
+-- Chỉ index các hàng archived. Cực nhỏ, cực nhanh cho query rất hiếm.
+```
+
+### 3. Function-based index — vì sao `WHERE LOWER(email)` không dùng index
+
+```sql
+CREATE INDEX idx_email ON users (email);
+
+SELECT * FROM users WHERE LOWER(email) = 'alice@x.com';
+-- ^ KHÔNG dùng được index. Index sort theo email gốc, không phải LOWER(email).
+```
+
+Fix: tạo **expression/function index**:
+
+```sql
+CREATE INDEX idx_email_lower ON users (LOWER(email));
+
+SELECT * FROM users WHERE LOWER(email) = 'alice@x.com';
+-- Bây giờ dùng được.
+```
+
+Tương tự với `WHERE DATE(created_at) = '2026-05-20'` — phải tạo index trên `DATE(created_at)` hoặc viết lại thành `created_at >= '2026-05-20' AND created_at < '2026-05-21'`.
+
+### 4. `LIKE '%abc'` không dùng được index — `'abc%'` thì có
+
+B+Tree sort theo prefix. `WHERE name LIKE 'John%'` có thể skip nhanh tới các key bắt đầu bằng "John", và đọc tuần tự đến khi không còn match. Nhưng `WHERE name LIKE '%son'`? Không có prefix → phải scan toàn bộ.
+
+Workaround: nếu thật sự cần suffix search:
+
+- Lưu thêm cột `reverse(name)` và index nó → `WHERE reverse_name LIKE 'nos%'`
+- Dùng **trigram index** (`pg_trgm` ở PostgreSQL) — chia text thành các 3-gram và index chúng. Hỗ trợ wildcard cả hai phía:
+
+```sql
+CREATE EXTENSION pg_trgm;
+CREATE INDEX idx_name_trgm ON users USING GIN (name gin_trgm_ops);
+
+SELECT * FROM users WHERE name LIKE '%son%';
+-- Có thể dùng trigram index
+```
+
+### 5. Implicit cast — index bỗng dưng không hoạt động
+
+```sql
+CREATE INDEX idx_phone ON users (phone);  -- phone VARCHAR
+
+SELECT * FROM users WHERE phone = 1234567;
+-- phone là VARCHAR, 1234567 là INT
+-- MySQL sẽ convert phone -> INT cho TỪNG hàng -> full scan
+```
+
+Fix: dùng đúng kiểu — `WHERE phone = '1234567'`. Hoặc cast tường minh phía ngoài.
+
+### 6. Covering index — tránh "double lookup"
+
+Trên PostgreSQL hoặc trên InnoDB secondary index, query phải đi 2 trip: tìm index → tìm heap/clustered. Nếu cả query chỉ cần cột trong index, có thể skip trip thứ hai = **index-only scan**.
+
+> **Covering Index**: Một index chứa đầy đủ các cột mà query cần, cho phép database trả lời query chỉ bằng cách đọc index, không cần fetch row từ heap. Trong PostgreSQL gọi là *Index Only Scan*. MySQL dùng *Using index* trong EXPLAIN.
+
+```sql
+-- Query thường truy vấn
+SELECT email, name FROM users WHERE email = ?;
+
+-- Index thường: (email)
+-- Phải đi 2 trip để lấy "name"
+
+-- Covering index:
+CREATE INDEX idx_email_name ON users (email, name);
+-- Hoặc PostgreSQL với INCLUDE (cleaner):
+CREATE INDEX idx_email_inc ON users (email) INCLUDE (name);
+-- Bây giờ Index Only Scan
+```
+
+### 7. Index trên `NULL` — câu hỏi mẹo
+
+PostgreSQL B-Tree index bao gồm cả `NULL`. Oracle B-Tree thì *không*. Câu hỏi phỏng vấn cổ điển: *"Tại sao `SELECT * FROM t WHERE col IS NULL` đôi khi không dùng index trên Oracle?"* — câu trả lời là **B-Tree của Oracle bỏ qua NULL, phải tạo bitmap index hoặc function index `(col, 0)`**.
+
+### 8. Đừng tạo quá nhiều index
+
+Mỗi index là **chi phí write**. Insert vào bảng 5 index = 1 lần ghi data + 5 lần update index. Bảng OLTP với 20 index gần như chắc chắn là design sai.
+
+Quy tắc thực dụng:
+
+- Mỗi bảng nên có 5-7 index là max (trừ data warehouse).
+- Luôn drop index không được dùng (PostgreSQL: `pg_stat_user_indexes`, MySQL: `sys.schema_unused_indexes`).
+- Nếu hai index có cùng prefix (`(a)` và `(a, b)`), thường drop được `(a)` — `(a, b)` đã cover.
+
+### 9. UUID v4 làm Primary Key — chuyện cũ nói lại
+
+UUID v4 là ngẫu nhiên. Trên InnoDB (clustered index), insert UUID v4 PK gây:
+
+- Random page split khắp B+Tree.
+- Fragment cao → đọc tệ hơn.
+- Mỗi secondary index lưu UUID 16 byte (so với 4 byte INT).
+
+Giải pháp:
+
+- **UUID v7** (timestamp + random): Vẫn unique toàn cầu, nhưng **sortable theo thời gian**. Insert ở cuối B+Tree, không split.
+- **ULID** (26-char Base32): Tương tự, monotonic.
+- Hoặc dùng INT auto-increment + thêm UUID làm secondary index cho external API.
+
+### 10. Đọc `EXPLAIN` đúng cách
+
+Không có cuộc phỏng vấn database nào không có câu này. Một số manh mối quan trọng:
+
+| Plan keyword | Nghĩa |
+|---|---|
+| `Seq Scan` / `ALL` | Full table scan — index không được dùng |
+| `Index Scan` / `ref` | Dùng index, vẫn đọc heap |
+| `Index Only Scan` / `Using index` | Covering — không đọc heap |
+| `Bitmap Heap Scan` | PostgreSQL combine nhiều index trước khi đọc heap |
+| `Filter:` | Điều kiện áp sau khi đọc — thường nghĩa là index chưa cover hết |
+| `Rows Removed by Filter:` | Cao = index không selective tốt |
+
+Luôn đo bằng `EXPLAIN ANALYZE` (PostgreSQL) hoặc `EXPLAIN ANALYZE FORMAT=JSON` (MySQL 8) trên dữ liệu thật, không phải production stage data.
+
+### Một câu trả lời mẫu cho phỏng vấn
+
+> *"Tôi sẽ tiếp cận theo ba bước: đầu tiên dùng EXPLAIN ANALYZE để xem optimizer thực sự làm gì; thứ hai kiểm tra selectivity của các điều kiện WHERE — nếu thấp, có thể partial index hoặc xem xét cấu trúc khác; thứ ba xem xét leftmost prefix và covering — sắp xếp cột trong composite index theo selectivity giảm dần và include các cột thường được select. Tôi sẽ tránh thêm index nếu chưa đo, vì mỗi index là chi phí write."*
+
+Câu trả lời đó cho thấy bạn không "thuộc lòng" mà *suy nghĩ* về trade-off.

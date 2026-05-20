@@ -1,0 +1,32 @@
+## Kết luận
+
+Index không phải là "mục lục của sách". Nó là một **cấu trúc dữ liệu cẩn thận được thiết kế quanh giới hạn của phần cứng** — page-oriented I/O, sequential vs random, cache locality, write amplification. Mỗi loại index tồn tại để giải quyết một bộ trade-off cụ thể:
+
+- **B+Tree** thống trị OLTP vì cân bằng read/write/range tốt nhất. Cây thấp, fanout cao, leaf liên kết — đúng môi trường của database trên đĩa.
+- **Hash** thắng ở point lookup nhưng mất hoàn toàn range — vì thế chỉ dùng trong workload đặc biệt (in-memory, key-value, AHI ngầm).
+- **LSM-Tree** hy sinh read latency để đạt write throughput cực cao — backbone của Cassandra, RocksDB, ScyllaDB và mọi NoSQL write-heavy ngày nay.
+- **Bitmap, GIN, GiST, BRIN** giải các bài toán đặc biệt — cardinality thấp, full-text, geospatial, bảng cực lớn — mà B+Tree làm tệ.
+
+Hiện thực thật còn nhiều tầng nữa: **clustered vs heap**, **WAL group commit**, **MVCC + VACUUM**, **page split + fill factor**, **bloom filter**, **compaction strategy**. Mỗi tầng là một câu hỏi phỏng vấn tiềm năng — và cũng là một quyết định kỹ thuật bạn sẽ phải làm trên hệ thống thật.
+
+### Bài học cuối cùng
+
+Khi ai đó hỏi "tôi nên tạo index thế nào?", câu trả lời đúng không bao giờ là một quy tắc cứng. Nó là một loạt câu hỏi ngược:
+
+- **Workload** ra sao? Đọc nhiều hay ghi nhiều?
+- **Query pattern** điển hình là gì? Point lookup, range, sort, aggregate?
+- **Cardinality** và **selectivity** của các cột thế nào?
+- **Hardware**: SSD hay HDD? RAM bao nhiêu so với data size?
+- **Đo đạc**: `EXPLAIN ANALYZE` nói gì? Có dead tuple, có bloat, có page split không?
+
+Hiểu sâu index là hiểu sâu **mối liên hệ giữa cấu trúc dữ liệu, phần cứng, và workload**. Đó cũng là lý do nó vẫn là một trong những câu hỏi phỏng vấn yêu thích — nó tách những người thật sự hiểu khỏi những người chỉ học vẹt.
+
+### Tiếp theo nên đọc gì?
+
+- **"Designing Data-Intensive Applications"** của Martin Kleppmann — chapter 3 về Storage và Retrieval là nền tảng vàng.
+- **"Database Internals"** của Alex Petrov — đi vào từng cấu trúc lưu trữ (B-Tree, LSM, Bw-Tree) đến mức implementation.
+- **PostgreSQL Internals** ở [postgrespro.com/community/books](https://postgrespro.com/community/books/internals) — chi tiết về MVCC, VACUUM, index types.
+- **MySQL Reference Manual** — phần *"InnoDB Storage Engine"* là tài liệu chính thức tốt nhất.
+- **The RocksDB Wiki** — học LSM-Tree từ một implementation production-grade.
+
+Khi đọc xong, hãy mở `EXPLAIN ANALYZE` trên một query thật ở dự án của bạn. Đó là khoảnh khắc lý thuyết và thực tế gặp nhau — và là lúc bạn thật sự **học** chứ không chỉ **biết**.

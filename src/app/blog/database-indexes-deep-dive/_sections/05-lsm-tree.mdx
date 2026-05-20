@@ -1,0 +1,115 @@
+## LSM-Tree — vì sao Cassandra, RocksDB, LevelDB không dùng B+Tree
+
+Có một loại workload mà B+Tree dở tệ: **write-heavy với throughput cực cao và key gần như ngẫu nhiên**. Tin nhắn, sự kiện IoT, telemetry, time-series — hàng triệu write/giây, mỗi write đụng vào một page khác nhau. B+Tree sẽ:
+
+1. Page split liên tục → write amplification cao.
+2. Random write trên đĩa → IOPS bão hòa.
+3. Lock contention trên internal node.
+
+Năm 1996, O'Neil, Cheng, Gawlick và O'Neil đề xuất một cấu trúc mới: **Log-Structured Merge Tree (LSM-Tree)**. Ý tưởng: thay vì update tại chỗ, **gom write vào memory, định kỳ ghi xuống đĩa theo sequential I/O, rồi merge ngầm**.
+
+> **LSM-Tree (Log-Structured Merge Tree)**: Cấu trúc lưu trữ write-optimized, gom write vào memory (memtable), flush xuống đĩa thành các file bất biến (SSTable), và định kỳ merge các SSTable theo level để tránh không gian bị đầy. Đánh đổi write tại chỗ → write tuần tự, để có throughput write cực cao.
+
+### Anatomy của LSM-Tree
+
+```text
++----------------------- MEMORY -----------------------+
+|                                                      |
+|  Write -> WAL (append-only log)                      |
+|                                                      |
+|  Memtable (sorted skiplist or red-black tree)        |
+|     [ key1->v, key2->v, key3->v, ... ]               |
+|                                                      |
++------------------ flush when full -------------------+
+                            |
+                            v
++------------------------ DISK ------------------------+
+|                                                      |
+|  Level 0 (newest, may have overlapping ranges)       |
+|     SSTable_001  SSTable_002  SSTable_003            |
+|                                                      |
+|  Level 1 (sorted, no overlap within level)           |
+|     SSTable_L1_a    SSTable_L1_b    ...              |
+|                                                      |
+|  Level 2  (10x size of L1)                           |
+|     ...                                              |
+|                                                      |
+|  Level 3  (10x size of L2)                           |
+|     ...                                              |
+|                                                      |
++------------------------------------------------------+
+```
+
+#### Write path
+
+1. Write vào **WAL** (write-ahead log) — append-only file để recover khi crash.
+2. Insert vào **memtable** trong RAM — thường là skiplist hoặc red-black tree, sorted by key.
+3. Khi memtable đầy (vài MB - vài chục MB), nó **chuyển thành immutable** và bắt đầu một memtable mới.
+4. Một background thread flush memtable đó xuống đĩa thành một **SSTable** (Sorted String Table) ở Level 0.
+
+> **SSTable (Sorted String Table)**: File bất biến trên đĩa chứa các key-value đã sort. Một khi đã ghi, SSTable không bao giờ được sửa, chỉ bị merge với các SSTable khác hoặc bị xóa. Mỗi SSTable kèm theo một **Bloom filter** và một **sparse index** để tăng tốc lookup.
+
+#### Read path
+
+Đọc phải kiểm tra **mọi nơi key có thể tồn tại**, từ mới nhất đến cũ nhất:
+
+```text
+GET key:
+  1. memtable        (RAM, instant)
+  2. immutable mt    (RAM, instant)
+  3. Level 0 SSTables (may overlap, check all)
+  4. Level 1 SSTable (binary search, key range known)
+  5. Level 2 SSTable
+  ...
+  Return first match found.
+```
+
+Đọc tệ hơn B+Tree đấy chứ! Vì sao vẫn dùng? Hai cứu cánh:
+
+- **Bloom filter**: Mỗi SSTable có Bloom filter giúp loại bỏ nhanh "key này chắc chắn không có ở đây", tránh phải đọc đĩa.
+- **Block cache**: Các SSTable nóng được cache trong RAM.
+
+> **Bloom Filter**: Cấu trúc dữ liệu xác suất, dùng nhiều hash function, trả lời "phần tử có trong tập?" bằng **YES có thể** hoặc **NO chắc chắn**. Tỉ lệ false positive cấu hình được (thường 1%). Cực kỳ tiết kiệm bộ nhớ — chỉ vài bit/key.
+
+#### Compaction — bí mật của LSM
+
+Vì SSTable bất biến, khi update hoặc delete xảy ra, các phiên bản cũ vẫn còn. Phải có quá trình **compaction**: định kỳ merge các SSTable, loại bỏ các bản cũ và tombstone (đánh dấu xóa).
+
+> **Compaction**: Quá trình background gộp nhiều SSTable thành ít hơn, loại bỏ duplicate và tombstone, đẩy data xuống level thấp hơn. Là **chi phí ẩn lớn nhất** của LSM-Tree — chiếm I/O và CPU, có thể gây spike latency nếu không tune đúng.
+
+Hai chiến lược compaction phổ biến:
+
+| Chiến lược | Ưu | Nhược |
+|---|---|---|
+| **Size-tiered** (Cassandra default cũ) | Write amplification thấp | Space amplification cao, đọc chậm |
+| **Leveled** (RocksDB, LevelDB) | Read tốt, space amplification thấp | Write amplification cao hơn |
+
+### So sánh thẳng B+Tree vs LSM-Tree
+
+| Đặc điểm | B+Tree | LSM-Tree |
+|---|---|---|
+| Write throughput | Medium | **Rất cao** (sequential write) |
+| Read latency (point lookup) | **Thấp, ổn định** (1-4 I/O) | Trung bình (Bloom filter + nhiều level) |
+| Range scan | **Rất tốt** (linked leaf) | Tốt (merge across levels) |
+| Write amplification | Thấp (1-2x) | Cao (10-50x do compaction) |
+| Space amplification | Thấp | Trung bình (tombstone, duplicate trước compaction) |
+| Crash recovery | Tốt (WAL + checkpoint) | Tốt (WAL + replay memtable) |
+| Workload phù hợp | OLTP truyền thống | Write-heavy, time-series, log |
+
+### Database dùng LSM-Tree
+
+- **Cassandra, ScyllaDB** — distributed NoSQL, time-series.
+- **HBase** — Hadoop-based.
+- **RocksDB** — engine nhúng từ Facebook, dùng trong MySQL MyRocks, CockroachDB, TiKV, YugabyteDB.
+- **LevelDB** — tiền thân RocksDB, từ Google.
+- **InfluxDB** — time-series.
+
+Đáng chú ý là MySQL MyRocks. Facebook viết một storage engine cho MySQL dùng RocksDB thay InnoDB, đạt **2x compression** và giảm write amplification đáng kể cho workload của họ. Đây là ví dụ rõ nhất: không có "best index data structure" — chỉ có **best for the workload**.
+
+### Bài học rút ra cho phỏng vấn
+
+Nếu được hỏi "Cassandra khác MySQL ở chỗ nào về storage?", câu trả lời sâu là:
+
+> *"MySQL InnoDB dùng B+Tree với update tại chỗ — tốt cho OLTP với mix read/write. Cassandra dùng LSM-Tree với sequential write và compaction nền — tối ưu cho write throughput nhưng read phải merge nhiều SSTable, và compaction tạo write amplification cao. Lựa chọn phụ thuộc workload."*
+
+Câu trả lời này đánh thắng 90% ứng viên ở mức "MySQL là SQL, Cassandra là NoSQL".

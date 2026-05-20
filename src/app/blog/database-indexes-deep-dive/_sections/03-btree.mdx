@@ -1,0 +1,109 @@
+## B-Tree và B+Tree — con ngựa kéo của thế giới database
+
+Khi ai đó nói "tôi đã thêm index" mà không nói thêm gì, gần như 100% họ đang nói về **B+Tree index**. Đây là index mặc định của MySQL InnoDB, PostgreSQL, SQL Server, Oracle, SQLite — vì một lý do: nó là cấu trúc cân bằng nhất giữa **read, write, range scan, và disk-friendly**.
+
+### B-Tree gốc — ý tưởng cơ bản
+
+B-Tree do Rudolf Bayer và Edward McCreight đề xuất năm 1970 tại Boeing. Ý tưởng: thay vì binary tree (mỗi node 1 key, 2 children), tạo một cây mà **mỗi node chứa nhiều key và nhiều children** — bằng đúng kích thước một disk page.
+
+> **B-Tree**: Cây tìm kiếm tự cân bằng, mỗi node chứa nhiều key (sorted) và có nhiều children. Tất cả các leaf node ở cùng độ sâu. Một B-Tree bậc *m* có tối đa *m* children và *m-1* key trên mỗi node. Tên "B" chính thức chưa từng được Bayer xác nhận đứng cho từ gì (Balanced, Bayer, Boeing, Broad — đều có thể).
+
+Vì sao "nhiều key trên mỗi node" lại quan trọng? Vì **fanout cao = cây thấp = ít I/O**. Hãy tính nhanh:
+
+- Một page 16KB. Giả sử mỗi key + pointer mất 16 byte → mỗi node chứa ~1000 children.
+- Cây 3 tầng = 1000³ = 1 tỷ key, chỉ cần **3 lần đọc đĩa** để tìm bất kỳ key nào.
+- Cây 4 tầng = 1000⁴ = 1 nghìn tỷ key, chỉ cần **4 lần đọc đĩa**.
+
+Bốn lần I/O cho một nghìn tỷ hàng. Đó là lý do B-Tree vẫn còn ở khắp mọi nơi.
+
+### B+Tree — biến thể được dùng thật sự
+
+Database thực tế không dùng B-Tree nguyên bản, mà dùng **B+Tree** với hai khác biệt quan trọng:
+
+1. **Chỉ leaf node chứa data (hoặc pointer tới data).** Internal node chỉ chứa key dùng làm navigation.
+2. **Leaf node được linked list nối với nhau.** Cho phép range scan tuần tự rất nhanh.
+
+> **B+Tree**: Biến thể của B-Tree mà toàn bộ giá trị (hoặc con trỏ tới giá trị) được lưu ở leaf node. Internal node chỉ giữ key để định tuyến. Các leaf được nối thành doubly-linked list, cho phép `WHERE id BETWEEN 100 AND 500` chỉ cần xuống cây 1 lần rồi đi ngang.
+
+```text
+                    +-----------------+
+                    |   [50]   [100]  |   <- Internal (routing only)
+                    +-----------------+
+                       /      |     \
+                      v       v      v
+              +--------+ +--------+ +-----------+
+              | 10 30  | | 50 70  | | 100 130   |  <- Internal
+              +--------+ +--------+ +-----------+
+                /    \      / \         / \
+               v     v     v   v       v   v
+        +-------+ +------+ ...
+        | 1->R  | | 12->R |
+        | 4->R  | | 25->R |   <-- Leaf: key + row pointer
+        | 9->R  | | 30->R |       Leaf nodes linked left-right
+        +-------+ +------+
+            <-------> linked list <------->
+```
+
+Khác biệt then chốt giữa B-Tree và B+Tree khi range scan:
+
+| Thao tác | B-Tree | B+Tree |
+|---|---|---|
+| Point lookup (`WHERE id = 42`) | O(log n) — có thể dừng sớm ở internal | O(log n) — luôn xuống leaf |
+| Range scan (`WHERE id BETWEEN ...`) | Phải in-order traverse, đi lên xuống nhiều lần | Xuống leaf 1 lần, đi linked list ngang — rất nhanh |
+| Sequential I/O | Khó | Dễ — leaf liền kề về mặt logic, thường liền kề trên đĩa |
+
+### Cách insert hoạt động — page split
+
+Hãy xem điều gì xảy ra khi node bị đầy. Giả sử mỗi leaf chứa được tối đa 4 key:
+
+```text
+Bước 1: Insert 5, 9, 12, 20 -> leaf đầy
+   +-----------------+
+   | [5][9][12][20]  |
+   +-----------------+
+
+Bước 2: Insert 15 -> phải split
+   Tìm giữa: 12. Chia thành 2 leaf, push 12 lên parent.
+
+   Parent:    [12]
+             /    \
+   Leaf:  [5,9]  [12,15,20]
+
+Bước 3: Tiếp tục insert. Khi internal node đầy, nó cũng split,
+        có thể đệ quy lên root. Nếu root split, cây tăng 1 tầng
+        (đây là cách B+Tree luôn cân bằng - growth từ root xuống).
+```
+
+Page split là chi phí ẩn của B+Tree. Mỗi split là:
+
+1. Đọc page sắp đầy.
+2. Allocate page mới.
+3. Copy nửa data sang page mới.
+4. Update parent (có thể trigger split tiếp).
+5. Cập nhật linked list của leaf.
+
+Cấu hình **fill factor** (PostgreSQL) hoặc **MERGE_THRESHOLD** (InnoDB) cho phép bạn để chừa khoảng trống trong page để giảm split. Mặc định PostgreSQL fill factor là 90% cho B-Tree index — 10% còn lại dành cho insert sau này.
+
+> **Fill Factor**: Phần trăm không gian được dùng khi tạo/build lại một page index. Fill factor thấp (ví dụ 70%) giảm page split nhưng tăng kích thước index. Workload write-heavy nên dùng fill factor thấp, workload read-only nên đặt 100%.
+
+### Cây thấp đến cỡ nào trên thực tế?
+
+Tài liệu MySQL InnoDB nói một B+Tree với page 16KB và row key 8 byte có thể chứa khoảng 2000 entries mỗi node. Tương ứng:
+
+- 1 tầng (root only): ~2,000 hàng
+- 2 tầng: ~4 triệu hàng
+- 3 tầng: ~8 tỷ hàng
+- 4 tầng: ~16 nghìn tỷ hàng
+
+Trong hầu hết database thực tế, cây sâu **3-4 tầng là tối đa**. Nếu root + internal được cache trong buffer pool (thường được vì chúng nhỏ), point lookup chỉ tốn **1 I/O** để đọc leaf, đôi khi 0 I/O nếu leaf cũng cached.
+
+### Khi B+Tree không phù hợp
+
+B+Tree không phải lời giải cho mọi bài toán. Nó kém ở:
+
+- **Workload write-heavy với random key**: Mỗi insert là một point write vào random page → write amplification cao → LSM-Tree thắng (xem section 5).
+- **Equality lookup tinh khôi**: Hash index có O(1), B-Tree có O(log n) — nếu không cần range thì hash nhanh hơn (xem section 4).
+- **Full-text search**: B-Tree không hiểu "word inside text". Cần inverted index / GIN (xem section 6).
+- **Very low cardinality**: Một cột chỉ có giá trị Y/N, dùng Bitmap index hiệu quả hơn nhiều.
+
+Nhưng cho **80% use case** — primary key, foreign key, point lookup, range scan, ORDER BY, MIN/MAX — B+Tree là lựa chọn đúng. Đó là lý do nó là **default** ở mọi RDBMS.

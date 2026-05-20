@@ -1,0 +1,66 @@
+## Nền tảng: vì sao database không thể giống một mảng trong RAM
+
+Trước khi nói về cấu trúc của index, phải hiểu **môi trường mà index sống**: ổ đĩa. Database engineer khác application developer ở chỗ này — họ không thể giả định data nằm gọn trong RAM.
+
+### Disk I/O đắt như thế nào?
+
+Một con số kinh điển từ "Latency Numbers Every Programmer Should Know":
+
+| Thao tác | Thời gian | So với 1 CPU cycle |
+|---|---|---|
+| L1 cache reference | 0.5 ns | 1x |
+| Main memory reference (RAM) | 100 ns | 200x |
+| SSD random read 4KB | 16 μs | 32,000x |
+| HDD seek | 10 ms | 20,000,000x |
+
+Đọc một block 4KB từ SSD chậm hơn truy cập RAM khoảng **160 lần**. Trên HDD truyền thống thì chậm hơn **100,000 lần**. Vì thế, database không thể design giống như một mảng trong memory — mỗi lần "chạm" đĩa là một khoản chi phí khổng lồ. **Mục tiêu chính của mọi cấu trúc index là giảm số lần chạm đĩa**, chứ không phải giảm số phép so sánh CPU.
+
+### Page — đơn vị I/O của database
+
+Database không đọc đĩa theo byte hay theo từng hàng. Nó đọc theo **page** (trang) — một block có kích thước cố định, thường là 4KB, 8KB hoặc 16KB. Vì sao? Vì hệ điều hành và disk hardware đều làm việc theo block, và đọc 1 byte cũng tốn chi phí gần như đọc nguyên block.
+
+> **Page (data page, block)**: Là đơn vị I/O cơ bản của database, thường 4KB-16KB. Mỗi page chứa nhiều hàng (rows) hoặc nhiều entry của index. Khi database cần đọc một hàng, nó đọc nguyên page chứa hàng đó vào buffer pool, kể cả khi chỉ cần một cột nhỏ.
+
+Kích thước page của một số database phổ biến:
+
+| Database | Page size mặc định |
+|---|---|
+| MySQL InnoDB | 16 KB |
+| PostgreSQL | 8 KB |
+| SQL Server | 8 KB |
+| Oracle | 8 KB (configurable) |
+| SQLite | 4 KB |
+
+```text
++---------------------------- 16 KB page (InnoDB) -----------------------------+
+| Page Header (38 B) | Page Directory | ... user records ... | Free Space      |
++------------------------------------------------------------------------------+
+                                       ^
+                                       |
+                          Records grow downward, directory grows upward
+```
+
+Một page 16KB có thể chứa khoảng 100-200 hàng tùy schema. Khi bạn `SELECT * FROM users WHERE id = 42`, database không tìm "hàng số 42" — nó tìm page nào chứa hàng đó, đọc cả page vào buffer pool, rồi mới trích hàng ra.
+
+### Buffer pool — cache giữa đĩa và truy vấn
+
+Page đọc lên được giữ trong **buffer pool** (bộ nhớ đệm). Đây là RAM mà database quản lý riêng, không thông qua page cache của OS (thường là vậy, vì DB biết rõ hơn page nào nóng). Lần đọc tiếp theo của cùng page sẽ "hit" buffer pool và không phải chạm đĩa.
+
+> **Buffer Pool**: Vùng RAM database dùng để cache các page đã đọc từ đĩa. Khi page bị thay đổi, nó được đánh dấu *dirty* và sẽ được flush về đĩa sau (thường thông qua background writer + WAL). Buffer pool dùng các thuật toán thay thế như LRU, Clock-sweep, hoặc 2Q.
+
+Đây là lý do thực hành: **một index tốt là index mà các page hot vừa đủ nhỏ để fit trong buffer pool**. Một index 100GB trên server có 32GB RAM sẽ liên tục bị evict và đọc lại từ đĩa.
+
+### Vì sao không dùng binary search trên file sorted?
+
+Nếu data đã sorted theo key, ta có thể binary search trên file. Đúng, và đây từng là cách làm thật sự (ISAM). Vấn đề:
+
+1. **Insert/Update đắt khủng khiếp** — chèn một hàng vào giữa cần dịch chuyển tất cả phía sau, hoặc giữ "overflow pages" mà cuối cùng degrade về linear scan.
+2. **Mỗi bước binary search là một random I/O** — log₂(10⁹) ≈ 30 lần seek, mỗi seek 10ms trên HDD là 300ms cho một query.
+
+Chúng ta cần một cấu trúc:
+
+- **Cân bằng**: Truy cập bất kỳ key nào cũng có chi phí gần như nhau.
+- **Fanout cao**: Mỗi page chứa nhiều children → cây thấp → ít lần I/O.
+- **Update tại chỗ**: Insert/Delete không phá vỡ cấu trúc.
+
+Đó chính là lý do **B-Tree** (và biến thể B+Tree) thống trị thế giới database suốt 50 năm qua. Section sau sẽ mổ xẻ nó.

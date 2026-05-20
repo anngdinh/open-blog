@@ -1,0 +1,80 @@
+## Hash index — O(1) nhưng kém vạn năng
+
+Nếu B+Tree là con dao đa năng, **hash index** là con dao mổ — chỉ một nhiệm vụ, nhưng làm cực kỳ tốt: **point lookup theo equality**.
+
+### Ý tưởng
+
+Hash index dùng đúng hash table mà bạn học ở môn cấu trúc dữ liệu:
+
+1. Tính `h = hash(key)`.
+2. `slot = h mod n` (n là số bucket).
+3. Trong bucket có một danh sách (linked list / open addressing) chứa các entry trùng hash.
+4. So sánh key thật để loại bỏ collision.
+
+Độ phức tạp: **O(1) trung bình** cho `WHERE key = 'x'`. So với O(log n) của B-Tree, với 1 tỷ row, hash nhanh hơn ~30 lần về số phép so sánh.
+
+> **Hash Index**: Cấu trúc index dùng hash function để map key thành bucket. Truy vấn equality cực nhanh nhưng KHÔNG hỗ trợ range scan, sorting, hoặc tìm prefix. Tự sửa lại kích thước khi load factor vượt ngưỡng (linear hashing, extendible hashing).
+
+### Vì sao không thay B+Tree?
+
+Hash index có **ba điểm yếu chí mạng**:
+
+1. **Không hỗ trợ range** (`WHERE id > 100`, `BETWEEN`, `ORDER BY`). Hash phá vỡ thứ tự — hai key liền kề có hash ngẫu nhiên ở hai góc bucket khác nhau.
+2. **Không hỗ trợ prefix lookup** (`WHERE name LIKE 'John%'`). Cùng lý do.
+3. **Memory-friendly nhưng disk-unfriendly**. Mỗi point lookup là một **random I/O** vào một bucket bất kỳ — tệ trên HDD, kém hiệu quả khi index lớn hơn buffer pool.
+
+### Hash trong database thực tế
+
+#### MySQL InnoDB — Adaptive Hash Index
+
+InnoDB có một tính năng đặc biệt gọi là **Adaptive Hash Index (AHI)**. Đây *không phải* là loại index bạn tạo bằng `CREATE INDEX`. Nó là cache nằm bên trong buffer pool, InnoDB tự động xây dựng cho các index thường xuyên được dùng equality lookup.
+
+> **Adaptive Hash Index (AHI)**: Một hash table chạy ngầm bên trong buffer pool của InnoDB. Khi InnoDB phát hiện một secondary index được truy cập rất nhiều bằng equality, nó tự xây hash entry trỏ trực tiếp tới leaf node của B+Tree, bỏ qua việc đi từ root xuống. Có thể bật/tắt bằng `innodb_adaptive_hash_index`.
+
+```text
+Without AHI:                     With AHI hit:
+                                                       
+  SQL: WHERE id = 42               SQL: WHERE id = 42
+   |                                |
+   v                                v
+  [Root]      <- I/O #1            [Hash Bucket] - O(1) memory
+   |                                |
+  [Internal]  <- I/O #2             |
+   |                                |
+  [Leaf]      <- I/O #3       ----> [Leaf] - direct pointer
+   |                                |
+  Found row                         Found row
+```
+
+AHI giúp tăng tốc đáng kể workload OLTP với key lookup, nhưng nó **không thay thế** B+Tree gốc — nó chỉ là một shortcut. Trên các workload random key insert nặng, AHI có thể bị contention cao và team thường tắt nó đi.
+
+#### MySQL MEMORY engine
+
+MEMORY engine (RAM-only, không persist) **mặc định dùng hash index**. Phù hợp cho lookup table tạm thời, vì range scan trên MEMORY rất hiếm.
+
+#### PostgreSQL hash index
+
+PostgreSQL có `CREATE INDEX ... USING HASH`. Trước phiên bản 10, hash index của PostgreSQL **không được WAL log**, nghĩa là không crash-safe — gần như không ai dùng. Từ PostgreSQL 10, đã được fix nhưng vẫn hiếm khi dùng vì:
+
+- Chỉ hỗ trợ `=` operator
+- B+Tree đã rất nhanh cho equality
+- Tradeoff hiếm khi đủ thuyết phục
+
+```sql
+-- PostgreSQL hash index syntax
+CREATE INDEX idx_users_email_hash ON users USING HASH (email);
+
+-- Only supports = operator. Following will NOT use this index:
+SELECT * FROM users WHERE email > 'm';        -- range, hash unusable
+SELECT * FROM users WHERE email LIKE 'a%';    -- prefix, hash unusable
+SELECT * FROM users ORDER BY email;           -- sort, hash unusable
+```
+
+### Khi nào hash index có ý nghĩa?
+
+- **Key-value store thuần** (Redis, Memcached): Bản chất là hash table khổng lồ.
+- **In-memory database** (SAP HANA, Memcached): Random I/O không còn là vấn đề.
+- **Equality-only workload với cardinality cao**: Bảng session lookup theo UUID, bảng cache theo key.
+- **Khi B+Tree quá sâu**: Hiếm gặp ngày nay với buffer pool lớn.
+
+Với hầu hết workload OLTP truyền thống, **bạn không cần** chủ động tạo hash index. B+Tree đã đủ nhanh, và range scan luôn là tính năng mà sớm hay muộn bạn cũng cần.

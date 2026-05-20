@@ -1,0 +1,74 @@
+---
+title: "Database Index Deep Dive: Từ B+Tree đến LSM-Tree và những bẫy phỏng vấn"
+description: "Đào sâu cách database index hoạt động — page-oriented storage, B+Tree, Hash, LSM-Tree, Bitmap, GIN, GiST, BRIN — và cách MySQL InnoDB cùng PostgreSQL thực sự hiện thực chúng. Kèm phân tích các bẫy thiết kế index thường gặp trong phỏng vấn."
+date: 2026-05-20
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+import Introduction from "./_sections/01-introduction.mdx";
+import StorageFundamentals from "./_sections/02-storage-fundamentals.mdx";
+import BTree from "./_sections/03-btree.mdx";
+import Hash from "./_sections/04-hash.mdx";
+import LsmTree from "./_sections/05-lsm-tree.mdx";
+import Specialized from "./_sections/06-specialized.mdx";
+import Implementation from "./_sections/07-implementation.mdx";
+import Pitfalls from "./_sections/08-pitfalls.mdx";
+import Conclusion from "./_sections/09-conclusion.mdx";
+
+export const metadata = generateBlogMetadata({
+  title: "Database Index Deep Dive: Từ B+Tree đến LSM-Tree và những bẫy phỏng vấn",
+  description: "Đào sâu cách database index hoạt động — page-oriented storage, B+Tree, Hash, LSM-Tree, Bitmap, GIN, GiST, BRIN — và cách MySQL InnoDB cùng PostgreSQL thực sự hiện thực chúng. Kèm phân tích các bẫy thiết kế index thường gặp trong phỏng vấn.",
+  date: "2026-05-20",
+  slug: "database-indexes-deep-dive"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/database-indexes-deep-dive/cover.jpg"
+    alt="Server rack representing database storage and indexing infrastructure"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+<Introduction />
+<StorageFundamentals />
+<BTree />
+<Hash />
+<LsmTree />
+<Specialized />
+<Implementation />
+<Pitfalls />
+<Conclusion />
+
+## References
+
+- [Designing Data-Intensive Applications — Martin Kleppmann, Chapter 3](https://dataintensive.net/)
+- [Database Internals — Alex Petrov](https://www.databass.dev/)
+- [PostgreSQL Documentation: Indexes](https://www.postgresql.org/docs/current/indexes.html)
+- [PostgreSQL Internals — postgrespro.com](https://postgrespro.com/community/books/internals)
+- [MySQL Reference Manual: InnoDB Storage Engine](https://dev.mysql.com/doc/refman/8.0/en/innodb-storage-engine.html)
+- [MySQL Reference Manual: B-Tree and Hash Indexes](https://dev.mysql.com/doc/refman/8.0/en/index-btree-hash.html)
+- [The Log-Structured Merge-Tree (O'Neil et al., 1996)](https://www.cs.umb.edu/~poneil/lsmtree.pdf)
+- [RocksDB Wiki — LSM-Tree implementation reference](https://github.com/facebook/rocksdb/wiki)
+- [Use The Index, Luke! — SQL indexing tutorial by Markus Winand](https://use-the-index-luke.com/)
+- [Latency Numbers Every Programmer Should Know — Jeff Dean](https://gist.github.com/jboner/2841832)
+
+### Related posts
+
+- [Clean Architecture in Go](/blog/clean-architecture) - Thiết kế ứng dụng sạch, tách biệt với hạ tầng (bao gồm tầng database)
+- [Golang Goroutines Deep Dive](/blog/golang-goroutines-deep-dive) - Một deep dive cùng style về concurrency runtime
+- [eBPF Deep Dive](/blog/ebpf-deep-dive) - Deep dive về một công nghệ kernel khác

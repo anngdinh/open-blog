@@ -1,0 +1,139 @@
+## Hiện thực thật trong MySQL InnoDB và PostgreSQL
+
+Cùng đều là B+Tree, nhưng MySQL InnoDB và PostgreSQL hiện thực rất khác nhau. Hiểu sự khác biệt này là một trong những câu hỏi phỏng vấn nâng cao mà người hỏi dùng để phân biệt "biết" với "thật sự hiểu".
+
+### MySQL InnoDB — Clustered index, mọi thứ là B+Tree
+
+InnoDB lưu **toàn bộ bảng** bên trong một B+Tree, sort theo **primary key**. Tức là dữ liệu không nằm trong "heap file" riêng — leaf node của B+Tree primary key **chính là data**.
+
+> **Clustered Index (Index-Organized Table)**: Mô hình mà data của bảng được lưu trực tiếp trong leaf node của một B+Tree theo primary key. Mỗi bảng có đúng một clustered index. InnoDB, SQL Server, Oracle (IOT mode) dùng mô hình này.
+
+```text
+InnoDB primary key B+Tree (also the table itself):
+
+                    Internal nodes (PK only)
+                          [50]
+                         /    \
+              [10,30]              [70,90]
+              /  |  \              /  |  \
+           leaf  leaf leaf       leaf leaf leaf
+
+   Leaf node:
+   +----------------------------------------+
+   | PK=10 | name=Alice | age=30 | ...      |
+   | PK=11 | name=Bob   | age=25 | ...      |
+   | PK=13 | name=Carol | age=40 | ...      |
+   +----------------------------------------+
+   ^^^^^^   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   PK       Toàn bộ row data nằm tại đây
+```
+
+**Hệ quả 1: Primary key lookup cực nhanh**. Một I/O xuống leaf là có row đầy đủ. Không cần "trip" thứ hai.
+
+**Hệ quả 2: Secondary index trỏ tới PK, không phải vị trí vật lý**.
+
+```text
+Secondary index on `email`:
+
+   +-------------------+
+   | email -> PK       |
+   +-------------------+
+   | alice@x.com -> 10 |
+   | bob@x.com   -> 11 |
+   | carol@x.com -> 13 |
+   +-------------------+
+
+Query: SELECT * FROM users WHERE email='alice@x.com'
+  Step 1: B+Tree lookup email -> PK=10        (3-4 I/O)
+  Step 2: B+Tree lookup PK=10 -> row data     (3-4 I/O, "double lookup")
+```
+
+Đây là lý do **PK của InnoDB nên ngắn và đơn điệu tăng dần** (auto-increment INT, BIGINT, hoặc ULID/sortable UUID). Mỗi secondary index lưu kèm PK ở mỗi entry. Nếu PK là VARCHAR(256), mỗi secondary index sẽ phình ra rất nhiều.
+
+**Hệ quả 3: Insert ngẫu nhiên gây page split**. Auto-increment PK sẽ luôn append vào leaf cuối cùng — không split. Random PK (UUID v4) sẽ rải khắp B+Tree, gây split liên tục, fragment cao. Đây là *lý do thực dụng* để team thường tránh UUID v4 làm PK.
+
+### PostgreSQL — Heap file + index riêng
+
+PostgreSQL có triết lý khác: data sống trong **heap file** (file không sort, không cấu trúc), index là cấu trúc riêng trỏ tới **physical location** (TID — Tuple ID = page + slot).
+
+> **Heap Table**: Mô hình mà data lưu trong file không sort — hàng mới chỉ append vào page có chỗ trống. Index lưu (key -> TID). PostgreSQL, MySQL MyISAM, Oracle (default), SQL Server (nếu không có clustered index) dùng mô hình này.
+
+```text
+PostgreSQL:
+
+  Heap file (unordered):
+  +---------------------------+
+  | Page 0: row, row, row     |
+  | Page 1: row, row, row     |
+  | Page 2: row, row, row     |
+  +---------------------------+
+
+  Index on `email`:
+  +--------------------------------+
+  | email -> (page_no, slot_no)    |
+  +--------------------------------+
+  | alice@x.com -> (Page 2, slot 1)|
+  | bob@x.com   -> (Page 0, slot 3)|
+  +--------------------------------+
+
+  Query: SELECT * FROM users WHERE email='alice@x.com'
+    Step 1: B+Tree lookup -> TID (1-3 I/O)
+    Step 2: Read heap Page 2 slot 1     (1 I/O)
+```
+
+**Hệ quả 1: Index lookup luôn là two-step** (trừ index-only scan).
+
+**Hệ quả 2: Primary index không đặc biệt** — nó là một B-Tree index như mọi index khác.
+
+**Hệ quả 3: MVCC tạo "dead tuple"**. PostgreSQL không update tại chỗ — mỗi `UPDATE` viết một version mới (mới TID), version cũ vẫn còn. Việc dọn version cũ là nhiệm vụ của **VACUUM**.
+
+> **MVCC (Multi-Version Concurrency Control)**: Cơ chế PostgreSQL dùng để cho phép nhiều transaction đọc đồng thời mà không lock. Mỗi row có metadata `xmin/xmax` cho biết transaction nào tạo và xóa nó. Hệ quả là sau update/delete, các bản cũ vẫn nằm trong heap cho đến khi VACUUM dọn.
+
+#### Heap-Only Tuple (HOT) update
+
+Nếu một update không thay đổi cột nào có index, và page còn chỗ trống, PostgreSQL có thể tạo version mới **trong cùng page** và bỏ qua việc cập nhật index. Đây gọi là **HOT update**, rất nhanh.
+
+#### Index-only scan
+
+Nếu tất cả các cột được query đều có trong index, PostgreSQL có thể đọc thẳng từ index mà không cần đi tới heap. Nhưng vì MVCC, nó cần kiểm tra tuple có visible với transaction hiện tại không — thông qua **visibility map**. Nếu page tương ứng đã "all visible", VACUUM sẽ đánh dấu trong visibility map, và index-only scan thật sự thành công.
+
+```sql
+CREATE TABLE users (id INT, email TEXT, name TEXT);
+CREATE INDEX idx_email ON users (email) INCLUDE (name);
+
+-- Có thể index-only scan: chỉ cần email + name
+EXPLAIN ANALYZE SELECT name FROM users WHERE email = 'a@x.com';
+-- Index Only Scan using idx_email
+```
+
+### Side-by-side: InnoDB vs PostgreSQL
+
+| Đặc điểm | InnoDB | PostgreSQL |
+|---|---|---|
+| Tổ chức bảng | Clustered B+Tree theo PK | Heap (unordered) + index riêng |
+| Lookup theo PK | 1 trip (data ở leaf) | 2 trip (index -> heap) |
+| Lookup theo secondary | 2 trip (sec -> PK -> data) | 2 trip (sec -> heap) |
+| Update | In-place + undo log | Insert new version + VACUUM |
+| Sortable PK quan trọng? | **Rất** — random PK gây split | Không quan trọng — heap append |
+| Index-only scan | Cover index OK | Index Only Scan + Visibility Map |
+| Garbage cleanup | Purge thread (undo log) | VACUUM (autovacuum) |
+| Page size mặc định | 16 KB | 8 KB |
+
+### WAL — backbone của crash safety ở cả hai
+
+Cả hai đều dùng **Write-Ahead Log**: ghi vào log file (sequential, fsync) **trước** khi sửa page trong buffer pool. Khi crash, replay log để recover.
+
+> **WAL (Write-Ahead Log)**: Log append-only ghi mọi thay đổi page **trước khi** page đó được flush xuống đĩa. Đảm bảo durability — nếu crash, replay log từ checkpoint cuối cùng sẽ restore lại state. MySQL gọi là redo log; PostgreSQL gọi là WAL.
+
+WAL hai tác dụng:
+
+1. **Sequential I/O nhanh hơn random** — gom mọi modification thành sequence ghi tuần tự.
+2. **fsync 1 lần cho nhiều thay đổi** — group commit gộp nhiều transaction vào 1 fsync.
+
+Đây là lý do mà ngay cả với LSM-Tree, vẫn cần WAL — memtable chỉ ở RAM, mất là mất hết nếu không log trước.
+
+### Practical takeaway
+
+- **InnoDB**: Thiết kế schema với PK ngắn, đơn điệu tăng. Tránh quá nhiều secondary index trên bảng lớn.
+- **PostgreSQL**: Để autovacuum tune đúng. Hiểu visibility map nếu muốn index-only scan thật sự work. Watch bloat.
+- **Cả hai**: Đo `EXPLAIN ANALYZE` thật, đừng đoán.
