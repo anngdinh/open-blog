@@ -1,0 +1,88 @@
+---
+title: "Container the Hard Way: Mổ xẻ container từ namespace tới runtime"
+description: "Deep dive về cách container thực sự hoạt động — namespace, cgroup, OverlayFS, capability, seccomp, OCI runtime, networking, và các công nghệ ảo hoá thay thế như gVisor, Kata, Firecracker. Tự dựng một container bằng tay không Docker."
+date: 2026-05-22
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+import Introduction from "./_sections/01-introduction.mdx";
+import VmVsContainer from "./_sections/02-vm-vs-container.mdx";
+import Namespaces from "./_sections/03-namespaces.mdx";
+import Cgroups from "./_sections/04-cgroups.mdx";
+import Filesystem from "./_sections/05-filesystem.mdx";
+import Security from "./_sections/06-security.mdx";
+import RuntimeStack from "./_sections/07-runtime-stack.mdx";
+import Networking from "./_sections/08-networking.mdx";
+import FromScratch from "./_sections/09-from-scratch.mdx";
+import Alternatives from "./_sections/10-alternatives.mdx";
+import Conclusion from "./_sections/11-conclusion.mdx";
+
+export const metadata = generateBlogMetadata({
+  title: "Container the Hard Way: Mổ xẻ container từ namespace tới runtime",
+  description: "Deep dive về cách container thực sự hoạt động — namespace, cgroup, OverlayFS, capability, seccomp, OCI runtime, networking, và các công nghệ ảo hoá thay thế như gVisor, Kata, Firecracker. Tự dựng một container bằng tay không Docker.",
+  date: "2026-05-22",
+  slug: "container-the-hard-way"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/container-the-hard-way/cover.jpg"
+    alt="Stacks of colorful shipping containers symbolizing software containers and isolated workloads"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+<Introduction />
+<VmVsContainer />
+<Namespaces />
+<Cgroups />
+<Filesystem />
+<Security />
+<RuntimeStack />
+<Networking />
+<FromScratch />
+<Alternatives />
+<Conclusion />
+
+## References
+
+- [Linux Programmer's Manual — namespaces(7)](https://man7.org/linux/man-pages/man7/namespaces.7.html)
+- [Linux Programmer's Manual — cgroups(7)](https://man7.org/linux/man-pages/man7/cgroups.7.html)
+- [Linux Programmer's Manual — capabilities(7)](https://man7.org/linux/man-pages/man7/capabilities.7.html)
+- [Linux Programmer's Manual — seccomp(2)](https://man7.org/linux/man-pages/man2/seccomp.2.html)
+- [Linux Kernel Documentation — Control Group v2](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)
+- [OCI Runtime Specification](https://github.com/opencontainers/runtime-spec)
+- [OCI Image Specification](https://github.com/opencontainers/image-spec)
+- [OCI Distribution Specification](https://github.com/opencontainers/distribution-spec)
+- [runc — CLI tool for spawning OCI containers](https://github.com/opencontainers/runc)
+- [containerd — Industry-standard container runtime](https://containerd.io/)
+- [CRI-O — Lightweight container runtime for Kubernetes](https://cri-o.io/)
+- [Container Networking Interface (CNI) Specification](https://github.com/containernetworking/cni/blob/main/SPEC.md)
+- [OverlayFS Documentation — Linux Kernel](https://www.kernel.org/doc/html/latest/filesystems/overlayfs.html)
+- ["Build Your Own Container Using Less than 100 Lines of Bash" — Jess Frazelle](https://github.com/jessfraz/dockerfiles)
+- ["Containers From Scratch" — Liz Rice (GopherCon 2017)](https://www.youtube.com/watch?v=8fi7uSYlOdc)
+- [gVisor — Application Kernel for Containers](https://gvisor.dev/docs/)
+- [Kata Containers Documentation](https://katacontainers.io/docs/)
+- [Firecracker MicroVM — AWS](https://firecracker-microvm.github.io/)
+- [WasmEdge — WebAssembly Runtime](https://wasmedge.org/)
+
+### Related posts
+
+- [Container Networking from Scratch](/blog/container-networking-from-scratch) - Đi sâu vào phần networking layer của container
+- [Kubernetes CNI Overview](/blog/kubernetes-cni-overview) - CNI plugins và cách Kubernetes orchestrate container networking
+- [eBPF Deep Dive](/blog/ebpf-deep-dive) - Quan sát và bảo vệ container ở tầng kernel bằng eBPF
+- [Clean Architecture in Go](/blog/clean-architecture) - Code architecture, một góc khác của software engineering

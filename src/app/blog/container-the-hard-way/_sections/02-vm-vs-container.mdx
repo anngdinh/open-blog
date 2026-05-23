@@ -1,0 +1,83 @@
+## VM vs Container — hai cách "ảo hoá" khác nhau về bản chất
+
+Để hiểu container, phải hiểu nó *không phải* là gì trước đã. Người ta hay nói "container là VM nhẹ", nhưng đó là phép so sánh nguy hiểm — vì nó che mất một sự thật quan trọng: **VM và container ảo hoá ở hai tầng hoàn toàn khác nhau, dẫn đến hai mô hình bảo mật và performance khác nhau**.
+
+### Virtual Machine — ảo hoá phần cứng
+
+Một máy ảo (VM) ảo hoá ở **tầng hardware**. Một hypervisor (KVM, VMware ESXi, Hyper-V, Xen) giả lập một bộ CPU, RAM, disk, NIC ảo — và mỗi VM cài một **kernel riêng**, một hệ điều hành đầy đủ trên đó. Hai VM trên cùng host hoàn toàn không biết tới nhau ở tầng OS.
+
+> **Hypervisor**: Phần mềm tạo và quản lý máy ảo, đứng giữa phần cứng vật lý và các OS khách. Type-1 (bare-metal: ESXi, Xen, KVM) chạy trực tiếp trên phần cứng; Type-2 (hosted: VirtualBox, VMware Workstation) chạy như một ứng dụng trên một OS chủ.
+
+> **Guest OS**: Hệ điều hành chạy bên trong máy ảo. Mỗi VM có kernel riêng — một host Linux có thể chạy đồng thời các guest Windows, Linux, FreeBSD mà không xung đột.
+
+### Container — ảo hoá hệ điều hành (OS-level)
+
+Container ảo hoá ở **tầng OS**. **Tất cả container trên cùng host đều chia sẻ chung một kernel** — kernel của host. Cái gọi là "ảo hoá" thật ra chỉ là kernel tự nó *trình bày* một view khác cho process: khi container hỏi "có những process nào đang chạy?", kernel chỉ trả về các process trong PID namespace của nó.
+
+Không có CPU ảo. Không có RAM ảo. Không có disk ảo. Process trong container chạy trực tiếp trên CPU của host, gọi syscall trực tiếp vào kernel của host. Kernel chỉ làm hai việc thêm: (1) lọc view (namespace) và (2) áp hạn mức (cgroup).
+
+```text
+VM model:
+
+  +-----------+ +-----------+ +-----------+
+  | App A     | | App B     | | App C     |
+  | libs      | | libs      | | libs      |
+  | Guest OS  | | Guest OS  | | Guest OS  |
+  | + kernel  | | + kernel  | | + kernel  |
+  +-----------+ +-----------+ +-----------+
+        |             |             |
+        v             v             v
+  +---------------------------------------+
+  |           Hypervisor (KVM/ESXi)       |
+  +---------------------------------------+
+  |              Host hardware            |
+  +---------------------------------------+
+
+
+Container model:
+
+  +-----------+ +-----------+ +-----------+
+  | App A     | | App B     | | App C     |
+  | libs      | | libs      | | libs      |
+  +-----------+ +-----------+ +-----------+
+        |             |             |
+        v             v             v
+  +---------------------------------------+
+  |        ONE shared Linux kernel        |
+  |  (namespaces + cgroups + LSM filter)  |
+  +---------------------------------------+
+  |              Host hardware            |
+  +---------------------------------------+
+```
+
+Chú ý sự khác biệt then chốt: phía VM, mỗi guest có **một kernel riêng**. Phía container, **chỉ có duy nhất một kernel** — của host. Tất cả container đều "ngồi chung" trên kernel đó.
+
+### So sánh trực tiếp
+
+| Tiêu chí | Virtual Machine | Container |
+|---|---|---|
+| Tầng ảo hoá | Phần cứng (hypervisor) | OS / kernel features |
+| Kernel | Mỗi VM có 1 kernel riêng | Tất cả container dùng chung kernel host |
+| Khởi động | Giây tới phút (boot OS) | Mili-giây tới giây |
+| Image size | GB (chứa cả OS) | MB (chỉ app + libs) |
+| Overhead | Cao (RAM, CPU cho mỗi guest OS) | Gần như zero so với process thường |
+| Isolation strength | Mạnh — vi phạm phải xuyên qua hypervisor | Yếu hơn — chung kernel, vi phạm syscall = thoát container |
+| Multi-OS | Có thể chạy Windows trên host Linux | Container Linux chỉ chạy trên kernel Linux (Windows có Windows container riêng) |
+| Use case điển hình | Multi-tenant cloud, legacy app, OS khác | Microservice, CI/CD, dev environment, scale-out |
+
+### Tại sao container ra đời?
+
+Nếu VM mạnh hơn về isolation và đã có sẵn từ những năm 2000, tại sao container vẫn xuất hiện và chiếm lĩnh? Vì **trade-off của VM quá đắt cho workload mới**:
+
+1. **Tốc độ deploy.** Microservice cần scale lên xuống trong vài giây. Boot một VM mất 30-60 giây — đủ lâu để mất user khi traffic spike. Container start trong dưới 1 giây.
+2. **Mật độ.** Một server có thể chạy 5-10 VM cùng lúc trước khi RAM cạn (mỗi guest OS tự ngốn 256MB-1GB). Cùng server đó chạy được hàng trăm container.
+3. **Image portability.** VM image hàng chục GB, copy giữa môi trường khó. Container image vài chục MB, push lên registry, pull về ở đâu cũng được — và nhờ layered filesystem (sẽ nói ở section 5), chỉ tải về phần chênh lệch.
+4. **Dev/prod parity.** "Works on my machine" giảm hẳn khi cả dev và prod chạy cùng một container image.
+
+Đổi lại, container *yếu hơn* về isolation. Một kernel exploit (CVE-2022-0185 trong filesystem, hay CVE-2022-0492 trong cgroup release_agent) có thể cho phép process bên trong container thoát ra root của host. VM thì không — bạn phải vượt qua cả guest kernel và hypervisor.
+
+### Hybrid: container nhưng có VM bao quanh
+
+Vì trade-off bảo mật ấy, có một dòng giải pháp lai: **micro-VM** hoặc **sandboxed container**. Container vẫn được orchestrate bằng Kubernetes/Docker, nhưng dưới đáy là một micro-VM (Firecracker, Cloud Hypervisor) hoặc một userspace kernel (gVisor). Section 10 sẽ đào sâu phần này.
+
+Hiểu xong nền tảng — **container là process + namespace + cgroup**. Phần còn lại của bài chia ra từng thành phần, mổ xẻ. Bắt đầu từ "trái tim" của isolation: namespaces.

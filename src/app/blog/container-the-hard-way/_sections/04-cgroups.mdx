@@ -1,0 +1,172 @@
+## Cgroups — giới hạn process được "ăn" bao nhiêu
+
+Namespace cho process một thế giới riêng để nhìn. Nhưng nếu không có gì giới hạn, process trong container vẫn có thể ngốn hết RAM của host, kéo CPU lên 100%, làm DoS các container khác. Đó là vai trò của **cgroups** (control groups): giới hạn và đo đếm tài nguyên.
+
+> **cgroup (control group)**: Tính năng kernel cho phép gom một hoặc nhiều process vào một nhóm và áp dụng giới hạn/quota tài nguyên cho nhóm đó. Tài nguyên gồm CPU, memory, block I/O, network bandwidth, PID count, hugetlb, perf_event, ... Cgroup có hierarchy (cây) — child kế thừa hạn mức từ parent.
+
+Cgroup do Google đề xuất năm 2006 (tên gốc *process containers*), merge vào kernel mainline 2.6.24 (2008). Nó là **nửa còn lại** của thiết kế container.
+
+### cgroup v1 vs v2 — đáng để phân biệt
+
+Có hai phiên bản cgroup tồn tại song song. Hiểu được sự khác biệt sẽ tiết kiệm rất nhiều thời gian gỡ rối:
+
+| Tiêu chí | cgroup v1 | cgroup v2 |
+|---|---|---|
+| Ra mắt | 2008 | 2016 (kernel 4.5) |
+| Hierarchy | Nhiều cây song song, mỗi controller có cây riêng | **Một cây thống nhất** |
+| Mount point | `/sys/fs/cgroup/<controller>/...` | `/sys/fs/cgroup/...` |
+| Memory + swap | Hai controller riêng | Gộp vào memory controller |
+| Trạng thái | Vẫn còn nhưng deprecated | **Mặc định** trên distro mới (Fedora 31+, Ubuntu 22.04+, RHEL 9+) |
+| Tool support | Đầy đủ | Một số tool cũ chưa support |
+
+Sự khác biệt lớn nhất: v1 cho phép một process nằm trong cgroup `cpu` này nhưng cgroup `memory` khác — dẫn tới hierarchy phức tạp và bug. v2 nói "một process nằm trong một cgroup duy nhất, và cgroup đó controlle tất cả các resource cùng lúc." Đơn giản hơn nhiều, nhưng phải migrate.
+
+```text
+cgroup v1 (multiple hierarchies):
+
+  /sys/fs/cgroup/cpu/      <- one tree
+  +-- docker/
+      +-- abc123/
+          +-- (tasks)
+
+  /sys/fs/cgroup/memory/   <- another tree, SAME process can be elsewhere
+  +-- system.slice/
+      +-- (tasks)
+
+cgroup v2 (one unified tree):
+
+  /sys/fs/cgroup/
+  +-- system.slice/
+  |   +-- (tasks here)
+  +-- user.slice/
+      +-- user-1000.slice/
+          +-- session-1.scope/
+              +-- (tasks here, all controllers apply)
+```
+
+Phần còn lại của section này dùng **v2** làm chuẩn (vì là default trên distro hiện đại).
+
+### Các controller phổ biến
+
+Dưới đây là các controller bạn sẽ chạm tới nhiều nhất trong container:
+
+#### CPU controller
+
+Giới hạn CPU theo 2 cách:
+
+- **cpu.max** (v2) — quota / period. Ví dụ `50000 100000` = "trong mỗi 100ms, được dùng tối đa 50ms CPU time" = nửa CPU.
+- **cpu.weight** — share, từ 1 đến 10000. Khi có cạnh tranh, weight cao được ưu tiên hơn.
+
+```bash
+# Giới hạn cgroup chỉ dùng 0.5 CPU
+echo "50000 100000" > /sys/fs/cgroup/mygroup/cpu.max
+
+# Trong Docker, tương đương:
+docker run --cpus=0.5 ubuntu
+```
+
+Đây cũng là nguồn của một bẫy nổi tiếng trong Java/Go: trước đây JVM đọc `Runtime.getRuntime().availableProcessors()` từ host CPU count, không biết về cgroup limit, dẫn tới việc tạo quá nhiều thread. Java 10+ đã fix (`-XX:+UseContainerSupport` mặc định). Go đã từng có vấn đề tương tự với `GOMAXPROCS` (phải set thủ công hoặc dùng `uber-go/automaxprocs`).
+
+#### Memory controller
+
+- **memory.max** — hard limit. Vượt qua = process bị OOMKill.
+- **memory.high** — soft limit. Vượt qua = kernel throttle process, ép swap/reclaim.
+- **memory.low** — best-effort guarantee. Kernel cố không reclaim memory dưới mức này.
+
+```bash
+echo "536870912" > /sys/fs/cgroup/mygroup/memory.max  # 512 MB hard limit
+```
+
+Khi container hit memory limit, kernel kích hoạt OOM killer **chỉ trong cgroup đó** — không ảnh hưởng host. Đây là cơ chế đằng sau status `OOMKilled` của Kubernetes/Docker.
+
+> **OOM killer (Out-Of-Memory killer)**: Cơ chế kernel chọn và kill process khi hệ thống (hoặc cgroup) hết memory. Việc kill dựa trên *score* được tính từ kích thước memory, nice value, và một số heuristic khác. Trong cgroup v2, OOM killer được áp dụng *trong phạm vi cgroup*, nên host vẫn an toàn.
+
+#### IO controller
+
+Giới hạn băng thông đĩa per-block-device:
+
+```bash
+# Limit 10 MB/s read, 5 MB/s write on device 8:0 (sda)
+echo "8:0 rbps=10485760 wbps=5242880" > /sys/fs/cgroup/mygroup/io.max
+```
+
+Tương đương Docker `--device-read-bps` và `--device-write-bps`.
+
+#### PIDs controller
+
+Giới hạn số PID trong cgroup. Phòng fork bomb.
+
+```bash
+echo "100" > /sys/fs/cgroup/mygroup/pids.max
+```
+
+#### Các controller khác
+
+- `cpuset` — pin process vào tập CPU/NUMA node cụ thể.
+- `hugetlb` — giới hạn HugePage usage.
+- `rdma`, `misc` — cho phần cứng đặc biệt.
+
+### Tạo và dùng cgroup thủ công
+
+Với cgroup v2, tạo một cgroup đơn giản đến mức ngạc nhiên — chỉ là mkdir:
+
+```bash
+# 1. Tạo cgroup
+sudo mkdir /sys/fs/cgroup/mygroup
+
+# 2. Bật controller (subtree_control của parent)
+echo "+cpu +memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+
+# 3. Đặt limit
+echo "50000 100000" | sudo tee /sys/fs/cgroup/mygroup/cpu.max
+echo "536870912"    | sudo tee /sys/fs/cgroup/mygroup/memory.max
+
+# 4. Thêm process vào cgroup
+echo $$ | sudo tee /sys/fs/cgroup/mygroup/cgroup.procs
+
+# Giờ shell hiện tại bị giới hạn 0.5 CPU + 512MB
+```
+
+Trong v1 sẽ phải làm với từng controller hierarchy riêng, nhưng tư tưởng tương tự.
+
+### Cách Docker dùng cgroup
+
+Docker không tự phát minh ra cgroup tree — nó delegate qua systemd hoặc tự quản lý. Trên distro hiện đại với cgroup v2 + systemd:
+
+```text
+/sys/fs/cgroup/
++-- system.slice/
+    +-- docker.service/
+    |   (cgroup của docker daemon)
+    +-- docker-<container_id>.scope/
+        +-- cgroup.procs   <- chứa PID của container
+        +-- cpu.max
+        +-- memory.max
+        +-- ...
+```
+
+Khi bạn `docker run --memory 256m --cpus 1.5 nginx`, Docker chỉ làm hai việc:
+
+1. Tạo container (clone + namespace).
+2. Viết các giá trị vào `cpu.max`, `memory.max` của cgroup tương ứng.
+
+Đó là tất cả. Phần nặng đã được kernel cgroup nguyên thuỷ làm sẵn.
+
+### Bẫy phổ biến: container thấy memory host
+
+Câu hỏi phỏng vấn cổ điển: *Tại sao chạy `free` trong container thấy memory của host chứ không phải limit?*
+
+Vì `free` đọc `/proc/meminfo`, mà `/proc/meminfo` **không** virtualize theo cgroup. Cgroup giới hạn được nhưng không che được. Hậu quả:
+
+- App đọc `/proc/meminfo` để quyết định cache size sẽ nhầm.
+- JVM trước Java 10 đọc về và set heap quá lớn.
+- Tool như `top`, `htop` hiển thị memory host, không phải container.
+
+Giải pháp:
+- App tự đọc `/sys/fs/cgroup/memory.max` (nếu chạy trong container).
+- Hoặc mount `lxcfs` để fake `/proc/meminfo` theo cgroup limit (như LXC làm).
+- Hoặc dùng các thư viện như `uber-go/automaxprocs` cho Go, `-XX:+UseContainerSupport` cho Java.
+
+Đây là một ví dụ điển hình về **leaky abstraction**: container không phải là VM, nên nó không thể hoàn toàn ảo hoá mọi thứ. Phải hiểu giới hạn này để code đúng.
+
+Xong namespace + cgroup, đã có "kernel skeleton" của container. Giờ cần một filesystem riêng để chạy app — section tiếp theo.

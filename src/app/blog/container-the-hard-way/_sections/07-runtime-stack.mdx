@@ -1,0 +1,193 @@
+## Container runtime stack — runc, containerd, CRI, và Docker
+
+Ở những phần trước, "ai đó" gọi syscall, mount overlay, áp seccomp. Người đó là **container runtime**. Nhưng "runtime" là từ bị overload — có ít nhất hai lớp khác nhau cùng được gọi là *runtime*, và rất nhiều dev nhầm. Section này gỡ rối stack đó.
+
+### Hai loại runtime: low-level vs high-level
+
+> **Low-level container runtime (OCI runtime)**: Chương trình gọi trực tiếp syscall kernel (clone, mount, setns, ...) để tạo container từ một bundle gồm rootfs + `config.json`. Không quan tâm tới image, registry, network. Ví dụ: `runc`, `crun`, `youki`, `runsc` (gVisor), `kata-runtime`.
+
+> **High-level container runtime (container manager)**: Chương trình quản lý vòng đời container: pull image từ registry, lưu trữ snapshot, gọi low-level runtime để start, expose API cho client (CLI, Kubernetes). Ví dụ: `containerd`, `CRI-O`, `Podman` (cả low-level và high-level), Docker (về phần engine).
+
+Cụ thể:
+
+```text
+   docker CLI / kubectl / ctr / crictl
+                  |
+                  v
+   +--------------------------------------+      <- HIGH-LEVEL
+   | Docker daemon / containerd / CRI-O   |
+   |   - manage images                    |
+   |   - manage snapshots                 |
+   |   - expose gRPC API                  |
+   +--------------------------------------+
+                  |
+                  v
+   +--------------------------------------+      <- LOW-LEVEL (OCI runtime)
+   | runc                                 |
+   |   - clone() namespaces               |
+   |   - set up cgroup                    |
+   |   - mount overlay                    |
+   |   - apply seccomp                    |
+   |   - exec entrypoint                  |
+   +--------------------------------------+
+                  |
+                  v
+       Linux kernel (namespace + cgroup + ...)
+```
+
+### OCI Runtime Specification — chuẩn để low-level runtime tuân theo
+
+OCI Runtime Spec định nghĩa **bundle**: một thư mục chứa `config.json` (mô tả container) + `rootfs/` (thư mục root). Và định nghĩa interface CLI mà runtime phải support:
+
+```bash
+runc create <container-id>     # tạo container, chưa start process
+runc start  <container-id>     # chạy entrypoint
+runc list                      # liệt kê container
+runc kill   <container-id>     # gửi signal
+runc delete <container-id>     # cleanup
+```
+
+`config.json` mô tả mọi thứ container cần — entrypoint, env, namespace nào tạo, cgroup limit gì, seccomp profile nào áp:
+
+```json
+{
+  "ociVersion": "1.0.2",
+  "process": {
+    "user": {"uid": 0, "gid": 0},
+    "args": ["sh"],
+    "env": ["PATH=/usr/bin:/bin"],
+    "cwd": "/"
+  },
+  "root": {"path": "rootfs", "readonly": false},
+  "linux": {
+    "namespaces": [
+      {"type": "pid"},
+      {"type": "network"},
+      {"type": "mount"},
+      {"type": "ipc"},
+      {"type": "uts"}
+    ],
+    "resources": {
+      "memory": {"limit": 536870912},
+      "cpu": {"quota": 50000, "period": 100000}
+    },
+    "seccomp": { "...": "..." }
+  }
+}
+```
+
+Vì spec này được chuẩn hoá, bạn có thể swap `runc` ra `crun` (rewrite bằng C, nhanh hơn) hoặc `runsc` (gVisor) mà không đổi gì ở tầng trên. Đây là cú lớn về tính linh hoạt — và là lý do gVisor, Kata Containers chạy được trong Kubernetes mà không sửa Kubernetes.
+
+### runc — implementation tham chiếu
+
+`runc` là implementation gốc của OCI Runtime Spec, viết bằng Go. Là spin-off từ Docker năm 2015 khi OCI ra đời. Code base nhỏ, ~30k dòng Go. Mỗi lần start container, `runc` fork một process con, gọi `clone` với cờ namespace, set cgroup, mount, áp seccomp, rồi `exec` entrypoint của user.
+
+`crun` (RedHat, C) và `youki` (Rust) là hai implementation thay thế phổ biến. `crun` nhanh hơn `runc` đáng kể cho workload start nhiều container (như Knative scale-from-zero).
+
+### containerd — high-level runtime hiện đại
+
+Trước 2017, Docker là một daemon monolithic: CLI, daemon, image management, container management, network — tất cả trong một binary `dockerd`. Khó embed vào Kubernetes. Docker tách lõi ra thành **containerd**, donate cho CNCF.
+
+containerd có kiến trúc plugin:
+
+```text
++------------------------------------------+
+| containerd daemon                        |
+|                                          |
+|  +-------------------+                   |
+|  | gRPC API server   |                   |
+|  +-------------------+                   |
+|       |                                  |
+|       v                                  |
+|  +-------------------+ +---------------+ |
+|  | Content store     | | Image manager | |
+|  | (layers, blobs)   | | (pull/push)   | |
+|  +-------------------+ +---------------+ |
+|       |                       |          |
+|       v                       v          |
+|  +-------------------+ +---------------+ |
+|  | Snapshotter       | | Tasks runtime | |
+|  | (overlayfs/btrfs) | | (calls runc)  | |
+|  +-------------------+ +---------------+ |
+|                              |           |
+|                              v           |
+|                      +-------------+     |
+|                      | containerd- |     |
+|                      | shim        |     |
+|                      +-------------+     |
+|                              |           |
+|                              v           |
+|                          [runc]          |
++------------------------------------------+
+```
+
+CLI client là `ctr` (low-level, dev tool) và `nerdctl` (Docker-CLI-compatible).
+
+### Shim — vì sao containerd không trực tiếp giữ container
+
+Khi `containerd` start container, nó **không** trực tiếp parent của process container. Thay vào đó nó spawn một **shim** (`containerd-shim-runc-v2`), shim đó mới gọi `runc start` và trở thành parent của container process.
+
+Tại sao? Vì nếu `containerd` daemon restart (upgrade, crash, ...), parent chết → container chết. Shim ngăn điều đó: shim độc lập với containerd, container sống tiếp dù containerd down.
+
+Shim cũng giữ pipe của stdout/stderr container và xử lý reattach khi client (CLI) ngắt kết nối — đó là lý do bạn có thể `Ctrl+C` ra khỏi `docker logs -f` mà container không chết.
+
+### CRI — interface giữa Kubernetes và runtime
+
+Kubernetes ban đầu tích hợp trực tiếp Docker. Khi nhiều runtime xuất hiện (containerd, CRI-O), team Kubernetes định nghĩa **CRI (Container Runtime Interface)** — một gRPC API mà mọi runtime muốn dùng với Kubernetes phải implement.
+
+> **CRI (Container Runtime Interface)**: API gRPC mà kubelet dùng để giao tiếp với container runtime trên node. Định nghĩa các method như `RunPodSandbox`, `CreateContainer`, `StartContainer`, `PullImage`, `ListPodSandbox`. Cho phép Kubernetes làm việc với bất kỳ runtime nào support CRI.
+
+Hệ quả: Kubernetes không "chạy Docker" nữa. Nó chạy `containerd` hoặc `CRI-O`, gọi qua CRI:
+
+```text
+   kubectl
+     |
+     v
+   kube-apiserver
+     |
+     v
+   kubelet (on node)
+     |
+     v gRPC (CRI)
+   containerd / CRI-O
+     |
+     v
+   runc
+     |
+     v
+   namespace + cgroup
+```
+
+Kubernetes 1.24 (2022) chính thức **bỏ dockershim** — không còn hỗ trợ Docker engine. Docker vẫn dùng được để build image (vì image là chuẩn OCI), nhưng cluster Kubernetes mặc định chạy `containerd`.
+
+### Docker — vẫn là gì hôm nay?
+
+Docker, Inc. (the company) vẫn duy trì:
+- **Docker Desktop** — gói cho dev (Mac/Win/Linux).
+- **Docker Engine** — daemon (`dockerd`) gọi xuống `containerd` (project đã chuyển cho CNCF từ 2017).
+- **Docker CLI** — UX dễ dùng nhất trong tất cả các tool container.
+- **Docker Hub** — registry phổ biến.
+- **BuildKit** — tool build image hiện đại.
+
+Khi bạn `docker run`, thật ra chuỗi gọi là:
+
+```text
+docker CLI ->  dockerd ->  containerd ->  containerd-shim ->  runc ->  kernel
+```
+
+5 process tham gia để start 1 container. Đây là lý do `nerdctl` (gọi thẳng containerd) hoặc `podman` (không daemon, gọi thẳng runc) thường nhanh hơn `docker`.
+
+### Podman — daemonless
+
+Podman cùng API với Docker (`alias docker=podman` chạy được nhiều use case), nhưng kiến trúc khác hẳn: **không có daemon**. Mỗi `podman run` là một process fork ra, gọi `runc`, rồi thoát; container chạy độc lập (managed bởi systemd nếu cần).
+
+Ưu điểm:
+- Không có single point of failure.
+- Rootless tự nhiên (mỗi user tự chạy container của mình).
+- Tích hợp systemd tốt (`podman generate systemd` tạo unit file).
+
+Nhược điểm:
+- Không có daemon = không có background reconciliation. Nếu container chết, không ai restart trừ khi bạn dùng systemd.
+- Một số tính năng "swarm-style" thiếu.
+
+Tóm lại: nếu bạn hiểu stack `runc -> containerd-shim -> containerd -> CRI/Docker`, bạn đã hiểu 90% câu hỏi "tại sao kubelet/containerd/Docker behave thế này thế kia". Section tiếp theo lấp lỗ hổng cuối cùng: làm sao container nói chuyện với mạng.

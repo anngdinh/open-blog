@@ -1,0 +1,145 @@
+## Namespaces — kernel "đeo kính" cho process
+
+Nếu phải chọn duy nhất *một* tính năng kernel để giải thích container, đó là **namespace**. Cgroup giới hạn *bao nhiêu* tài nguyên process được dùng, nhưng namespace mới là cái quyết định process *thấy* thế giới như thế nào. Hai khái niệm khác hẳn nhau, và nhiều người gộp chung — đó là nguồn gốc của vô số hiểu lầm.
+
+> **Namespace (Linux namespace)**: Một tính năng kernel cho phép các process khác nhau thấy các "view" khác nhau của cùng một tài nguyên hệ thống. Mỗi loại namespace cô lập một loại tài nguyên (PID, network, mount, hostname, ...). Hai process trong hai namespace khác nhau có thể có PID giống hệt nhau mà không xung đột, có cùng một số IP mà không loạn — vì kernel duy trì riêng các bảng cho từng namespace.
+
+Hình dung đơn giản: namespace là một cặp kính mà kernel đeo cho process. Hai process đeo hai cặp kính khác nhau sẽ thấy hai thế giới khác nhau, dù vẫn đang chạy trên cùng một kernel, cùng một phần cứng.
+
+### Tám loại namespace hiện có
+
+Tính tới kernel hiện đại (6.x), Linux có 8 loại namespace, mỗi loại cô lập một mảng cụ thể:
+
+| Namespace | Cờ syscall | Cô lập cái gì |
+|---|---|---|
+| Mount (`mnt`) | `CLONE_NEWNS` | Cây mount, file system view |
+| UTS | `CLONE_NEWUTS` | Hostname, domain name |
+| IPC | `CLONE_NEWIPC` | System V IPC, POSIX message queues |
+| PID | `CLONE_NEWPID` | Cây tiến trình (PID space) |
+| Network | `CLONE_NEWNET` | Interface, route, iptables, socket |
+| User | `CLONE_NEWUSER` | UID/GID mapping |
+| Cgroup | `CLONE_NEWCGROUP` | View của cgroup hierarchy |
+| Time | `CLONE_NEWTIME` | `CLOCK_MONOTONIC` và `CLOCK_BOOTTIME` |
+
+Một container "đầy đủ" thường tạo cả 7 cái đầu cùng lúc (Time namespace tương đối mới, kernel 5.6+, chưa phổ biến). Đó là lý do `unshare(2)` cho phép truyền nhiều cờ trong một lần gọi.
+
+### Mount namespace — "tôi có hệ thống file riêng"
+
+Mount namespace là namespace ra đời sớm nhất (kernel 2.4.19, 2002). Mỗi mount namespace có **cây mount riêng**: bạn có thể mount một filesystem ở `/data` trong namespace A, mà namespace B không nhìn thấy.
+
+Đây là nền tảng để container có "rootfs" riêng. Container sẽ:
+
+1. Tạo mount namespace mới (clone với `CLONE_NEWNS`).
+2. Mount rootfs của image (thường qua OverlayFS — sẽ nói ở section 5) lên một thư mục tạm.
+3. Dùng `pivot_root(2)` để đảo cái thư mục tạm đó thành "/" của process.
+
+Sau bước 3, process trong container không có cách nào "trèo" về hệ thống file của host nữa — vì cây mount mà nó nhìn thấy đã bị cô lập.
+
+### PID namespace — "tôi là PID 1"
+
+PID namespace là cái khiến `ps` trong container trả về danh sách ngắn ngủn. Bên trong PID namespace mới, process đầu tiên được kernel đánh số là **PID 1** (init), và các process con của nó là 2, 3, 4...
+
+```text
+Host kernel view:                Container view:
+
+PID  COMMAND                     PID  COMMAND
+ 1   systemd                      1   nginx              <- master
+ 2   kthreadd                     7   nginx              <- worker
+...                               8   nginx              <- worker
+ 1234 dockerd
+ 5678 containerd-shim
+ 5679 nginx (master)        <-- same process,
+ 5685 nginx (worker)            different PID in
+ 5686 nginx (worker)            container ns
+```
+
+Cùng một process — đó là `nginx (master)`. Host kernel thấy nó là PID 5679, container thấy nó là PID 1. Không có gì kỳ diệu — bảng `task_struct` trong kernel có nhiều entry cho cùng một process, một entry ứng với mỗi PID namespace mà nó "thấy được" (host namespace + container namespace).
+
+PID 1 có vai trò đặc biệt: nó là **init của container**. Nếu PID 1 chết, kernel sẽ kill toàn bộ process trong PID namespace đó — đây là cơ chế cleanup. Đó cũng là lý do best practice nói "dùng một init thật sự (`tini`, `dumb-init`) thay vì chạy `bash` làm PID 1" — vì `bash` không reap zombie process tốt và không xử lý signal đúng kiểu.
+
+### Network namespace — "tôi có stack mạng riêng"
+
+Network namespace cô lập toàn bộ network stack: interface, routing table, `iptables`, ARP table, socket. Mỗi netns có một interface `lo` riêng, không liên quan tới `lo` của host.
+
+Khi bạn `docker run`, container có IP của riêng nó (kiểu `172.17.0.2`) — IP đó không tồn tại trên host. Cách hoạt động: Docker tạo một netns mới, đặt một đầu của **veth pair** vào netns đó rồi rename thành `eth0` (chính là interface mà container thấy), đầu kia ở netns host (interface `vethXXXX`) được attach vào bridge `docker0`. (Phần này sẽ chi tiết hơn ở section 8.)
+
+> **veth pair (Virtual Ethernet pair)**: Một cặp interface ảo nối liền nhau — gói tin gửi vào đầu này hiện ra ở đầu kia. Đây là "ống dây" cho phép một netns nói chuyện với netns khác (thường là netns container nói với netns host).
+
+### UTS namespace — hostname riêng
+
+UTS (UNIX Time-Sharing) namespace cô lập hostname và domain name. Đây là cái khiến bạn `hostname` trong container thấy `a1b2c3d4` (hash của container ID) thay vì hostname host. Đơn giản, ít drama.
+
+### IPC namespace — IPC riêng
+
+System V IPC (semaphore, shared memory, message queue) và POSIX message queue được cô lập. Hai container không thể chia sẻ shared memory với nhau qua System V IPC trừ khi cùng IPC namespace. Đa số dev không bao giờ chạm tới namespace này — nhưng nó quan trọng cho các app legacy dùng IPC kiểu cũ (Oracle DB, PostgreSQL trước phiên bản dùng POSIX shm).
+
+### User namespace — "UID 0 trong container, UID 100000 ngoài host"
+
+User namespace là namespace **phức tạp và quyền lực nhất**. Nó cho phép **UID/GID mapping**: process bên trong namespace thấy mình là `UID 0` (root), nhưng từ host nhìn vào, nó thực sự là một UID không có đặc quyền (ví dụ `100000`).
+
+```text
+Container view:           Mapping:           Host view:
+UID 0 (root)         <--> 100000        UID 100000 (unprivileged)
+UID 1                <--> 100001        UID 100001
+...                  <--> ...           ...
+UID 65535            <--> 165535        UID 165535
+```
+
+Đây là **lá chắn bảo mật quan trọng nhất** của container hiện đại. Nếu container "tin tưởng" rằng nó là root, nó có thể tạo file owner=root, chạy syscall yêu cầu quyền cao — nhưng do mapping, mọi thao tác đó ở host chỉ thực hiện với quyền của UID 100000, không gây hại gì.
+
+Đây là lý do **rootless container** (Podman, rootless Docker) tồn tại được. Không có user namespace, bạn không thể chạy container mà không có quyền root trên host. Có user namespace, một user thường có thể tạo container với "root" giả lập bên trong.
+
+Trade-off: user namespace gây phức tạp khi mount filesystem (UID không khớp), khi share volume với host (file owner sai), và đôi khi mâu thuẫn với một số tool (ví dụ Kubernetes mặc định *không* bật user namespace cho pod).
+
+### Cgroup namespace — view của cgroup hierarchy
+
+Đây là namespace tinh tế. Process có thể đọc `/proc/self/cgroup` để biết nó đang ở cgroup nào. Cgroup namespace **virtualize** path đó: bên trong namespace, container không thấy path đầy đủ trên host (ví dụ `/sys/fs/cgroup/system.slice/docker-xxxx.scope/...`), mà chỉ thấy `/` của cgroup tree con của riêng nó.
+
+Đây là tính năng quality-of-life — chống information leak (container không biết tên cgroup của nó trên host) và giúp các tool đo metric bên trong container không bị nhầm lẫn.
+
+### Time namespace — đồng hồ riêng (một phần)
+
+Time namespace (kernel 5.6, 2020) cho phép cô lập `CLOCK_MONOTONIC` và `CLOCK_BOOTTIME` — tức là **offset** của hai đồng hồ này có thể khác nhau giữa các namespace. Nó *không* virtualize `CLOCK_REALTIME` (giờ thực tế) — vì điều đó sẽ tạo ra nhiều rắc rối hơn lợi ích.
+
+Mục đích chính: cho phép checkpoint/restore (CRIU) một container ở host A và restore ở host B mà `uptime` bên trong container vẫn nhất quán. Ít người dùng đến, nhưng tốt cần biết.
+
+### Tạo namespace như thế nào
+
+Có ba syscall liên quan:
+
+- `clone(2)` — tạo process mới đồng thời tạo namespace mới (truyền cờ `CLONE_NEW*`).
+- `unshare(2)` — tách process hiện tại ra namespace mới.
+- `setns(2)` — gắn process vào namespace có sẵn (thường để `nsenter` vào container đang chạy).
+
+Một ví dụ thực tế với command-line `unshare`:
+
+```bash
+# Tạo một shell trong PID + mount + network + UTS namespace mới
+sudo unshare --pid --mount --net --uts --fork --mount-proc bash
+
+# Bên trong shell mới:
+hostname container1
+ps aux              # chỉ thấy bash và ps
+ip a                # chỉ thấy lo (chưa có interface khác)
+```
+
+Đây là Docker version 0.0.1 — không layered image, không security, không networking, nhưng đã có "container". Section 9 sẽ mở rộng cái này thành demo đầy đủ.
+
+### Namespace nhìn trong `/proc`
+
+Mỗi process có một thư mục `/proc/<pid>/ns/` chứa các symlink tới namespace mà nó thuộc về:
+
+```bash
+$ ls -l /proc/self/ns/
+cgroup -> 'cgroup:[4026531835]'
+ipc    -> 'ipc:[4026531839]'
+mnt    -> 'mnt:[4026531840]'
+net    -> 'net:[4026531969]'
+pid    -> 'pid:[4026531836]'
+user   -> 'user:[4026531837]'
+uts    -> 'uts:[4026531838]'
+```
+
+Số trong ngoặc là **inode** của namespace. Hai process có cùng inode = cùng namespace. Đây là cách hữu hiệu nhất để check: "process X và Y có chung network namespace không?" — chỉ cần so sánh `/proc/X/ns/net` và `/proc/Y/ns/net`.
+
+Hiểu xong namespace, bạn đã hiểu **một nửa** container. Nửa còn lại là cgroup — câu chuyện về việc giới hạn process được dùng *bao nhiêu* tài nguyên.

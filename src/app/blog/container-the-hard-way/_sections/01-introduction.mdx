@@ -1,0 +1,53 @@
+## Container không phải là magic — chỉ là Linux thôi
+
+Lần đầu chạy `docker run -it ubuntu bash`, bạn thấy mình đang trong một shell của Ubuntu, với hệ thống file riêng, network riêng, PID riêng — tất cả khởi động trong dưới một giây. Cảm giác như một phép màu: máy ảo nhẹ tới mức không tin được. Nhưng nếu hỏi *"container thực ra là gì?"*, câu trả lời chuẩn lại làm nhiều người ngạc nhiên: **container không phải là một thực thể. Nó là một process Linux bình thường — chỉ là kernel đã được yêu cầu nhìn nó qua một số "kính lọc" đặc biệt**.
+
+Container không có file `/proc/containers`. Không có syscall `create_container()`. Khi bạn `docker ps`, Docker chỉ đang nhìn vào danh sách process mà nó tự lưu trong database của mình. Bản thân kernel không biết "container" là gì — nó chỉ biết về **namespace**, **cgroup**, **mount point**, **capability**, **seccomp filter** — và khi bạn kết hợp đủ những thứ đó lại quanh một process, kết quả gọi là *container*.
+
+Đây là điều quan trọng nhất bạn cần ghi nhớ trước khi đọc tiếp:
+
+> **Container**: Một (hoặc nhiều) process Linux được cô lập bằng tổ hợp các tính năng của kernel — chủ yếu là namespace (cô lập view) và cgroup (giới hạn resource), kết hợp với một filesystem riêng và các lớp bảo mật phụ trợ. Không có syscall "container", chỉ có sự lắp ráp khéo léo của các nguyên thuỷ có sẵn từ trước.
+
+Nói cách khác, container là một **abstraction do userspace tự định nghĩa**, được lắp ráp từ các thành phần kernel rời rạc. Docker, containerd, runc, Podman — họ chỉ là những người lắp ráp khác nhau, dùng cùng một bộ Lego.
+
+### Tại sao "the hard way"?
+
+Bài này không phải để bạn quên mất Docker. Mục đích là **lột từng lớp ra cho tới khi không còn gì để lột**, để khi sau này gặp một câu hỏi như *"tại sao container bị OOMKill?"*, *"tại sao chạy `ps` trong container chỉ thấy 1 process?"*, *"tại sao Kata Container nói là `more secure than runc`?"* — bạn không phải đoán, mà có thể chỉ thẳng vào layer chịu trách nhiệm.
+
+Lộ trình bài:
+
+```text
+What we cover:
+
+  [Foundations]
+  1. VM vs Container — hai paradigm cô lập khác nhau
+
+  [The 5 pillars of container isolation]
+  2. Namespaces — cô lập view (8 loại)
+  3. Cgroups — cô lập tài nguyên (v1 vs v2)
+  4. Filesystem — chroot, pivot_root, OverlayFS, OCI image
+  5. Security — capabilities, seccomp, AppArmor/SELinux
+  6. Networking — veth, bridge, CNI
+
+  [The stack above the kernel]
+  7. Runtime stack — runc, containerd, CRI, shim
+
+  [Hands-on]
+  8. Build a container from scratch — chỉ unshare + cgroup + chroot
+
+  [Beyond runc]
+  9. Alternative isolation — gVisor, Kata, Firecracker, WASM
+
+  [Wrap-up]
+  10. Khi nào chọn cái gì
+```
+
+Nếu bạn đã quen Docker và muốn nhảy thẳng vào phần "nội tạng", có thể bỏ qua section 2 và đi thẳng tới **Namespaces** — đó là lớp nền móng của toàn bộ phần còn lại. Còn nếu bạn muốn thật sự *cảm* được container, hãy đọc tới section 9 và làm theo: 30 dòng shell, không Docker, một container chạy được. Sau đó bạn sẽ không bao giờ nhìn `docker run` như trước nữa.
+
+### Một lưu ý nhỏ về lịch sử
+
+Container không phải Docker phát minh. Năm 2000, FreeBSD đã có `jail(8)`. Năm 2004, Solaris có `zones`. Năm 2006, Google nội bộ đã chạy `cgroups` (lúc đó tên là *process containers*) để chia tài nguyên cho các service trong Borg. Linux namespace bắt đầu xuất hiện từ kernel 2.4.19 (mount namespace, năm 2002) và hoàn thiện dần qua hơn một thập kỷ.
+
+Docker (2013) không phát minh container — nó **đóng gói trải nghiệm**: image format, registry, một CLI dễ dùng, một daemon đứng giữa. Phần khó của công nghệ đã có sẵn trong kernel. Phần khó của *sản phẩm* là làm cho nó tiếp cận được với nửa tỷ developer. Đây là chi tiết quan trọng — vì khi đào sâu, bạn sẽ thấy hầu hết "phép màu của Docker" đều là gói lại của những thứ Linux đã làm được từ 2002.
+
+Giờ, hãy bắt đầu từ câu hỏi cơ bản nhất: **container khác máy ảo ở chỗ nào, và tại sao điều đó lại quan trọng?**

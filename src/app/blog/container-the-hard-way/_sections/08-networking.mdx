@@ -1,0 +1,162 @@
+## Container networking — veth, bridge, CNI
+
+Container có **network namespace** riêng. Theo mặc định, netns mới chỉ có một interface `lo` (loopback). Không có `eth0`, không có route ra ngoài. Vậy mà container "tự nhiên" có IP và ra Internet được — magic xảy ra ở chỗ nào? Section này lột tầng tầng lớp networking, từ veth tới CNI plugin.
+
+Có một bài riêng đào sâu phần này — [Container Networking from Scratch](/blog/container-networking-from-scratch) — section này điểm lại các thành phần cốt lõi và đặt chúng vào bức tranh tổng thể của container stack.
+
+### veth pair — đường ống giữa hai netns
+
+> **veth pair (Virtual Ethernet pair)**: Một cặp interface ảo nối liền nhau — gói tin nhận ở đầu này phát ra ở đầu kia. Một đầu nằm trong netns container, đầu kia nằm trong netns host (hoặc trong một netns khác). Đây là "wire" kết nối các netns.
+
+```text
+container netns                            host netns
++------------------------------+           +------------------------------+
+|                              |           |                              |
+|   eth0 (10.0.0.2)            |           |   veth1234abcd (no IP)       |
+|       ^                      |           |       ^                      |
+|       |                      |           |       |                      |
+|       +--- veth pair ----------------------------+                      |
+|                              |           |                              |
++------------------------------+           +------------------------------+
+```
+
+Tạo bằng tay:
+
+```bash
+# 1. Tạo netns mới
+ip netns add c1
+
+# 2. Tạo veth pair
+ip link add veth0 type veth peer name veth1
+
+# 3. Đặt đầu veth1 vào netns c1
+ip link set veth1 netns c1
+
+# 4. Đặt IP và up cả hai
+ip addr add 10.0.0.1/24 dev veth0
+ip link set veth0 up
+
+ip netns exec c1 ip addr add 10.0.0.2/24 dev veth1
+ip netns exec c1 ip link set veth1 up
+ip netns exec c1 ip link set lo up
+
+# 5. Test
+ping 10.0.0.2          # host -> container
+ip netns exec c1 ping 10.0.0.1  # container -> host
+```
+
+Trên cái nền veth pair này là toàn bộ thế giới container networking.
+
+### Bridge — kết nối nhiều container
+
+Một veth pair nối được 2 endpoint. Để nhiều container nói chuyện với nhau, dùng **Linux bridge**: một switch L2 phần mềm.
+
+> **Linux bridge**: Software switch trong kernel hoạt động như switch L2. Các interface (vật lý hoặc ảo) "attached" vào bridge có thể trao đổi frame Ethernet với nhau như cùng đấu vào một switch vật lý.
+
+Docker mặc định tạo bridge tên `docker0` với subnet `172.17.0.0/16`. Mỗi container có một veth, một đầu trong netns container (`eth0`), đầu kia attached vào `docker0`:
+
+```text
+                 docker0 bridge (172.17.0.1/16)
+                /        |          \
+         vethA1B2   vethC3D4    vethE5F6
+            |          |             |
+        container1  container2  container3
+        eth0        eth0        eth0
+        172.17.0.2  172.17.0.3  172.17.0.4
+```
+
+Container1 ping container2: gói tin đi qua veth, vào bridge, bridge forward sang veth khác, đến container2. Hoàn toàn ở L2, không cần routing.
+
+### Ra Internet — NAT
+
+Bridge cho phép container nói chuyện với nhau và với host (qua `docker0` interface trên host). Để container ra Internet, cần **NAT**: gói tin từ `172.17.0.2` phải được rewrite source IP thành IP host trước khi gửi đi. Đây là `iptables` MASQUERADE:
+
+```bash
+# Rule Docker tạo (tự động):
+iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+```
+
+Đọc: "gói tin có source 172.17.0.0/16, đi ra interface không phải docker0 → rewrite source thành IP của interface đi ra".
+
+Phía vào (publish port `-p 8080:80`):
+
+```bash
+iptables -t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to 172.17.0.2:80
+```
+
+Đọc: "gói tin TCP tới port 8080 → rewrite destination thành container."
+
+### Network mode khác — host, none, container
+
+Ngoài `bridge` mặc định, Docker có vài network mode khác — mỗi cái tương ứng với một cách khác nhau dùng network namespace:
+
+| Mode | Cách hoạt động | Use case |
+|---|---|---|
+| `bridge` (default) | Tạo netns mới, veth, attach vào docker0, NAT | App thường |
+| `host` | **Không tạo netns** — container dùng chung netns host | Performance critical (skip NAT), monitoring agent |
+| `none` | Tạo netns mới nhưng không attach gì | Job offline, không cần network |
+| `container:<name>` | Dùng chung netns với container khác | Sidecar pattern (Kubernetes pod chính là cái này) |
+
+`container:` mode rất quan trọng vì nó là cơ chế đằng sau **Kubernetes pod**: tất cả container trong cùng pod share netns. Cụ thể, kubelet start một container "pause" (rất nhỏ) trước, các container khác join netns của pause container. Pause chỉ ngồi `pause()` cả đời để giữ netns sống.
+
+### CNI — chuẩn cho Kubernetes networking
+
+Bridge + NAT của Docker hoạt động tốt cho single host. Nhưng Kubernetes có hàng trăm node — container ở node A phải nói chuyện với container ở node B mà không cần NAT (Kubernetes networking model yêu cầu "every pod gets unique IP, all pods can talk directly"). Cần một abstraction.
+
+> **CNI (Container Network Interface)**: Đặc tả tối giản về cách container runtime gọi plugin để cấu hình network cho container. Khi container được tạo, runtime gọi `cni-plugin ADD <netns> <args>` — plugin tự setup interface, IP, route, NAT, ... Cùng pattern khi xoá container: `cni-plugin DEL ...`.
+
+CNI plugin là binary đơn lẻ trên disk, thường ở `/opt/cni/bin/`. Cấu hình CNI nằm ở `/etc/cni/net.d/`. Một plugin chỉ làm một việc: setup network cho container vừa tạo.
+
+Có hai cấp:
+
+- **Reference plugins** — đơn giản: `bridge`, `host-local` (IP allocation), `loopback`, `portmap`.
+- **CNI implementations** — phức tạp, làm overlay/routing cross-node: **Flannel**, **Calico**, **Cilium**, **Weave Net**, **Antrea**.
+
+Mỗi implementation chọn một kỹ thuật khác:
+
+| Plugin | Cách hoạt động | Đặc điểm |
+|---|---|---|
+| Flannel (VXLAN) | Overlay L2 qua VXLAN tunnel giữa các node | Đơn giản, default cho nhiều cluster |
+| Calico | BGP routing thuần L3, không overlay | Performance cao, scale tốt, NetworkPolicy mạnh |
+| Cilium | eBPF, replace iptables bằng BPF program | Modern, observability tốt, performance đỉnh |
+| Weave Net | Overlay UDP/VXLAN tự design | Dễ setup, mesh networking |
+
+### kube-proxy — service và NAT trong Kubernetes
+
+Container có IP riêng, nhưng pod có thể chết và tạo lại với IP khác. Client cần một địa chỉ ổn định. Đó là **Service**: một VIP (Virtual IP) cluster-wide, kube-proxy lo việc route VIP → các pod IP đang chạy.
+
+> **kube-proxy**: Component chạy trên mỗi Kubernetes node, watch các Service và Endpoint, rồi config iptables/IPVS (hoặc Cilium eBPF) để các gói tin tới VIP của service được DNAT về một trong các pod backend. Khi pod chết hoặc thêm, kube-proxy update rule.
+
+Mode phổ biến:
+- `iptables` mode (default) — viết một loạt rule iptables. Đơn giản, đủ tốt tới ~1000 service.
+- `ipvs` mode — dùng IPVS (Linux kernel L4 load balancer). Scale tốt hơn nhiều, cần kernel module.
+- `nftables` mode — GA từ Kubernetes 1.33, thay iptables bằng nftables.
+- Hoặc **bỏ kube-proxy** và để **Cilium eBPF** làm việc đó hoàn toàn trong BPF.
+
+### Tóm lại stack networking
+
+Tổng kết các tầng:
+
+```text
++---------------------------------------+
+| Application (HTTP, gRPC, ...)         |
++---------------------------------------+
+| TCP/UDP socket in container netns     |
++---------------------------------------+
+| eth0 (veth in container)              |
++---------------------------------------+
+| veth peer in host netns               |
++---------------------------------------+
+| Bridge (docker0/cni0) OR routing      |
++---------------------------------------+
+| iptables/IPVS/eBPF (NAT, service)     |
++---------------------------------------+
+| Physical NIC of host                  |
++---------------------------------------+
+| Network                               |
++---------------------------------------+
+```
+
+Mỗi tầng có thể swap: veth bằng macvlan/ipvlan, bridge bằng routing thuần, iptables bằng eBPF. Container networking là một trong các phần linh hoạt nhất của Linux kernel — bạn ráp các nguyên thuỷ thế nào tuỳ workload.
+
+Đã có đủ kiến thức — section tiếp theo sẽ ráp tất cả lại tay không.

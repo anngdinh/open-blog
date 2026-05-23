@@ -1,0 +1,133 @@
+## Security layers — vì sao container không phải là root toàn quyền
+
+Một process gọi `clone(CLONE_NEWPID | CLONE_NEWNS | ...)` rồi `chroot` vào rootfs riêng — về kỹ thuật đã là "container". Nhưng nếu chỉ dừng ở đó, container vẫn cực kỳ nguy hiểm: process bên trong vẫn là **UID 0 (root)** trên kernel host, vẫn có thể gọi *hàng trăm* syscall, một số trong đó (như `mount`, `reboot`, `kexec_load`) có thể phá hủy host hoặc thoát container.
+
+Để container thực sự dùng được trong production, kernel áp **nhiều lớp giảm đặc quyền** chồng lên nhau: capabilities, seccomp, LSM (AppArmor/SELinux), `no_new_privs`. Đây là phần ít được nhắc tới nhưng quan trọng nhất để hiểu "tại sao container vẫn an toàn dù chạy như root".
+
+### Capabilities — chẻ nhỏ quyền root
+
+Trong Unix truyền thống, có hai trạng thái: UID 0 (root, làm gì cũng được) và non-zero (chỉ làm gì được cho phép). Quá nhị phân. Linux 2.2 (1999) chia quyền root thành ~40 **capability** rời rạc.
+
+> **Linux capability**: Một đặc quyền cụ thể của process. Thay vì "root có tất cả", capability cho phép gán một số quyền riêng (ví dụ `CAP_NET_ADMIN` để config mạng, `CAP_SYS_TIME` để chỉnh giờ) mà không trao toàn bộ quyền root. Process có thể bị thu hồi capability không cần thiết để giảm thiệt hại nếu bị tấn công.
+
+Một số capability quan trọng:
+
+| Capability | Cho phép |
+|---|---|
+| `CAP_NET_ADMIN` | Cấu hình mạng, iptables, route |
+| `CAP_NET_BIND_SERVICE` | Bind port < 1024 |
+| `CAP_SYS_ADMIN` | Một "túi đồ" khổng lồ — mount, swap, set hostname, ... |
+| `CAP_SYS_PTRACE` | Trace process khác |
+| `CAP_SYS_MODULE` | Load kernel module — **tuyệt đối không cho container** |
+| `CAP_SYS_TIME` | Đổi giờ hệ thống |
+| `CAP_DAC_OVERRIDE` | Bỏ qua discretionary access control (đọc file mặc dù không có quyền) |
+| `CAP_CHOWN` | Đổi owner của file |
+| `CAP_KILL` | Gửi signal cho process khác user |
+
+Docker mặc định **drop tất cả capability**, rồi *thêm lại* một danh sách an toàn (gọi là *bounding set*). Mặc định Docker giữ lại 14 capability:
+
+```text
+chown, dac_override, fowner, fsetid, kill, setgid, setuid,
+setpcap, net_bind_service, net_raw, sys_chroot, mknod,
+audit_write, setfcap
+```
+
+Chú ý là `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, `CAP_SYS_MODULE` đều **bị bỏ**. Đó là lý do bạn `apt update` trong container vẫn được (`CAP_DAC_OVERRIDE` đủ), nhưng `iptables -L` báo "permission denied" — vì cần `CAP_NET_ADMIN`. Để thêm: `docker run --cap-add NET_ADMIN`.
+
+```bash
+# Xem capability hiện tại của container
+docker run --rm alpine sh -c "apk add libcap-utils && getpcaps 1"
+
+# Drop tất cả, chỉ giữ NET_BIND_SERVICE để bind port 80
+docker run --cap-drop ALL --cap-add NET_BIND_SERVICE nginx
+```
+
+### Seccomp — lọc syscall
+
+Capability lọc *quyền*; seccomp lọc *syscall*. Linux có ~350 syscall, container thường chỉ cần ~50-100. Số còn lại không ai dùng, nhưng từng có lỗ hổng (Dirty COW, Dirty Pipe...) — chặn trước những syscall không cần thiết là phòng thủ sâu.
+
+> **seccomp (secure computing mode)**: Cơ chế kernel giới hạn các syscall mà process được phép gọi. `seccomp-bpf` (mode mới) cho phép viết filter BPF: với mỗi syscall, filter trả về `ALLOW`, `DENY`, `KILL`, hoặc `TRAP`. Một khi cài, không thể tự gỡ — kể cả root trong container.
+
+Docker đi kèm một **default seccomp profile** chặn ~44 syscall nguy hiểm: `kexec_load`, `reboot`, `swapon`, `unshare` (nếu không có user namespace), `bpf`, ... Bạn có thể viết profile riêng bằng JSON:
+
+```json
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "syscalls": [
+    {
+      "names": ["read", "write", "open", "close", "fstat",
+                "mmap", "exit_group"],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}
+```
+
+Profile trên *deny by default*, chỉ allow vài syscall — quá khắt khe cho hầu hết app, nhưng tốt cho workload đặc biệt (function-as-a-service, sandbox).
+
+Apply trong runc/Docker:
+
+```bash
+docker run --security-opt seccomp=my-profile.json myapp
+```
+
+Đây cũng là cơ chế đằng sau gVisor (sẽ nói ở section 10) — nó dùng seccomp ở mức cực đoan, chỉ allow một số syscall và intercept phần còn lại trong userspace.
+
+### LSM — AppArmor và SELinux
+
+> **LSM (Linux Security Module)**: Framework trong kernel cho phép gắn các module bảo mật để kiểm soát "có cho phép thao tác X không" ở các điểm kiểm tra (hook) trong kernel. Hai LSM phổ biến là **AppArmor** (path-based, Ubuntu/SUSE) và **SELinux** (label-based, RHEL/Fedora).
+
+Trong khi capability và seccomp can thiệp ở mức syscall, LSM can thiệp ở mức "object" — file nào, socket nào, process nào, được phép làm gì. Sâu hơn và linh hoạt hơn, nhưng cấu hình phức tạp hơn.
+
+**AppArmor** trên Ubuntu mặc định gắn một profile `docker-default` cho mọi container, chặn:
+- Ghi vào `/proc/*` ngoại trừ các file an toàn.
+- Truy cập `/sys/fs/cgroup/*` (read-only).
+- Mount filesystem ngoài rootfs container.
+
+```bash
+docker run --security-opt apparmor=docker-default ...
+# Hoặc disable (không khuyến khích):
+docker run --security-opt apparmor=unconfined ...
+```
+
+**SELinux** trên RHEL/Fedora dùng label. Mỗi process và file có một label (`system_u:system_r:container_t:s0:c123,c456`). Policy quyết định container với label nào được truy cập file với label nào. Chặt chẽ hơn AppArmor, nhưng debug khó hơn rất nhiều — `setenforce 0` (permissive) là phản xạ đầu tiên của nhiều dev khi gặp lỗi quyền lạ.
+
+### `no_new_privs` — không leo quyền giữa chừng
+
+Một process có thể leo quyền qua **setuid binary** (ví dụ `/usr/bin/sudo`, `/usr/bin/passwd`). Trong container không nên có chuyện đó. Cờ `PR_SET_NO_NEW_PRIVS` (kernel prctl) khoá process: kể cả exec một setuid binary, kernel không cho thêm quyền.
+
+Docker bật cờ này mặc định khi bạn dùng `--security-opt no-new-privileges`. Kubernetes pod có `securityContext.allowPrivilegeEscalation: false` để bật.
+
+### Rootless container — không chạm tới root
+
+Tất cả các lớp trên là *giảm thiểu thiệt hại khi container chạy như root*. Cách triệt để hơn: **không cần root ngay từ đầu**.
+
+**Rootless container** (Podman, Buildah, rootless Docker) dùng **user namespace** (đã nói ở section 3) để map UID 0 trong container thành một UID không có đặc quyền trên host. Nếu container thoát ra, exploit cũng không có quyền gì.
+
+Trade-off:
+- Cần kernel support user namespace + một số tweak (`/etc/subuid`, `/etc/subgid` để khai báo UID range).
+- Một số tính năng giới hạn: bind port < 1024 cần `slirp4netns`, mount filesystem hạn chế, một số filesystem (NFS) không hoạt động trong user namespace.
+
+Tóm tắt phân lớp:
+
+```text
++------------------------------------------+
+| Process in container                     |
++------------------------------------------+
+| Layer 5: User namespace (UID remap)      |
++------------------------------------------+
+| Layer 4: LSM (AppArmor/SELinux profile)  |
++------------------------------------------+
+| Layer 3: Seccomp (filter syscall)        |
++------------------------------------------+
+| Layer 2: Capabilities (bounding set)     |
++------------------------------------------+
+| Layer 1: Namespace (isolated view)       |
++------------------------------------------+
+|         Linux kernel                     |
++------------------------------------------+
+```
+
+Mỗi lớp là một *defense in depth*. Một lỗ hổng kernel có thể vượt qua lớp 1-2, nhưng đụng phải seccomp hoặc LSM thì khó hơn nhiều. Hiểu chồng lớp này, bạn sẽ hiểu vì sao các CVE container kiểu CVE-2019-5736 (runc thoát container) lại tạo ra cú sốc lớn — nó vượt qua nhiều lớp cùng lúc.
+
+Container đã an toàn (đủ). Giờ ai là người gọi `clone(CLONE_NEW*)`, set cgroup, áp seccomp, mount overlay? Đó là **container runtime** — section tiếp.

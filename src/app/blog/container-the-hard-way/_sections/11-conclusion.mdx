@@ -1,0 +1,63 @@
+## Kết luận — container là một ý tưởng đơn giản được lắp ráp khéo
+
+Quay lại câu hỏi mở đầu: *container là gì?* Câu trả lời sau khi đi hết bài chắc đã rõ ràng hơn nhiều — **không có "container" trong kernel Linux**. Có namespace, có cgroup, có capabilities, có seccomp, có OverlayFS, có veth. Container là cái tên ta đặt cho sự lắp ráp khéo của chúng quanh một process. Docker, runc, containerd, Podman, Kubernetes — tất cả chỉ là các cách lắp ráp khác nhau cho cùng một bộ nguyên thuỷ.
+
+Tóm tắt các tầng lại lần cuối:
+
+```text
++-----------------------------------------------+
+| Orchestrator                                  |
+| (Kubernetes, Nomad, Swarm)                    |
++-----------------------------------------------+
+| Container manager / CRI                       |
+| (containerd, CRI-O, Docker engine)            |
++-----------------------------------------------+
+| OCI Runtime                                   |
+| (runc, crun, gVisor's runsc, Kata)            |
++-----------------------------------------------+
+| Kernel features                               |
+|  - Namespaces (PID, NET, MNT, UTS, IPC, USER) |
+|  - Cgroups v2 (CPU, memory, IO, PID)          |
+|  - OverlayFS (union mount)                    |
+|  - Capabilities + Seccomp + LSM               |
+|  - veth + bridge + netfilter                  |
++-----------------------------------------------+
+| Linux kernel                                  |
++-----------------------------------------------+
+| Hardware                                      |
++-----------------------------------------------+
+```
+
+Mỗi tầng có một abstraction rõ ràng. Tầng dưới không biết tầng trên — kernel không biết "container" là gì, runc không biết Kubernetes là gì. Đó là vẻ đẹp của thiết kế: **interface bằng spec (OCI), implementation thay được**.
+
+### Những điều đáng nhớ
+
+Nếu sau bài này phải nhớ 5 điều, thì là:
+
+1. **Container = process + namespace + cgroup + filesystem + security layers.** Không có "container syscall". Chỉ là tổ hợp.
+2. **Namespace cô lập view, cgroup giới hạn tài nguyên.** Hai chuyện khác hẳn nhau — đừng gộp.
+3. **Image là tập layer SHA-256-addressable + manifest.** OverlayFS gộp chúng lại, registry phân phối chúng.
+4. **OCI spec là cái khiến hệ sinh thái có thể swap được.** runc -> runsc -> kata-runtime mà không đổi code orchestrator.
+5. **Container không phải là silver bullet bảo mật.** Một kernel exploit có thể thoát container. Nếu cần isolation level VM, dùng Kata/Firecracker/gVisor — không phải vì runc kém, mà vì cùng một kernel = cùng một attack surface.
+
+### Khi nào dùng cái gì?
+
+- **Học/dev local**: Docker hoặc Podman. UX tốt nhất.
+- **Production Kubernetes**: containerd với runc. Battle-tested.
+- **CI/sandbox không tin cậy**: gVisor hoặc Kata.
+- **Serverless** *quy mô siêu lớn*: Firecracker hoặc tương đương.
+- **Edge/plugin**: WebAssembly với WASI.
+
+Và quan trọng nhất, hiểu các tầng đủ để **debug từng lớp riêng**. Khi container OOMKill — đó là cgroup. Khi `ps` chỉ thấy 1 process — đó là PID namespace. Khi `iptables` báo permission denied — đó là capabilities. Khi `docker pull` chậm — đó là registry và layer hierarchy. Khi `kubectl exec` báo lỗi — có thể là CRI, có thể là shim, có thể là namespace setup.
+
+### Đi đâu tiếp theo?
+
+Nếu bài này thú vị, một số hướng đào sâu:
+
+- **Container networking deep dive**: [Container Networking from Scratch](/blog/container-networking-from-scratch) đi vào chi tiết veth/bridge/iptables level.
+- **CNI implementations**: [Kubernetes CNI Overview](/blog/kubernetes-cni-overview) so sánh Calico, Cilium, Flannel.
+- **eBPF observability**: [eBPF Deep Dive](/blog/ebpf-deep-dive) — cách quan sát và bảo mật container ở tầng kernel mà không cần modify code.
+- **Đọc source runc**: ~30k dòng Go, code base sạch, là cách tốt nhất để thấy spec OCI biến thành syscall thật như thế nào. Bắt đầu từ `libcontainer/factory_linux.go`.
+- **Đọc spec OCI**: Runtime spec + Image spec + Distribution spec, mỗi cái ngắn (~50 trang), đầy đủ.
+
+Khi bạn nhìn `docker run nginx` lần tới và **biết được** trong 1 giây đó có bao nhiêu syscall, bao nhiêu file mount, bao nhiêu rule iptables, bao nhiêu cgroup được setup — thế giới container đã không còn là một hộp đen nữa. Nó chỉ là Linux thôi, hết sức bình thường, và bạn vừa hiểu nó.

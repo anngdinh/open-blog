@@ -1,0 +1,160 @@
+## Filesystem & Image — từ chroot tới OverlayFS
+
+Container có namespace và cgroup rồi, nhưng còn một câu hỏi: *cây thư mục của container đến từ đâu?* Khi bạn `docker run ubuntu bash`, bên trong bạn thấy `/bin`, `/etc`, `/usr`, đầy đủ Ubuntu — dù host có thể là Arch Linux hay Amazon Linux. Cách image này lắp ráp lại trên đĩa và xuất hiện trong container là một câu chuyện thú vị, đi từ `chroot` của 1979 tới OverlayFS hiện đại.
+
+### chroot — tổ tiên của container filesystem
+
+> **chroot**: Syscall và lệnh giúp thay đổi root directory của một process — process sau khi chroot sẽ thấy thư mục đó như là "/" của mình, không truy cập được lên trên. Có từ kernel Unix V7 (1979).
+
+```bash
+mkdir -p /tmp/jail/{bin,lib,lib64}
+cp /bin/bash /tmp/jail/bin/
+# copy các so deps...
+sudo chroot /tmp/jail /bin/bash
+# Giờ bạn ở trong "container" — / chính là /tmp/jail
+```
+
+Chroot **không phải là** security boundary. Một process có quyền `CAP_SYS_CHROOT` có thể `chroot()` ra ngoài bằng kỹ thuật cũ. Nó cũng không cô lập PID, network, ... Nhưng ý tưởng "thay root directory" là viên gạch đầu tiên của container.
+
+Container hiện đại không dùng `chroot()` mà dùng **`pivot_root(2)`** — an toàn hơn, vì nó di chuyển root cũ ra ngoài và cho phép `umount` sau đó, ngăn process thoát qua các tham chiếu cũ.
+
+### Vấn đề: image trùng lặp
+
+Giả sử bạn có 50 container đều dựa trên Ubuntu base image (~70MB). Nếu mỗi container có một bản copy đầy đủ, sẽ tốn 3.5GB chỉ cho base. Cộng với image của mỗi app, chục GB là chuyện thường.
+
+Giải pháp: **layered filesystem** + **union mount**.
+
+> **Union filesystem (union mount)**: Một filesystem ảo gộp (overlay) nhiều thư mục lại thành một view duy nhất. Khi đọc, nó tìm tuần tự từ layer trên xuống. Khi ghi, nó ghi vào layer trên cùng (writable layer). Các layer dưới là **read-only và shared** giữa các container.
+
+Linux có nhiều union filesystem qua các năm: AUFS (Docker đời đầu), btrfs subvolume, ZFS, **OverlayFS** (chuẩn hiện nay, kernel 3.18+).
+
+### OverlayFS — cách hoạt động
+
+OverlayFS có 4 thư mục:
+
+- **lowerdir** — read-only, có thể có nhiều (nhiều layer chồng lên nhau).
+- **upperdir** — writable, mọi thay đổi được ghi vào đây.
+- **workdir** — thư mục tạm cho OverlayFS làm việc nội bộ.
+- **merged** — view kết hợp mà process thấy.
+
+```text
++-------------------------+
+| merged (what app sees)  |
++-------------------------+
+            ^              
+            | overlay      
++-------------------------+
+| upperdir (writable)     |
++-------------------------+
+| lowerdir layer N        |
++-------------------------+
+| lowerdir layer N-1      |
++-------------------------+
+| ...                     |
++-------------------------+
+| lowerdir layer 0        |
++-------------------------+
+```
+
+- **merged**: view mà process trong container nhìn thấy như là "/".
+- **upperdir**: layer ghi của container, chứa mọi thay đổi.
+- **lowerdir layer N…0**: các layer read-only, share giữa nhiều container. Layer 0 thường là base image (ví dụ Ubuntu rootfs).
+
+Khi container ghi file:
+
+- File chưa tồn tại → tạo trong upperdir.
+- File tồn tại trong lowerdir, container muốn sửa → **copy-up**: kernel copy file từ lowerdir lên upperdir trước, rồi mới ghi.
+- Xoá file ở lowerdir → tạo một "whiteout" trong upperdir (file đặc biệt báo "file này đã bị xoá").
+
+Lệnh mount thực tế:
+
+```bash
+mount -t overlay overlay \
+  -o lowerdir=/base/ubuntu:/base/python:/base/app,upperdir=/data/container1/upper,workdir=/data/container1/work \
+  /data/container1/merged
+```
+
+Khi container dừng, có thể xoá `upperdir` mà không ảnh hưởng tới các container khác đang dùng cùng lowerdir.
+
+### OCI Image — chuẩn hoá định dạng image
+
+Trước đây mỗi runtime có format image riêng. Năm 2015, OCI (Open Container Initiative) ra đời để chuẩn hoá. **OCI Image Specification** định nghĩa image là gì.
+
+> **OCI Image**: Một tarball có cấu trúc gồm: (1) manifest JSON liệt kê các layer, (2) config JSON chứa metadata (entrypoint, env, cmd), (3) các layer là tar archive nén gzip. Mỗi layer có một content-addressable ID — là SHA-256 của nội dung tar.
+
+Cấu trúc của một image khi bạn `docker pull ubuntu`:
+
+```text
+ubuntu:22.04
++-- manifest.json
+|   {
+|     "schemaVersion": 2,
+|     "config": "sha256:abc...",
+|     "layers": [
+|       {"digest": "sha256:1a2b...", "size": 28000000},
+|       {"digest": "sha256:3c4d...", "size": 1200000},
+|       ...
+|     ]
+|   }
+|
++-- config: sha256:abc...
+|   {
+|     "architecture": "amd64",
+|     "os": "linux",
+|     "config": {
+|       "Cmd": ["/bin/bash"],
+|       "Env": ["PATH=/usr/local/sbin:..."],
+|     },
+|     "rootfs": {
+|       "type": "layers",
+|       "diff_ids": ["sha256:...", "sha256:..."]
+|     }
+|   }
+|
++-- layers/
+    +-- sha256:1a2b... .tar.gz   (base rootfs)
+    +-- sha256:3c4d... .tar.gz   (additional layer)
+```
+
+Vì layer được nội dung-định-danh (SHA-256), hai image dùng chung base layer chỉ tải về một bản — registry pull về **theo digest, không phải theo path**. Đây là lý do `docker pull` lần thứ hai một image base nhanh hơn hẳn lần đầu.
+
+### Dockerfile và cách layer được tạo
+
+Mỗi instruction (gần như) trong Dockerfile tạo một layer mới:
+
+```dockerfile
+FROM ubuntu:22.04           # layer 0: base
+RUN apt-get update          # layer 1: apt cache + ...
+RUN apt-get install -y nginx # layer 2: nginx binary
+COPY index.html /var/www/   # layer 3: copy file
+CMD ["nginx", "-g", "daemon off;"]   # config, không layer
+```
+
+Mỗi `RUN` chạy trong một container tạm, sau đó OverlayFS upperdir của container đó được **commit thành tar** và trở thành layer mới. Đó là lý do best practice nói: gộp nhiều `RUN` lại bằng `&&` để giảm số layer, hoặc clean cache trong cùng layer (`apt-get clean && rm -rf /var/lib/apt/lists/*`).
+
+### Registry — nơi image sống
+
+> **Container registry**: Server lưu trữ và phân phối OCI image qua HTTP, theo chuẩn OCI Distribution Specification. Docker Hub, GitHub Container Registry, AWS ECR, Google GCR, Harbor là các implementation phổ biến.
+
+Khi `docker pull nginx:latest`:
+
+1. Client hỏi registry: cho tôi manifest của `nginx:latest`.
+2. Registry trả về JSON liệt kê các layer digest.
+3. Client check cache local — layer nào đã có thì bỏ qua.
+4. Tải về các layer còn lại song song.
+5. Verify SHA-256 từng layer.
+6. Extract vào `/var/lib/docker/overlay2/...` (hoặc tương đương).
+
+`docker push` đảo ngược quá trình. Vì layer là content-addressable, registry tự dedupe — bạn push một image dựa trên `ubuntu:22.04`, registry chỉ nhận layer mới của bạn, các layer base đã có sẵn.
+
+### Snapshot vs Overlay — containerd góc nhìn khác
+
+containerd (runtime modern hơn Docker) gọi layer storage là **snapshot**, và có nhiều **snapshotter** plugin: `overlayfs` (mặc định trên Linux), `native` (copy bằng tay, không dùng union FS), `btrfs`, `zfs`, `stargz` (lazy-pull). Mỗi snapshotter là một cách hiện thực hoá khác nhau cho cùng abstraction: "tạo một writable layer trên tập layer read-only".
+
+### copy-on-write — vì sao container start nhanh
+
+Khi `docker run`, OverlayFS chỉ tạo `upperdir` rỗng và `merged` mount. Không có file nào bị copy. Container thấy "hệ thống file đầy đủ" mà thực ra hệ thống đó vẫn nằm yên trong các tar layer trên đĩa, được mount qua overlay.
+
+Đây là lý do container start trong dưới 1 giây kể cả với image vài GB — start không liên quan tới kích thước image, mà chỉ liên quan tới việc setup namespace + cgroup + mount. Image size chỉ ảnh hưởng tới `docker pull` (lần đầu).
+
+Filesystem xong. Container đã có namespace, cgroup, rootfs. Nhưng một process root bên trong namespace vẫn rất nguy hiểm — section tiếp theo nói về các lớp security làm cho việc đó an toàn hơn.

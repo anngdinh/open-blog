@@ -1,0 +1,187 @@
+## Hands-on — dựng một container bằng tay không Docker
+
+Bây giờ ráp tất cả lại: namespace + cgroup + rootfs + bridge + veth. Mục tiêu là chạy một shell trong môi trường cô lập gần đủ để gọi là "container", chỉ dùng shell và các tool cơ bản (`unshare`, `ip`, `mount`). Không Docker. Không containerd. Không runc.
+
+Demo này chạy được trên Linux host hiện đại (Ubuntu 22.04+, kernel 5.10+) với quyền root. Ở mỗi bước, mình giải thích syscall hoặc tool đứng đằng sau, để bạn thấy "container" thực sự là cái gì.
+
+### Bước 1 — Chuẩn bị rootfs
+
+Cần một filesystem để container nhìn thấy như "/". Cách dễ nhất là export một image Alpine sẵn có:
+
+```bash
+mkdir -p /tmp/myctn/rootfs
+docker export $(docker create alpine) | tar -C /tmp/myctn/rootfs -xf -
+ls /tmp/myctn/rootfs
+# bin  dev  etc  home  lib  media  ...
+```
+
+Nếu không có Docker, có thể tải tarball Alpine miniroot từ alpinelinux.org và extract — không sao cả.
+
+### Bước 2 — Setup cgroup giới hạn tài nguyên
+
+Tạo cgroup v2 với limit 100MB RAM và 0.5 CPU:
+
+```bash
+# Bật controller ở root
+echo "+cpu +memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+
+# Tạo cgroup riêng
+sudo mkdir /sys/fs/cgroup/myctn
+echo "104857600" | sudo tee /sys/fs/cgroup/myctn/memory.max     # 100 MB
+echo "50000 100000" | sudo tee /sys/fs/cgroup/myctn/cpu.max     # 0.5 CPU
+echo "100" | sudo tee /sys/fs/cgroup/myctn/pids.max             # 100 PID max
+```
+
+### Bước 3 — Tạo network namespace và veth pair
+
+```bash
+# Tạo netns
+sudo ip netns add myctn
+
+# Tạo bridge (nếu chưa có)
+sudo ip link add name br0 type bridge 2>/dev/null || true
+sudo ip addr add 10.99.0.1/24 dev br0 2>/dev/null || true
+sudo ip link set br0 up
+
+# Tạo veth pair
+sudo ip link add veth-host type veth peer name veth-ctn
+
+# Đầu host attach vào bridge
+sudo ip link set veth-host master br0
+sudo ip link set veth-host up
+
+# Đầu container vào netns
+sudo ip link set veth-ctn netns myctn
+sudo ip netns exec myctn ip link set lo up
+sudo ip netns exec myctn ip link set veth-ctn name eth0
+sudo ip netns exec myctn ip addr add 10.99.0.10/24 dev eth0
+sudo ip netns exec myctn ip link set eth0 up
+sudo ip netns exec myctn ip route add default via 10.99.0.1
+
+# Bật forwarding và NAT để container ra Internet
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo iptables -t nat -A POSTROUTING -s 10.99.0.0/24 ! -o br0 -j MASQUERADE
+```
+
+### Bước 4 — Tạo các namespace còn lại và chroot vào rootfs
+
+`unshare` tạo namespace mới và chạy command. Combine với việc đặt process vào cgroup và netns đã có:
+
+```bash
+# Vào cgroup trước khi clone
+echo $$ | sudo tee /sys/fs/cgroup/myctn/cgroup.procs
+
+# Vào netns đã tạo
+sudo nsenter --net=/var/run/netns/myctn \
+  unshare --pid --mount --uts --ipc --fork --mount-proc \
+  chroot /tmp/myctn/rootfs /bin/sh
+```
+
+Trong shell này:
+- Cô lập PID (`ps aux` chỉ thấy `sh` và `ps`)
+- Cô lập mount (mount riêng, `/proc` đã được mount lại bởi `--mount-proc`)
+- Cô lập network (chỉ có `eth0` 10.99.0.10 và `lo`)
+- Cô lập UTS (`hostname container1` không ảnh hưởng host)
+- Cô lập IPC
+- Filesystem là Alpine rootfs
+- Bị cgroup giới hạn 100MB / 0.5 CPU / 100 PID
+
+Test thử bên trong:
+
+```bash
+hostname container1
+ps aux
+ip addr
+ping -c 2 10.99.0.1
+ping -c 2 8.8.8.8         # nếu NAT ok
+```
+
+### Cái còn thiếu so với Docker
+
+Cái shell vừa tạo là một "container" theo bản chất kỹ thuật. Nhưng so với Docker thì còn thiếu các lớp sau:
+
+- **User namespace** — chưa map UID. Nếu thoát thông qua bug kernel, vẫn là root host.
+- **Capabilities** — vẫn full root capability set. Cần `capsh --drop=cap_sys_admin,cap_net_admin,...`
+- **Seccomp** — chưa filter syscall. Cần `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ...)`.
+- **AppArmor/SELinux** — không có profile.
+- **OverlayFS** — đang dùng rootfs đầy đủ. Nếu nhiều container, lãng phí.
+- **pivot_root** — `chroot` không an toàn bằng `pivot_root`.
+
+Mỗi cái là một patch lên trên cái base. Tổng cộng, Docker (qua containerd qua runc) tự động làm hết — chính là lý do tồn tại của container runtime.
+
+### Một script gói gọn
+
+Đoạn này gói cả demo thành script reusable, để bạn copy về thử:
+
+```bash
+#!/usr/bin/env bash
+set -e
+
+CTN_NAME="${1:-myctn}"
+CTN_IP="${2:-10.99.0.10/24}"
+CTN_GW="10.99.0.1"
+ROOTFS="/tmp/${CTN_NAME}/rootfs"
+
+# 1. Prepare rootfs (assumes Alpine tarball already extracted)
+if [[ ! -d "$ROOTFS/bin" ]]; then
+  mkdir -p "$ROOTFS"
+  docker export "$(docker create alpine)" | tar -C "$ROOTFS" -xf -
+fi
+
+# 2. cgroup v2
+mkdir -p /sys/fs/cgroup/${CTN_NAME}
+echo "+cpu +memory +pids" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+echo "104857600"   > /sys/fs/cgroup/${CTN_NAME}/memory.max
+echo "50000 100000" > /sys/fs/cgroup/${CTN_NAME}/cpu.max
+echo "100"          > /sys/fs/cgroup/${CTN_NAME}/pids.max
+
+# 3. Network
+ip link add name br0 type bridge 2>/dev/null || true
+ip addr add 10.99.0.1/24 dev br0 2>/dev/null || true
+ip link set br0 up
+
+ip netns add ${CTN_NAME} 2>/dev/null || true
+ip link add veth-${CTN_NAME} type veth peer name eth0-${CTN_NAME} 2>/dev/null || true
+ip link set veth-${CTN_NAME} master br0
+ip link set veth-${CTN_NAME} up
+ip link set eth0-${CTN_NAME} netns ${CTN_NAME}
+
+ip netns exec ${CTN_NAME} ip link set lo up
+ip netns exec ${CTN_NAME} ip link set eth0-${CTN_NAME} name eth0
+ip netns exec ${CTN_NAME} ip addr add ${CTN_IP} dev eth0
+ip netns exec ${CTN_NAME} ip link set eth0 up
+ip netns exec ${CTN_NAME} ip route add default via ${CTN_GW}
+
+sysctl -w net.ipv4.ip_forward=1 > /dev/null
+iptables -t nat -C POSTROUTING -s 10.99.0.0/24 ! -o br0 -j MASQUERADE 2>/dev/null \
+  || iptables -t nat -A POSTROUTING -s 10.99.0.0/24 ! -o br0 -j MASQUERADE
+
+# 4. Run
+echo $$ > /sys/fs/cgroup/${CTN_NAME}/cgroup.procs
+exec nsenter --net=/var/run/netns/${CTN_NAME} \
+  unshare --pid --mount --uts --ipc --fork --mount-proc \
+  chroot "$ROOTFS" /bin/sh
+```
+
+Chạy `sudo ./mini-ctn.sh myctn`. Bạn vừa có một container. Khoảng 30 dòng shell.
+
+### Cleanup
+
+```bash
+sudo ip netns del myctn
+sudo ip link del veth-host 2>/dev/null || true
+sudo rmdir /sys/fs/cgroup/myctn
+sudo rm -rf /tmp/myctn
+```
+
+### Bài học rút ra
+
+Sau khi làm điều này, ba điều thường khiến người ta giật mình:
+
+1. **Không có gì kỳ diệu trong container.** Tất cả đều là syscall và config có sẵn từ kernel hàng chục năm nay.
+2. **Docker chỉ là một packaging.** Image, registry, daemon, CLI — đó là cái khó về *sản phẩm*, không phải về *công nghệ container*.
+3. **Tự build được container không có nghĩa nên dùng nó cho production.** Cleanup, error handling, security hardening, networking phức tạp — đó là chỗ runc/containerd có giá trị.
+
+Khi bạn debug container trong Kubernetes lần tới, hãy nhớ: đằng sau `kubectl exec` là chuỗi `kubelet -> CRI -> containerd -> shim -> runc -> nsenter -> setns -> exec`. Mỗi mắt xích có thể fail riêng. Hiểu được chuỗi này khiến debug nhanh hơn rất nhiều.
+
+Phần cuối cùng: nếu container không đủ an toàn cho workload của bạn, có những lựa chọn nào khác?

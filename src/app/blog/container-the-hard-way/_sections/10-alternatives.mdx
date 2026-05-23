@@ -1,0 +1,151 @@
+## Beyond runc — gVisor, Kata, Firecracker, WASM
+
+Container "runc-style" (chia sẻ kernel host, dùng namespace + cgroup) là chuẩn 95% workload. Nhưng có những use case mà sự đánh đổi không chấp nhận được:
+
+- **Multi-tenant cloud** — chạy code của khách hàng không tin tưởng. Một kernel exploit = thoát container = tấn công khách hàng khác.
+- **Function-as-a-service** — cần start trong vài chục ms với hàng triệu function ngắn ngày.
+- **WebAssembly** — model thực thi mới, isolation ở tầng VM thay vì OS.
+
+Mỗi vấn đề tạo ra một dòng giải pháp khác nhau. Section này điểm qua bốn cách phổ biến.
+
+### gVisor — userspace kernel
+
+> **gVisor**: Một "application kernel" của Google, viết bằng Go. Container chạy trên runtime `runsc` không gọi syscall trực tiếp tới kernel host — chúng gọi tới **Sentry**, một mini-kernel chạy trong userspace, Sentry mới gọi (một tập rất nhỏ) syscall thực sự xuống kernel. Mục tiêu: thêm một lớp giảm thiểu attack surface giữa container và kernel.
+
+```text
++----------------------+
+| Container app        |
+| (issues syscalls)    |
++----------------------+
+           |            
+           v            
++----------------------+
+| gVisor Sentry        |
+| (impl. syscalls)     |
++----------------------+
+           |            
+           v            
++----------------------+
+| Host kernel          |
++----------------------+
+```
+
+Sentry là userspace "kernel" của gVisor, viết bằng Go — nó intercept syscall từ container qua ptrace (mặc định cũ) hoặc KVM platform (nhanh hơn, khuyến nghị cho production). Sentry tự xử lý syscall và chỉ gọi xuống host kernel khoảng ~50 syscall an toàn nhất.
+
+Sentry tự implement filesystem, network stack, scheduling, ... Khi container gọi `open("/etc/passwd")`, Sentry xử lý (kiểm tra permission, lookup theo mount table của nó), rồi mới gọi xuống host nếu cần.
+
+Trade-off:
+- **Pro**: attack surface giảm khoảng 10 lần. Một CVE kernel thường không vượt qua được Sentry.
+- **Pro**: tương thích OCI — drop-in replacement của `runc` trong Kubernetes (`--runtime=runsc`).
+- **Con**: performance overhead ~10-30%, một số syscall (đặc biệt là syscall sâu vào kernel) chậm hẳn.
+- **Con**: không 100% Linux ABI compatible — vài binary đặc biệt không chạy.
+
+Use case: Google Cloud Run, một số function platform, học máy sandbox.
+
+### Kata Containers — micro-VM
+
+> **Kata Containers**: Mỗi container chạy trong một **micro-VM** riêng (KVM + một guest kernel nhỏ). Vẫn dùng OCI bundle, vẫn `kata-runtime` thay `runc`. Cô lập ở tầng hardware-virtualization như VM, nhưng performance và start time gần với container.
+
+```text
++----------------- pod -----------------+
+|  +------- micro-VM --------+          |
+|  | Guest kernel (minimal)  |          |
+|  | +-- container A         |          |
+|  | +-- container B         |          |
+|  +-------------------------+          |
++---------------------------------------+
+                    |                    
+                    v   (via KVM)        
++---------------------------------------+
+|         Host kernel + KVM             |
++---------------------------------------+
+```
+
+Mỗi pod (hoặc mỗi container, configurable) được wrap trong một VM riêng. Guest kernel rất nhỏ (~5MB), boot trong dưới 200ms. Bên trong, container chạy như bình thường, nhưng nếu một CVE kernel cho phép thoát container — chỉ thoát vào *guest kernel*, vẫn phải vượt KVM mới đụng được host.
+
+Trade-off:
+- **Pro**: isolation mạnh tương đương VM truyền thống.
+- **Pro**: tương thích OCI, drop-in cho Kubernetes.
+- **Con**: overhead RAM ~50-100MB per pod (vì có guest kernel).
+- **Con**: hỗ trợ host nested-virtualization (KVM khả dụng).
+
+Use case: multi-tenant Kubernetes (Confidential Containers, một số managed Kubernetes của cloud).
+
+### Firecracker — micro-VM cho FaaS
+
+> **Firecracker**: Hypervisor của AWS, viết bằng Rust, được tối ưu cho mô hình "tạo + tiêu hủy nhanh". Boot một micro-VM (kernel guest cực kỳ trimmed) trong **dưới 125ms**, RAM overhead ~5MB. Là engine đằng sau AWS Lambda và Fargate.
+
+Firecracker không phải là container runtime — nó là một hypervisor (như KVM/QEMU). Nhưng nó được thiết kế *cho* workload kiểu container: stateless, ngắn ngày, đông đảo.
+
+Khác Kata: Firecracker chỉ implement subset rất nhỏ của hardware ảo hoá (chỉ virtio devices cần thiết — net, block, vsock; không có PCI, USB, ...). Trade-off compatibility lấy speed và security.
+
+```text
+Firecracker design philosophy:
+  - Minimal device model (chỉ virtio)
+  - REST API để control
+  - Rust => memory safety
+  - Designed for "millions of VMs / day"
+```
+
+Use case: serverless function platform, containerd-shim cho Kubernetes (qua project firecracker-containerd).
+
+### WebAssembly — model thực thi mới
+
+> **WebAssembly (Wasm)**: Một bytecode portable, sandboxed, deterministic, ban đầu cho browser. Đang lan ra server-side qua **WASI (WebAssembly System Interface)** — một chuẩn syscall mới được thiết kế lại từ đầu cho isolation.
+
+WASM khác container về bản chất: nó không phải là Linux container — nó là một **VM runtime** (như JVM, CLR). Code biên dịch ra `.wasm` chạy trên một runtime (Wasmtime, WasmEdge, wasmer, ...). Runtime tự sandbox: code WASM không có syscall trực tiếp, chỉ có WASI functions được host cấp.
+
+```text
++----------------------+
+| .wasm bytecode       |
++----------------------+
+           |            
+           v            
++----------------------+
+| Wasm runtime         |
+|  - sandbox memory    |
+|  - capability-based  |
+|  - WASI imports      |
++----------------------+
+           |            
+           v            
++----------------------+
+| Host OS              |
++----------------------+
+```
+
+Đặc điểm:
+- **Tiny**: image .wasm thường vài MB.
+- **Fast start**: dưới 10ms cold start.
+- **Capability-based**: code WASM không thấy file system trừ khi được explicit cấp.
+- **Portable**: cùng `.wasm` chạy trên Linux, Mac, Windows, ARM, RISC-V, browser.
+
+Trade-off:
+- **Con**: phải biên dịch lại ứng dụng ra WASM (Rust, Go, C/C++ ok; nhưng Python/Java đang chậm dần ngấm vào WASM).
+- **Con**: hệ sinh thái còn non — không có "Linux ecosystem" full.
+
+Kubernetes có shim cho WASM (`runwasi`) — bạn có thể chạy `.wasm` workload trong pod như container thường.
+
+### So sánh tổng quan
+
+| Tiêu chí | runc (container) | gVisor | Kata | Firecracker | Wasm |
+|---|---|---|---|---|---|
+| Cô lập | Namespace + cgroup | + userspace kernel | + KVM | + KVM | Sandbox runtime |
+| Kernel | Host | Userspace (Sentry) | Guest (mini) | Guest (mini) | None |
+| Start time | < 1s | ~1s | ~1s | ~125ms | < 10ms |
+| Memory overhead | ~MB | ~10MB | ~50MB | ~5MB | ~MB |
+| Compatibility | Full Linux | High (some quirks) | Full | Full | Cần build WASM |
+| Attack surface | Wide | Narrow | Very narrow | Very narrow | Tiniest |
+| Use case | General | Untrusted code | Multi-tenant | FaaS | Edge, plugins |
+
+### Khi nào chọn cái gì?
+
+Vài rule of thumb:
+
+- **runc/Docker**: 95% trường hợp. Default. Đủ tốt.
+- **gVisor**: khi chạy code không tin tưởng (CI runner, sandbox cho người dùng, học máy training với code do user submit).
+- **Kata**: multi-tenant cluster (mỗi khách hàng muốn isolation level VM, nhưng vẫn muốn UX container).
+- **Firecracker**: FaaS, hàng trăm nghìn instance/day, mỗi instance ngắn ngày.
+- **WASM**: edge computing, plugin system, polyglot UDF.
+
+Đáng chú ý: các giải pháp này **không loại trừ nhau**. Một cluster Kubernetes có thể có node pool dùng `runc`, một pool khác dùng `runsc`, một pool nữa dùng Kata — tuỳ workload, RuntimeClass của Kubernetes cho phép pin pod vào runtime cụ thể. Đây là "polyglot isolation": chọn đúng công cụ cho đúng workload.
