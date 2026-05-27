@@ -23,8 +23,9 @@ with English technical terms.
 2. **Read the full post** — every line matters for a thorough review. **For multi-file posts**
    (those with a `_sections/` directory), read `page.mdx` AND every section file. Check for
    section files with: `ls src/app/blog/<slug>/_sections/` — if the directory exists, the post
-   is multi-file and you need to review all of them. Run the diagram check script on each
-   section file individually.
+   is multi-file and you need to review all of them. Run BOTH automated checks on each section
+   file: `check_diagrams.py` (text diagram alignment) and `check_mdx_syntax.py` (MDX parser
+   pitfalls like unescaped `<digit`). Both are fast and catch issues humans regularly miss.
 3. **Run through each review dimension** below and collect findings.
 4. **Output a single recommendations report** using the format at the bottom. For multi-file
    posts, prefix each finding with the filename (e.g., `_sections/03-core-concept.mdx: Line 45`).
@@ -101,6 +102,19 @@ If a diagram is complex (>15 lines), suggest a corrected version when the fix is
 - **Links** — if there are external links, flag any that look suspicious or broken patterns
 - **Length** — note the approximate word count; if the post is very short (<500 words) or very
   long (>5000 words), mention it as something to consider
+- **MDX syntax pitfalls** — the MDX parser treats `<` in prose as the start of a JSX tag.
+  Patterns like `<50ms`, `<100`, `<N seconds` break the build with `Unexpected character ...
+  before name`. This is invisible to humans reading the source but fatal at build time, so
+  always run the syntax linter:
+
+  ```bash
+  python3 .claude/skills/review-blog/scripts/check_mdx_syntax.py <path-to-mdx-file>
+  ```
+
+  The script ignores code blocks, inline code, JSX tags, and attribute string values, so it
+  only flags `<` in actual prose. Fix by wrapping in backticks (`` `<50ms` ``), inserting a
+  space (`< 50ms`), or using `&lt;`. For multi-file posts, run it across every section file
+  the same way you do for the diagram check.
 
 ### 6. Readability & engagement
 
