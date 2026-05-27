@@ -1,0 +1,47 @@
+---
+title: "gVisor vs Firecracker: Hai triết lý sandbox container"
+description: "Deep dive technical về gVisor (application kernel userspace) và Firecracker (microVM hypervisor), so sánh kiến trúc, attack surface, performance, và khi nào nên chọn cái nào."
+date: 2026-05-27
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+import Introduction from "./_sections/01-introduction.mdx";
+import GvisorArchitecture from "./_sections/02-gvisor-architecture.mdx";
+import FirecrackerArchitecture from "./_sections/03-firecracker-architecture.mdx";
+import Comparison from "./_sections/04-comparison.mdx";
+import Conclusion from "./_sections/05-conclusion.mdx";
+
+export const metadata = generateBlogMetadata({
+  title: "gVisor vs Firecracker: Hai triết lý sandbox container",
+  description: "Deep dive technical về gVisor (application kernel userspace) và Firecracker (microVM hypervisor), so sánh kiến trúc, attack surface, performance, và khi nào nên chọn cái nào.",
+  date: "2026-05-27",
+  slug: "gvisor-vs-firecracker"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/gvisor-vs-firecracker/cover.jpg"
+    alt="Abstract cybersecurity sandbox isolation visual representing gVisor and Firecracker container security"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+<Introduction />
+<GvisorArchitecture />
+<FirecrackerArchitecture />
+<Comparison />
+<Conclusion />

@@ -1,0 +1,156 @@
+## So sánh trực tiếp gVisor vs Firecracker
+
+Hai công nghệ giải cùng một bài toán bằng hai triết lý ngược nhau. Section này đặt chúng cạnh nhau theo từng góc.
+
+### Bản đồ kiến trúc — vị trí của ranh giới isolation
+
+```text
+            gVisor                                Firecracker
+  +-----------------------+            +-----------------------+
+  | Container app         |            | Guest userspace (app) |
+  | (Linux syscalls)      |            |                       |
+  +-----------------------+            +-----------------------+
+             |                                     |
+             v  (syscall intercepted)              v
+  +-----------------------+            +-----------------------+
+  | Sentry (Go userspace) |            | Guest kernel (Linux)  |
+  | - reimpl 237 syscalls |            | (full kernel, yours)  |
+  | - Netstack TCP/IP     |            +-----------------------+
+  +-----------------------+                        |
+             |                                     v  (VMEXIT)
+             v  (53-68 host syscalls)  +-----------------------+
+  +-----------------------+            | Firecracker VMM (Rust)|
+  | Host Linux kernel     |            | + KVM ioctls          |
+  +-----------------------+            +-----------------------+
+                                                   |
+                                                   v
+                                       +-----------------------+
+                                       | Host Linux kernel+KVM |
+                                       +-----------------------+
+```
+
+Điểm cốt lõi: **ở đâu là ranh giới giữa "code không tin tưởng" và "host kernel"?**
+
+- **gVisor**: ranh giới là Sentry. Container code -> Sentry (Go) -> host kernel. Mọi syscall bị Sentry filter, reimplement. Không có guest kernel.
+- **Firecracker**: ranh giới là KVM. Container code -> guest kernel -> Firecracker VMM -> host kernel. Có một guest kernel đầy đủ giữa container và host.
+
+### Bảng so sánh đầy đủ
+
+| Chiều | gVisor | Firecracker |
+|---|---|---|
+| **Loại isolation** | Application kernel (userspace) | Hardware virtualization (KVM) |
+| **Ngôn ngữ** | Go (memory-safe) | Rust (memory-safe) |
+| **Cô lập syscall qua** | Reimplement trong Sentry | Guest kernel + KVM |
+| **Có guest kernel?** | Không | Có (Linux đầy đủ) |
+| **Linux ABI compat** | Một phần (~237/350 syscall) | 100% (chạy Linux kernel thật) |
+| **Boot time** | Vài chục đến vài trăm ms | ~125 ms |
+| **Memory overhead** | ~15 MB (Sentry + Gofer) | ~5 MB (chưa tính guest kernel) |
+| **Density / host** | Hàng nghìn | Hàng nghìn |
+| **Syscall overhead** | Đáng kể (10-30% cho syscall-heavy) | Gần native (sau khi boot) |
+| **Network performance** | Netstack chậm hơn Linux ~20-30% | Native (qua TAP) |
+| **I/O storage** | Qua Gofer (giờ là Directfs, gần native) | virtio-blk (≤ kernel native, OK) |
+| **Hardware virt yêu cầu** | Không (Systrap không cần) | Có (KVM bắt buộc) |
+| **Nested virtualization** | OK | Khả dụng nhưng ít dùng |
+| **GPU passthrough** | NVIDIA support | Không (không có PCI) |
+| **OCI compatible** | Có (runsc) | Không (cần firecracker-containerd) |
+| **Use case chính** | Sandbox code không tin tưởng, GKE Sandbox | Serverless (Lambda), micro-VM platform |
+| **Mã nguồn** | ~600K LoC Go | ~50K LoC Rust |
+| **Open-sourced** | 2018 (Google) | 2018 (AWS) |
+
+### Attack surface — khác biệt căn bản
+
+Đây là điểm khác biệt nền tảng nhất.
+
+**gVisor** giảm attack surface bằng cách **thu hẹp số syscall reach được host kernel**: 350 -> 68. Container code phải xuyên qua Sentry, và Sentry chỉ "đụng" host qua 68 syscall được whitelist. Một CVE kernel trong syscall không nằm trong 68 đó *không tồn tại* về mặt thực tế trong môi trường gVisor.
+
+```text
+[Container code]
+   v
+   |  ~237 syscalls go through Sentry (Go reimpl)
+   v
+[Sentry]
+   v
+   |  53-68 host syscalls (seccomp-enforced)
+   v
+[Host kernel]
+```
+
+**Firecracker** giữ toàn bộ syscall surface — *nhưng surface đó nằm ở guest kernel của container, không phải host*. Code trong guest có thể exploit guest kernel — nhưng để thoát ra host, phải:
+
+1. Compromise guest kernel (350 syscall, đầy đủ Linux)
+2. Compromise virtio device emulation trong Firecracker VMM (~50K LoC Rust)
+3. Hoặc tìm bug trong KVM (host kernel module)
+4. Sau đó vẫn rơi vào jailer sandbox (seccomp, chroot, namespace)
+
+Hai cách tiếp cận khác nhau triết lý: gVisor *hạn chế* attack surface, Firecracker *xếp lớp* attack surface.
+
+> **Hệ quả thực tế**: nếu attacker khai thác được một kernel CVE, gVisor có khả năng cao "miễn nhiễm" (vì Sentry reimplement code). Firecracker thì *guest kernel của bạn cũng có CVE đó* — nhưng escape ra host vẫn phải qua KVM/jailer barrier.
+
+### Compatibility — đâu mới là "Linux thật"?
+
+Firecracker = guest kernel Linux thật. Bạn boot bất kỳ kernel Linux nào (5.10+, 6.x, custom). Mọi syscall hoạt động đúng như Linux, mọi `/proc`, mọi `ioctl`, mọi feature mới đều có. Workload chạy "as is".
+
+gVisor = subset của Linux. ~237/350 syscall implement, một số phần:
+- `iptables` chỉ hỗ trợ một phần (đủ Docker)
+- `nftables` hạn chế
+- `io_uring` disabled mặc định (chỉ basic op khi bật)
+- Custom hardware device files không support (trừ NVIDIA GPU, TPU)
+- KVM-trong-sandbox không được (không có nested virt)
+- Mount block device (ext4, fat32) từ trong sandbox: không
+- Một số `ioctl` exotic, `xattrs`, raw socket: không
+
+Với 90% workload web (Node, Python, Go service), không vấn đề gì. Với workload "low-level" (cần `perf`, cần `eBPF`, cần `io_uring` cao cấp): chọn Firecracker.
+
+### Performance — khác biệt theo workload
+
+Không có "cái nào nhanh hơn" — phụ thuộc workload:
+
+| Workload | gVisor | Firecracker |
+|---|---|---|
+| **CPU-bound compute** | Gần native | Gần native |
+| **Cold start (1 lần)** | 100-300 ms | ~125 ms |
+| **Cold start + snapshot** | Không có | 4-10 ms (SnapStart) |
+| **Memory / instance** | ~15 MB (Sentry+Gofer) | ~5 MB + guest kernel ~20 MB |
+| **Network throughput** | Netstack: -20%; passthrough: 0% | Native (qua TAP) |
+| **Storage IOPS** | Directfs: gần native | virtio-blk: OK nhưng có cap |
+| **Syscall-heavy** | -10% đến -50% | Gần native |
+| **Memory pressure / density** | Tốt (không có guest kernel) | Tốn hơn |
+
+Nói gọn: **Firecracker** tốt hơn cho workload cần *performance bám sát native* nhưng vẫn cần *strong isolation*. **gVisor** tốt hơn cho workload mà *cost của một guest kernel quá lớn* (vd. hàng triệu function ngắn, mỗi cái <50ms), hoặc khi *không có hardware virtualization* (chạy trong cloud VM nested).
+
+### Use case "nên dùng cái nào"
+
+**Chọn gVisor khi:**
+
+- Bạn muốn drop-in thay `runc` cho Kubernetes (có RuntimeClass sẵn cho GKE, minikube, containerd-shim).
+- Workload là OCI container chuẩn, không cần guest kernel riêng.
+- Cần defense in depth chống kernel CVE mà không muốn vận hành hypervisor.
+- Chạy trên cloud VM không có hardware virt (Systrap platform).
+- CI runner / sandbox cho user code không tin tưởng.
+- Workload web tiêu chuẩn, không quá syscall-heavy.
+
+**Chọn Firecracker khi:**
+
+- Bạn xây platform (Lambda-like, Fly Machines-like). Bạn *có* engineering capacity để build control plane.
+- Cần 100% Linux ABI — guest tự chọn kernel, tự cài module.
+- Cần snapshot/restore cực nhanh (SnapStart pattern).
+- Cần GPU/specialized hardware passthrough? Khó — Firecracker bỏ PCI.
+- Multi-tenant function platform với SLA cold start nghiêm ngặt.
+- Workload syscall-heavy mà gVisor làm chậm quá.
+
+**Cân nhắc Kata Containers nếu** bạn muốn microVM nhưng cũng cần OCI compatibility ngay (Kata wrap Firecracker hoặc QEMU thành OCI runtime).
+
+### Một góc nhìn lịch sử
+
+Hai dự án open-source gần như đồng thời (cuối 2018), từ hai đối thủ trực tiếp:
+
+```text
+2018-05  Google open-source gVisor tại KubeCon EU
+2018-11  AWS open-source Firecracker tại re:Invent
+```
+
+Trên thực tế, **gVisor cũng từng được xem xét cho Lambda** (theo lời Marc Brooker trong [Seven Years of Firecracker](https://brooker.co.za/blog/2025/09/18/firecracker.html)), nhưng AWS chọn Firecracker vì lý do compatibility — họ cần chạy *bất kỳ* runtime nào khách hàng deploy (Java JVM, .NET, Go, Rust binary tự build), không thể chấp nhận 5% workload bị break vì subset syscall.
+
+Ngược lại, Google chọn gVisor vì App Engine / Cloud Run / Cloud Functions phần lớn là *managed runtime* — Google kiểm soát interpreter, biết workload không động vào syscall exotic. Trade-off compatibility chấp nhận được.
+
+Hai chọn lựa engineering khác nhau cho hai môi trường khách hàng khác nhau, không phải vì kỹ thuật bên này thắng bên kia.

@@ -1,0 +1,155 @@
+## Firecracker — Hypervisor tối giản cho serverless
+
+### Triết lý: "Container VM"
+
+Trong khi gVisor tránh né hardware virtualization (vì lý do cloud nested-virt), Firecracker đi ngược lại: *ôm chặt KVM*. Nhưng nó cắt bỏ tất cả những phần "rườm rà" của một hypervisor truyền thống. AWS đặt câu hỏi đúng: *"a virtual machine would look like if it was designed for today's world of containers and functions?"* ([AWS announcement 2018](https://aws.amazon.com/blogs/aws/firecracker-lightweight-virtualization-for-serverless-computing/))
+
+Câu trả lời: một VMM **chỉ 50.000 dòng Rust** (so với QEMU >1.4 triệu dòng C). Không PCI, không USB, không graphics, không sound, không BIOS, không ACPI enumeration, không CPU instruction emulation. Chỉ giữ những thứ tối thiểu để guest kernel boot và phục vụ một workload kiểu container: virtio block, virtio net, virtio vsock, một virtio balloon, một serial console, và một i8042 keyboard controller bé tí — *chỉ* để guest có thể gửi tín hiệu reset/shutdown.
+
+> **Firecracker**: Một Virtual Machine Monitor (VMM) viết bằng Rust, chạy trên KVM. Mỗi process Firecracker quản lý đúng một **microVM**. Boot guest kernel trong dưới 125ms, overhead RAM khoảng 5MB, có thể tạo 150 microVM/giây mỗi host. Là engine đằng sau AWS Lambda và AWS Fargate.
+
+> **microVM**: Một VM thực sự (dùng KVM, có guest kernel riêng) nhưng được trimmed cực nhỏ — không PCI, không BIOS, chỉ có virtio device tối thiểu. Mục tiêu: chạy một container-like workload với boot time và density gần với container, mà cô lập ở tầng hardware như VM.
+
+> **Jailer**: Process wrapper khởi chạy Firecracker. Cài chroot, cgroup, namespace, seccomp filter, drop privilege, rồi mới `exec()` vào Firecracker binary. Đây là lớp phòng thủ thứ hai — nếu guest thoát được KVM, vẫn rơi vào một jail unprivileged.
+
+### Tại sao nhỏ thế?
+
+Firecracker được fork từ **crosvm** của Chromium OS (cũng là một minimal VMM Rust cho Chrome OS). Bước đầu xoá hơn nửa code — bỏ tất cả phần liên quan đến desktop, GPU, audio. Sau đó rewrite core. Rust được chọn vì *memory safety*: hầu hết CVE hypervisor lịch sử đến từ bug C kiểu use-after-free, buffer overflow trong device emulation. Rust loại được cả lớp lỗi đó. ([Nguồn: LWN](https://lwn.net/Articles/775736/), [Micah Lerner summary](https://www.micahlerner.com/2021/06/17/firecracker-lightweight-virtualization-for-serverless-applications.html))
+
+Việc bỏ PCI nghe có vẻ kinh khủng nhưng nhìn kỹ rất hợp lý: serverless function không cần plug-and-play device discovery. Guest biết trước nó có virtio-net, virtio-block ở địa chỉ cố định. Bỏ BIOS — kernel boot trực tiếp từ entry point, không cần real-mode setup. Bỏ ACPI — không có power management dynamic. Tất cả những gì còn lại là một stub guest tối giản, đủ để Linux kernel boot và chạy.
+
+### Sơ đồ kiến trúc
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/gvisor-vs-firecracker/firecracker-host-integration.png"
+    alt="Firecracker host integration diagram showing Firecracker process, KVM, microVM with guest kernel, jailer, and virtio devices"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+<p style={{textAlign: 'center', fontStyle: 'italic', fontSize: '0.9em', marginTop: '-1rem'}}>Firecracker host integration. Nguồn: <a href="https://firecracker-microvm.github.io/">firecracker-microvm.github.io</a></p>
+
+### Threading model
+
+Mỗi Firecracker process có ba loại thread ([design doc](https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md)):
+
+```text
++--------------------- Firecracker process ----------------------+
+|  Unix socket (REST API, control plane) <----+                  |
+|                                             |                  |
+|  +-------------+  +--------------+  +----------------------+   |
+|  | API thread  |  | VMM thread   |  | vCPU thread(s)       |   |
+|  | (HTTP/UDS,  |  | (devices,    |  | (loop:               |   |
+|  |  control)   |  |  IRQ chip,   |  |   ioctl(KVM_RUN))    |   |
+|  |             |  |  PIO/MMIO)   |  |   -> guest code runs |   |
+|  +-------------+  +--------------+  +----------------------+   |
+|         ^                ^                     |               |
+|         +----------------+------ ioctl KVM_* --+               |
++----------------------------------------------------------------+
+```
+
+Control plane (REST API qua Unix socket) tách bạch với data plane (vCPU và virtio queue). Một orchestrator gọi API để config CPU, RAM, attach drive, network, snapshot — sau đó vCPU thread tự chạy guest code qua `ioctl(KVM_RUN)`. Có **token-bucket rate limiter** built-in per-device cho ops/sec và bandwidth.
+
+### Jailer — defense in depth
+
+Firecracker tự nó đã rất nhỏ (TCB chỉ ~50K LoC Rust), nhưng AWS vẫn không tin. Threat model giả định: *"vCPU thread chạy malicious code ngay từ giây thứ nhất sau boot"*. Vậy nếu một CVE trong virtio device cho phép guest đọc bộ nhớ host thì sao?
+
+Jailer là câu trả lời. Trước khi `exec()` vào binary Firecracker, jailer làm tuần tự ([Nguồn: design doc](https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md)):
+
+```text
+1. Tạo cgroup (v1/v2): giới hạn CPU, memory, PIDs
+2. unshare(CLONE_NEW{PID,NET,MNT,IPC,UTS}): tách namespace
+3. chroot(/firecracker/jail/<id>): khoá filesystem vào jail
+4. setresuid()/setresgid(): drop về UID unprivileged
+5. Load seccomp-bpf filter: whitelist ~24 syscall + ~30 ioctl
+6. exec("firecracker"): chuyển sang binary chính
+```
+
+Sau bước 6, ngay cả nếu Firecracker bị hack từ bên trong, attacker chỉ thấy: một jail rỗng, không có UID 0, không có quyền sang namespace khác, không có syscall nào ngoài 24 cái được whitelist. Hai lớp barrier: KVM + jailer.
+
+### Snapshot/restore — bí mật của Lambda SnapStart
+
+Một trong những feature kỹ thuật ấn tượng nhất của Firecracker là **snapshot**: dump toàn bộ state của microVM (memory page, device state, CPU register, vCPU state) ra disk, rồi restore lại trong vài mili-giây. ([Nguồn: Marc Brooker — SnapStart blog](https://brooker.co.za/blog/2022/11/29/snapstart.html))
+
+AWS Lambda **SnapStart** dùng ý tưởng này cho cold start:
+
+```text
+Cold start truyền thống:
+  boot kernel (100ms) -> init runtime (500ms-3s) -> load code -> chạy
+  = vài giây cho lần đầu
+
+Cold start với SnapStart:
+  [build-time, offline]
+    boot kernel -> init runtime -> chạy customer init code -> SNAPSHOT
+  [request time]
+    RESTORE từ snapshot -> chạy handler  (4-10ms)
+```
+
+Một số chi tiết tinh tế:
+
+- **Hierarchical snapshot tree** — Lambda tạo snapshot phân tầng: post-kernel-boot, post-runtime-init, post-customer-init. Page nào không thay đổi giữa các tầng được dedupe, giảm ~90% data movement.
+- **Predictive page loading** — thay vì demand-paging (chậm vì network), Lambda đoán trước page nào sẽ cần và prefetch.
+- **Uniqueness hazard** — restore từ snapshot = nhiều VM có cùng PRNG state, cùng `/dev/urandom` initial pool. AWS phải patch OpenSSL, Linux kernel, `java.security.SecureRandom` để reseed sau restore. Bài học: snapshot-based cloning có hệ luỵ subtle về entropy/uniqueness.
+
+SnapStart hiện GA cho Java 11+, Python 3.12, .NET 8 — AWS quảng bá **giảm cold start tới 10x**. ([Nguồn: AWS SnapStart docs](https://docs.aws.amazon.com/lambda/latest/dg/snapstart.html))
+
+### Performance numbers
+
+Lấy từ paper NSDI '20 ([Agache et al.](https://www.usenix.org/system/files/nsdi20-paper-agache.pdf)) và [Adrian Colyer's summary](https://blog.acolyer.org/2020/03/02/firecracker/):
+
+| Metric | Firecracker | Cloud Hypervisor | QEMU |
+|---|---|---|---|
+| Memory overhead / VM | **~3-5 MiB** | ~13 MB | ~131 MB |
+| Boot time tới userspace | **~100-125 ms** | ~200 ms | seconds |
+| VM creation rate | **~150 / giây** | thấp hơn | nhiều thấp hơn |
+| Block I/O 4KB (max) | ~13,000 IOPS / 52 MB/s | cao hơn | native 340k+ |
+
+Đây là điểm yếu thừa nhận: Firecracker **không thay thế hypervisor general-purpose**. Workload I/O block performance critical (database VM) thì QEMU + virtio-blk-vhost vẫn nhanh hơn nhiều lần. Firecracker tối ưu cho *density* và *boot time*, không cho throughput.
+
+Density trong sản xuất:
+- AWS chạy production với **10x oversubscription CPU/memory**, đã test tới 20x.
+- Hàng nghìn microVM cùng tồn tại trên một host vật lý.
+- Tháng 11/2018 khi open-source: đã chạy **trillion executions/tháng** trên Lambda, **tens of millions container/tuần** trên Fargate.
+
+### API — REST qua Unix socket
+
+Firecracker không có CLI flag phức tạp. Toàn bộ lifecycle qua REST:
+
+```bash
+# Start daemon (jailed)
+firecracker --api-sock /tmp/fc.sock
+
+# Set kernel + rootfs
+curl --unix-socket /tmp/fc.sock -X PUT 'http://localhost/boot-source' \
+  -d '{"kernel_image_path": "vmlinux", "boot_args": "console=ttyS0 root=/dev/vda"}'
+
+curl --unix-socket /tmp/fc.sock -X PUT 'http://localhost/drives/rootfs' \
+  -d '{"drive_id": "rootfs", "path_on_host": "rootfs.ext4", "is_root_device": true}'
+
+# CPU / RAM
+curl --unix-socket /tmp/fc.sock -X PUT 'http://localhost/machine-config' \
+  -d '{"vcpu_count": 1, "mem_size_mib": 256}'
+
+# Network
+curl --unix-socket /tmp/fc.sock -X PUT 'http://localhost/network-interfaces/eth0' \
+  -d '{"iface_id": "eth0", "host_dev_name": "tap0"}'
+
+# Start
+curl --unix-socket /tmp/fc.sock -X PUT 'http://localhost/actions' \
+  -d '{"action_type": "InstanceStart"}'
+```
+
+Đơn giản, declarative. Đây là điểm mạnh khi build platform — orchestrator chỉ cần gọi HTTP, không phải parse log/output.
+
+### Production use beyond AWS
+
+- **Fly.io** — Fly Machines = Firecracker microVM. Start local ~10ms, cross-region ~150ms. Mỗi customer container thực sự là một VM. ([Nguồn: Fly Machines blog](https://fly.io/blog/fly-machines/))
+- **Koyeb, Northflank, Qovery, Browserbase** — serverless / sandbox platforms.
+- **firecracker-containerd** — containerd shim cho Firecracker, cho phép chạy OCI container trong microVM. **AWS Fargate's data plane chính là firecracker-containerd**. ([Nguồn: Fargate data plane](https://aws.amazon.com/blogs/containers/under-the-hood-fargate-data-plane/))
+- **Kata Containers** — Kata thực ra hỗ trợ multiple backend; chọn Firecracker thay vì QEMU mặc định khi cần boot time / density.
+
+### Liên hệ với Nitro Hypervisor
+
+Câu hỏi hay gặp: *Firecracker có phải Nitro Hypervisor không?* **Không.** Nitro Hypervisor là một hypervisor riêng (cũng dựa trên KVM), chạy trên **Nitro Card** (silicon AWS thiết kế) để cô lập EC2 instance. Firecracker chạy *bên trong* EC2 instance (thường là Nitro-based) để cung cấp lớp isolation thứ hai cho Lambda/Fargate workload. ([Nguồn: AWS Nitro](https://aws.amazon.com/ec2/nitro/))
+
+Phân lớp: Nitro cô lập *customer* (instance to instance), Firecracker cô lập *workload* (function to function trong cùng một customer).

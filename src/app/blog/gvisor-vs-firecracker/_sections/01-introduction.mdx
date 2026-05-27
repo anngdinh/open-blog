@@ -1,0 +1,19 @@
+## Mở đầu — Vì sao container truyền thống chưa đủ?
+
+Container "kiểu runc" (namespace + cgroup + seccomp) gần như là chuẩn de facto của workload hiện đại. Nhưng có một nhược điểm không thể né: **tất cả container trên cùng một host đều chia sẻ duy nhất một kernel Linux**. Toàn bộ ranh giới giữa "code của tôi" và "code của khách hàng khác" nằm gọn trong khoảng 350 syscall của kernel host. Một lỗ hổng nâng quyền trong kernel (CVE-2022-0185, Dirty Pipe, CVE-2017-7308 AF_PACKET, …) là đủ để một container thoát ra và đụng tới các workload khác.
+
+Với 95% workload nội bộ, đánh đổi này chấp nhận được. Nhưng có ba lớp use case mà nó *không* chấp nhận được:
+
+- **Serverless / FaaS đa khách hàng** — AWS Lambda, Google Cloud Run, Fly Machines. Function của hai khách hàng có thể chạy cách nhau vài mili-giây trên cùng một host vật lý. Một CVE kernel = thảm hoạ multi-tenant.
+- **Code không tin tưởng** — sandbox AI/code-execution (Replit, e2b, các môi trường "run my Python"), CI runners chạy PR của contributor lạ, các nền tảng học máy chạy notebook của khách hàng.
+- **Edge / micro-VM scale lớn** — Fly.io, Koyeb, các CDN cần hàng nghìn instance trên một máy với boot time tính bằng mili-giây.
+
+Hai cách tiếp cận đối lập nhau xuất hiện để giải bài toán này, đều ra mắt năm 2018 và đều mã nguồn mở:
+
+> **gVisor (Google)**: thay vì để container gọi syscall trực tiếp xuống kernel host, dựng một **"application kernel" trong userspace** (viết bằng Go) — gọi là Sentry — đứng giữa. Sentry tự reimplement ~237 syscall Linux bằng code Go memory-safe, và chỉ gọi xuống host khoảng 68 syscall (53 nếu không có network). Attack surface co từ 350 xuống 68. ([Nguồn: gVisor Security Basics Part 1](https://gvisor.dev/blog/2019/11/18/gvisor-security-basics-part-1/))
+
+> **Firecracker (AWS)**: thay vì tìm cách "lọc" syscall, ép mỗi workload vào một **microVM riêng** — một VM thực sự dùng KVM nhưng cực kỳ trimmed (~50K dòng Rust, không PCI, không USB, không BIOS, không graphics). Boot trong dưới 125ms với overhead RAM chỉ ~5MB. Mỗi function Lambda chạy trong một microVM Firecracker riêng. ([Nguồn: Firecracker NSDI 2020 paper](https://www.usenix.org/system/files/nsdi20-paper-agache.pdf))
+
+Cả hai đều giải cùng một bài toán — *cô lập workload không tin tưởng, ở mật độ cao, với cost thấp* — nhưng chọn hai triết lý kỹ thuật trái ngược: gVisor đi từ trên xuống (intercept syscall ở tầng application), Firecracker đi từ dưới lên (đưa workload vào VM riêng). Bài viết này mổ xẻ chi tiết từng cái, rồi đặt chúng cạnh nhau.
+
+Nếu bạn đã đọc bài [Container the Hard Way](/blog/container-the-hard-way), section này có thể coi như phần "mở rộng deep dive" cho phần *Beyond runc* — chúng ta sẽ đi sâu vào từng kiến trúc, thay vì chỉ điểm qua.

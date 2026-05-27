@@ -1,0 +1,142 @@
+## gVisor — Application kernel trong userspace
+
+### Triết lý: "Eo thắt" syscall
+
+Linux phiên bản 5.3.11 có khoảng **350 syscall**. Trong một container runc thông thường, tất cả 350 syscall đó đều là attack surface — chỉ cần một lỗ hổng trong bất kỳ syscall nào là một process trong container có thể leo quyền lên host.
+
+gVisor đặt một "**application kernel**" tên là **Sentry** đứng giữa container và host kernel. Sentry tự implement lại 237 syscall Linux bằng Go memory-safe. Khi container gọi `open()` hay `read()`, Sentry intercept syscall đó và xử lý hoàn toàn trong userspace. Bản thân Sentry — *toàn bộ* Sentry, phục vụ mọi syscall của container — chỉ gọi xuống host kernel **53 syscall** (hoặc 68 nếu bật networking). Tỷ lệ là ~5:1: 350 syscall "tiềm năng" co lại thành 68 syscall "thực sự" reach được host. ([Nguồn: gVisor Security Basics Part 1](https://gvisor.dev/blog/2019/11/18/gvisor-security-basics-part-1/))
+
+> **Sentry**: Một application kernel viết bằng Go, chạy hoàn toàn trong userspace. Đảm nhiệm vai trò của một kernel mini — implement syscall, memory management, signal delivery, scheduling, page faulting, threading. Container "thấy" Sentry như là kernel Linux thật.
+
+> **Gofer**: Một process host riêng được spawn cùng container, đóng vai trò *trusted filesystem proxy*. Sentry không được phép `open()` file trên host (seccomp chặn) — mọi truy cập filesystem phải đi qua Gofer. Đây là một thanh chắn quan trọng: nếu Sentry bị compromise, attacker vẫn không tự `open("/etc/shadow")` được, mà phải xin Gofer.
+
+> **runsc**: Binary entrypoint, OCI-compliant. Đóng gói Sentry + Platform + Gofer thành một runtime mà Docker / containerd / Kubernetes có thể plug-in qua `--runtime=runsc` hoặc `RuntimeClass`.
+
+### Sơ đồ kiến trúc
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/gvisor-vs-firecracker/gvisor-layers.png"
+    alt="gVisor architecture diagram showing application calling into Sentry which then makes restricted host syscalls"
+    style={{maxWidth: '500px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+<p style={{textAlign: 'center', fontStyle: 'italic', fontSize: '0.9em', marginTop: '-1rem'}}>Layer model của gVisor. Nguồn: <a href="https://gvisor.dev/docs/">gvisor.dev/docs/</a></p>
+
+Diagram trên minh hoạ ý tưởng "eo thắt": container phía trên có thể gọi 350 syscall (Application Calls), nhưng Sentry chỉ chuyển một tập rất nhỏ trong số đó xuống host (Limited System Calls). Phần *bên trái* trong bản đầy đủ trên gvisor.dev là Gofer — proxy filesystem riêng. Cả Sentry lẫn Gofer đều chạy với seccomp filter cực hẹp và bị `pivot_root` vào thư mục rỗng để không thể path-traverse.
+
+### Platform — cách Sentry bắt syscall của container
+
+Một câu hỏi cơ bản: khi container gọi `getpid()`, làm sao Sentry chặn được? gVisor có ba "platform" tương ứng với ba cơ chế intercept khác nhau ([Nguồn: Platform Guide](https://gvisor.dev/docs/architecture_guide/platforms/)):
+
+| Platform | Cơ chế bắt syscall | Trạng thái |
+|---|---|---|
+| **ptrace** | `PTRACE_SYSEMU` trap mỗi syscall | Deprecated (chậm) |
+| **KVM** | Sentry vừa là guest OS vừa là VMM, dùng hardware virtualization | Tốt trên bare-metal, kém trong nested-virt |
+| **Systrap** | seccomp `SECCOMP_RET_TRAP` gửi `SIGSYS` | **Default** (từ giữa 2023) |
+
+**ptrace** là cách đơn giản nhất: kernel "pause" thread của container mỗi khi nó issue syscall, đẩy nó cho Sentry xử lý, rồi resume. Vấn đề: mỗi syscall = 4 context switch user/kernel/user/kernel. Workload syscall-heavy (Redis, web server nhỏ) chậm thê thảm. Đã bị deprecate.
+
+**KVM** dùng hardware virtualization: Sentry tự đóng vai trò guest kernel *và* VMM, container chạy trong "ring 3" của một mini-VM, mỗi syscall trap qua VMEXIT. Nhanh khi chạy trên bare-metal hoặc machine có hardware virt enabled, nhưng trong VM của cloud (nested virtualization) thì chậm và nhiều khi không khả dụng.
+
+**Systrap** là default mới từ giữa 2023. Kernel cài seccomp filter trên thread container với `SECCOMP_RET_TRAP` — khi thread gọi syscall, kernel raise `SIGSYS` cho thread đó, signal handler đẩy context sang Sentry. Đây là sự hợp lý giữa ptrace (universal nhưng chậm) và KVM (nhanh nhưng đòi hardware): Systrap chạy ổn trên cả bare-metal lẫn cloud VM.
+
+### Sentry — kernel mini bằng Go
+
+Sentry implement bằng **pure Go (không CGo)**, và phần `unsafe` được tách riêng vào các file được audit kỹ. Tại sao Go? Memory safety. Một lỗ hổng kiểu use-after-free hay buffer overflow trong implementation của syscall — vốn là nguồn của hầu hết kernel CVE — trở nên khó/không thể xảy ra trong Go. Một CVE kernel ảnh hưởng đến code C của Linux gần như chắc chắn *không* ảnh hưởng đến Sentry, vì Sentry là code Go viết lại từ đầu.
+
+Một ví dụ thực tế: [CVE-2020-14386](https://cloud.google.com/blog/products/containers-kubernetes/how-gvisor-protects-google-cloud-services-from-cve-2020-14386) là một bug leo quyền trong `AF_PACKET` của kernel Linux. gVisor không bị ảnh hưởng vì Sentry tự implement packet socket code bằng Go — code Linux có bug, code Sentry hoàn toàn khác.
+
+### Gofer và filesystem — sự tiến hoá
+
+Filesystem là phần phức tạp nhất của gVisor. Sentry không có quyền `open()` file host — vậy làm sao container mở được file?
+
+Trả lời: Gofer. Khi `runsc` start một sandbox, nó cũng spawn một process Gofer riêng. Gofer có quyền truy cập rootfs của container (thông qua bind mount), Sentry thì không. Sentry và Gofer giao tiếp qua một Unix socket.
+
+Giao thức giao tiếp đã thay đổi 3 lần:
+
+| Thế hệ | Năm | Cơ chế | Trade-off |
+|---|---|---|---|
+| **9P** | 2018+ | Mỗi path component = 1 RPC. `stat("/a/b/c")` = 3+ RPC | Đơn giản, nhưng chatty và chậm |
+| **LISAFS** | 2022 | Linux Sandbox FS protocol, walk nhiều component trong 1 RPC | Gofer memory giảm 30-60%, cold start App Engine nhanh hơn 25% |
+| **Directfs** | 2023 (DEFAULT) | Gofer pass raw file descriptor sang Sentry qua `SCM_RIGHTS`. Sentry gọi `openat()` trực tiếp trên FD đó | stat nhanh hơn 2x, Ruby load nhanh hơn 17% |
+
+Directfs là cú breakthrough: Sentry vẫn không có quyền open *path* tuỳ ý, nhưng được Gofer cấp sẵn FD vào rootfs. Sentry dùng `openat(fd, "relative/path")` đi tiếp — vẫn an toàn vì bị `pivot_root` vào thư mục rỗng, không có cách nào "leo" ra khỏi FD đó. ([Nguồn: Directfs blog](https://gvisor.dev/blog/2023/06/27/directfs/), [LISAFS announcement](https://cloud.google.com/blog/products/containers-kubernetes/gvisor-file-system-improvements-for-gke-and-serverless))
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/gvisor-vs-firecracker/gvisor-resources.png"
+    alt="gVisor resource model showing sandbox containing Sentry, with Gofer outside as filesystem proxy"
+    style={{maxWidth: '600px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+<p style={{textAlign: 'center', fontStyle: 'italic', fontSize: '0.9em', marginTop: '-1rem'}}>Resource model: sandbox bao quanh Sentry, Gofer đứng ngoài làm filesystem proxy. Nguồn: <a href="https://gvisor.dev/docs/architecture_guide/resources/">gvisor.dev/docs/architecture_guide/resources/</a></p>
+
+### Networking — Netstack TCP/IP bằng Go
+
+gVisor mặc định dùng **Netstack** — một stack TCP/IP đầy đủ viết bằng Go. Container gọi `socket()`, `connect()`, `send()` — Sentry chuyển những syscall đó cho Netstack xử lý. Netstack tự ráp packet TCP/UDP, IP header, rồi đẩy frame raw xuống host qua một `AF_PACKET` socket.
+
+Hệ quả: một CVE TCP stack Linux không đụng được Netstack. Cái giá: Netstack chưa support đầy đủ các cơ chế recovery cao cấp như Linux (CUBIC variants, BBR tweaks, …) và CPU efficiency thấp hơn ~20-30% so với kernel Linux.
+
+Có chế độ thay thế **passthrough** (`--network=host`): Sentry chuyển syscall socket xuống thẳng host kernel. Nhanh hơn nhưng đánh đổi isolation — gần như trở về như container runc về mặt network attack surface. ([Nguồn: Networking guide](https://gvisor.dev/docs/architecture_guide/networking/))
+
+### Security model — ba lớp phòng thủ
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/gvisor-vs-firecracker/gvisor-security.png"
+    alt="gVisor security threat model showing isolation layers between container and host kernel"
+    style={{maxWidth: '600px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+<p style={{textAlign: 'center', fontStyle: 'italic', fontSize: '0.9em', marginTop: '-1rem'}}>Threat model. Nguồn: <a href="https://gvisor.dev/docs/architecture_guide/security/">gvisor.dev/docs/architecture_guide/security/</a></p>
+
+Theo doc chính thức ([Security Model](https://gvisor.dev/docs/architecture_guide/security/)), gVisor có ba nguyên tắc defense-in-depth:
+
+1. **No syscall bypass** — Mỗi syscall có một implementation Go độc lập. CVE syscall X trong Linux không tự động đụng được syscall X trong gVisor.
+2. **Limited functionality** — Chỉ implement những phần phổ biến. Phần "exotic" (xattrs, raw socket, hầu hết ioctl, io_uring đầy đủ) bị bỏ. Càng ít feature = càng ít attack surface.
+3. **Restricted host exposure** — Syscall mà Sentry được phép gọi xuống host được enumerate cứng và enforce bằng seccomp filter ngay khi Sentry start.
+
+### Khi nào gVisor chậm, khi nào nhanh
+
+Hiểu rõ cost model là chìa khoá khi quyết định dùng gVisor ([Nguồn: Performance guide](https://gvisor.dev/docs/architecture_guide/performance/)).
+
+**Nhanh** (gần như zero overhead):
+- Code CPU-bound thuần (math, image processing). Không gọi syscall = không qua Sentry = chạy native.
+- Workload genuinely I/O-bound (video transcode, large file scan). Disk cost át chi phí Sentry.
+
+**Chậm** (đáng kể):
+- Workload syscall-heavy. Redis-style workload có thể chậm 20-50% tuỳ benchmark, key-value store nhỏ, server xử lý nhiều request ngắn.
+- VFS-heavy (Apache serve static nhỏ): Sentry serialize VFS access.
+- Network throughput cao: Netstack thua kernel ~20-30%.
+- Cold start: khoảng vài chục đến vài trăm ms thêm so với runc.
+
+### Sử dụng thực tế
+
+Tại Google: App Engine standard, Cloud Functions, Cloud ML Engine, **Cloud Run 1st-gen** (đời sau dùng [microVM kiểu Firecracker](https://aws.amazon.com/blogs/aws/firecracker-lightweight-virtualization-for-serverless-computing/), nhưng 1st-gen vẫn dùng gVisor). Ngoài Google: nhiều CI runner cho code không tin tưởng, sandbox AI agent, OSS Fuzz.
+
+Tích hợp Kubernetes:
+
+```bash
+# Cách 1: GKE Sandbox managed
+gcloud container node-pools create sandbox-pool \
+  --cluster=my-cluster \
+  --sandbox=type=gvisor
+
+# Trong Pod manifest:
+spec:
+  runtimeClassName: gvisor
+  containers: [...]
+```
+
+```bash
+# Cách 2: Self-managed (containerd shim)
+# Install containerd-shim-runsc-v1, register RuntimeClass:
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+```
+
+Docker chỉ cần `sudo runsc install && docker run --runtime=runsc ubuntu`. ([Nguồn: gVisor Quick Start](https://gvisor.dev/docs/user_guide/quick_start/docker/))

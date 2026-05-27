@@ -1,0 +1,68 @@
+## Kết luận
+
+gVisor và Firecracker xuất hiện cùng năm 2018 vì cùng một áp lực thị trường: chạy code không tin tưởng ở mật độ cao, với cost thấp. Nhưng triết lý giải bài toán thì gần như đối nghịch:
+
+- **gVisor**: "Hãy giảm số syscall reach được host." Sentry trở thành một firewall ngữ nghĩa — container không bao giờ chạm trực tiếp host kernel.
+- **Firecracker**: "Hãy cho workload một kernel riêng — nhưng đặt nó trong VM cực nhỏ." Hardware virtualization tách biệt rõ ràng, jailer là lớp phụ.
+
+Hai cái không thay thế nhau, chúng *bổ sung*: một số platform thậm chí dùng cả hai (gVisor cho workload syscall-không-quá-exotic, Firecracker cho workload đòi 100% Linux ABI).
+
+Vài điểm rút ra:
+
+1. **Memory-safe language** (Go cho Sentry, Rust cho Firecracker) là điều kiện *cần* khi viết code trên đường nóng của isolation boundary. Cả hai team đều tránh C có chủ đích.
+2. **Defense in depth** là chuẩn. Cả hai không tin tưởng layer chính của mình — gVisor có Sentry + seccomp host + Gofer tách quyền filesystem, Firecracker có KVM barrier + jailer + seccomp.
+3. **Minimalism là feature**. Firecracker chỉ giữ 5 virtio device. Sentry chỉ implement những syscall thật sự cần. Càng ít code = càng ít CVE.
+4. **Trade-off là thật**. gVisor nhanh hơn cho function ngắn nhưng compat thấp hơn. Firecracker compat 100% nhưng tốn RAM guest kernel. Không có free lunch.
+
+Nếu bạn đang thiết kế hệ thống multi-tenant, câu hỏi đầu tiên không phải "gVisor hay Firecracker", mà là *threat model của tôi là gì*: ai chạy code không tin tưởng, ai gánh hậu quả nếu thoát container, cost của một CVE đáng giá bao nhiêu. Trả lời câu đó trước, rồi chọn công cụ phù hợp — hoặc thực dụng hơn: dùng Kubernetes RuntimeClass và để workload chọn runtime (`runc`, `runsc`, `kata`) qua label.
+
+### Đọc thêm trên blog này
+
+- [Container the Hard Way](/blog/container-the-hard-way) — mổ xẻ container từ namespace, cgroup, đến runtime OCI. gVisor và Firecracker được điểm qua ngắn trong section *Beyond runc*; bài hiện tại là phần deep dive mở rộng cho hai cái đó.
+- [eBPF Deep Dive](/blog/ebpf-deep-dive) — một con đường khác để observe và secure workload trong kernel, dùng cho phòng vệ chủ động thay vì sandbox.
+- [Harness Engineering Deep Dive](/blog/harness-engineering-deep-dive) — sandbox cho AI agent là một use case rất hiện đại của gVisor và Firecracker.
+
+## References
+
+### Tài liệu chính thức
+
+- [gVisor Documentation](https://gvisor.dev/docs/) — root docs
+- [gVisor Architecture Guide](https://gvisor.dev/docs/architecture_guide/) — Platform, Security, Networking, Performance, Resources
+- [gVisor Compatibility Reference](https://gvisor.dev/docs/user_guide/compatibility/) — danh sách syscall hỗ trợ
+- [gVisor GitHub](https://github.com/google/gvisor)
+- [Firecracker Documentation](https://firecracker-microvm.github.io/)
+- [Firecracker Design Document](https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md)
+- [Firecracker GitHub](https://github.com/firecracker-microvm/firecracker)
+- [firecracker-containerd architecture](https://github.com/firecracker-microvm/firecracker-containerd/blob/main/docs/architecture.md)
+
+### Paper và blog kỹ thuật
+
+- Agache et al., **"Firecracker: Lightweight Virtualization for Serverless Applications"**, NSDI 2020 — [PDF](https://www.usenix.org/system/files/nsdi20-paper-agache.pdf)
+- Adrian Colyer — [Firecracker paper summary (the morning paper)](https://blog.acolyer.org/2020/03/02/firecracker/)
+- Micah Lerner — [Firecracker paper summary](https://www.micahlerner.com/2021/06/17/firecracker-lightweight-virtualization-for-serverless-applications.html)
+- Marc Brooker (AWS) — [Lambda SnapStart](https://brooker.co.za/blog/2022/11/29/snapstart.html)
+- Marc Brooker (AWS) — [Seven Years of Firecracker (2025)](https://brooker.co.za/blog/2025/09/18/firecracker.html)
+- LWN — [The Firecracker VMM](https://lwn.net/Articles/775736/)
+
+### gVisor specifics
+
+- gVisor blog — [Security Basics Part 1](https://gvisor.dev/blog/2019/11/18/gvisor-security-basics-part-1/) — nguồn chính cho con số 237/68/53 syscall
+- gVisor blog — [Directfs filesystem (2023)](https://gvisor.dev/blog/2023/06/27/directfs/)
+- Google Cloud — [gVisor filesystem improvements (LISAFS)](https://cloud.google.com/blog/products/containers-kubernetes/gvisor-file-system-improvements-for-gke-and-serverless)
+- Google Cloud — [How gVisor protects against CVE-2020-14386](https://cloud.google.com/blog/products/containers-kubernetes/how-gvisor-protects-google-cloud-services-from-cve-2020-14386)
+- Google Cloud — [Open-sourcing gVisor announcement](https://cloud.google.com/blog/products/identity-security/open-sourcing-gvisor-a-sandboxed-container-runtime)
+- Google Cloud — [GKE Sandbox docs](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/sandbox-pods)
+
+### Firecracker production stories
+
+- AWS — [Firecracker open-source announcement (2018)](https://aws.amazon.com/blogs/aws/firecracker-lightweight-virtualization-for-serverless-computing/)
+- AWS — [Under the hood: Fargate data plane](https://aws.amazon.com/blogs/containers/under-the-hood-fargate-data-plane/)
+- AWS — [Lambda SnapStart documentation](https://docs.aws.amazon.com/lambda/latest/dg/snapstart.html)
+- AWS — [Nitro System overview](https://aws.amazon.com/ec2/nitro/)
+- Fly.io — [Fly Machines](https://fly.io/blog/fly-machines/)
+- Fly.io — [Learn Firecracker VM](https://fly.io/learn/firecracker-vm/)
+
+### So sánh & phân tích
+
+- Northflank — [Kata Containers vs Firecracker vs gVisor](https://northflank.com/blog/kata-containers-vs-firecracker-vs-gvisor)
+- Microarchitectural security study — [Springer Link](https://link.springer.com/content/pdf/10.1007/978-3-031-80020-7_1)
