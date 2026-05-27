@@ -116,7 +116,7 @@ Không có "cái nào nhanh hơn" — phụ thuộc workload:
 | **Syscall-heavy** | -10% đến -50% | Gần native |
 | **Memory pressure / density** | Tốt (không có guest kernel) | Tốn hơn |
 
-Nói gọn: **Firecracker** tốt hơn cho workload cần *performance bám sát native* nhưng vẫn cần *strong isolation*. **gVisor** tốt hơn cho workload mà *cost của một guest kernel quá lớn* (vd. hàng triệu function ngắn, mỗi cái <50ms), hoặc khi *không có hardware virtualization* (chạy trong cloud VM nested).
+Nói gọn: **Firecracker** tốt hơn cho workload cần *performance bám sát native* nhưng vẫn cần *strong isolation*. **gVisor** tốt hơn cho workload mà *cost của một guest kernel quá lớn* (vd. hàng triệu function ngắn, mỗi cái `<50ms`), hoặc khi *không có hardware virtualization* (chạy trong cloud VM nested).
 
 ### Use case "nên dùng cái nào"
 
