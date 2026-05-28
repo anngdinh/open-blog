@@ -1,0 +1,684 @@
+---
+title: "Triển khai Envoy Gateway + cert-manager + Cloudflare DNS-01 (wildcard) trên Kubernetes"
+description: "End-to-end guide: từ cluster Kubernetes trắng đến một Gateway HTTPS có wildcard cert Let's Encrypt, tự renew, kèm default landing page cho subdomain chưa cấu hình."
+date: 2026-05-28
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+export const metadata = generateBlogMetadata({
+  title: "Triển khai Envoy Gateway + cert-manager + Cloudflare DNS-01 (wildcard) trên Kubernetes",
+  description: "End-to-end guide: từ cluster Kubernetes trắng đến một Gateway HTTPS có wildcard cert Let's Encrypt, tự renew, kèm default landing page cho subdomain chưa cấu hình.",
+  date: "2026-05-28",
+  slug: "envoy-gateway-cert-manager-cloudflare-wildcard"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/envoy-gateway-cert-manager-cloudflare-wildcard/cover.jpg"
+    alt="Mạng lưới kết nối trên nền tối, biểu tượng cho edge layer HTTPS của Kubernetes"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+> End-to-end guide: từ cluster Kubernetes trắng đến một Gateway HTTPS có wildcard cert Let's Encrypt, tự renew, kèm default landing page cho subdomain chưa cấu hình.
+
+## 1. Mục tiêu
+
+Bài này dựng một edge layer cho Kubernetes có 4 tính chất:
+
+1. **TLS wildcard** `*.example.com` — không phải cấp cert cho từng subdomain.
+2. **Auto-renew** — cert hết hạn cứ 90 ngày, cert-manager tự xoay.
+3. **HTTP→HTTPS redirect** mặc định.
+4. **Default backend** — subdomain chưa cấu hình route thì rơi về một trang landing thay vì 404.
+
+Stack:
+
+| Thành phần | Version | Vai trò |
+|---|---|---|
+| Kubernetes | 1.30.x | Cluster (bài này dùng VKS của VNG, nhưng bất kỳ k8s nào đều dùng được) |
+| Gateway API | v1.2.1 (standard) | CRDs `Gateway`, `HTTPRoute`, … |
+| Envoy Gateway | v1.3.0 | Implementation của Gateway API (data plane là Envoy) |
+| cert-manager | v1.20.x | Xin/renew cert qua ACME |
+| Let's Encrypt | — | CA |
+| Cloudflare | — | DNS provider cho DNS-01 challenge |
+
+Domain mẫu trong bài: `*.sb.annd.io.vn`. Hãy thay bằng domain của bạn khi đọc.
+
+> Các version trên là tại thời điểm viết bài. Khi đọc, hãy thay bằng phiên bản mới nhất tương thích — Gateway API và Envoy Gateway minor-bump khá nhanh, còn cert-manager thì nhớ pin `>= 1.17` nếu dùng Cloudflare DNS-01 (xem mục 9.2).
+
+## 2. Kiến thức nền tảng
+
+Trước khi đi vào triển khai, cùng định nghĩa nhanh các khái niệm chính.
+
+> **Gateway API**: Là project kế nhiệm chính thức của Ingress trong Kubernetes, do SIG-Network phát triển. Tách rõ vai trò `GatewayClass` (infra-ops), `Gateway` (cluster-ops, mở listener/cấp cert) và `HTTPRoute` (app-ops, gắn route vào Gateway). Hỗ trợ đa giao thức HTTP/gRPC/TCP/TLS và các tính năng nâng cao như traffic split, header rewrite, redirect được chuẩn hoá ở mức spec.
+
+> **Envoy Gateway**: Là implementation tham chiếu của Gateway API được CNCF endorse, dùng Envoy làm data plane. Nhẹ hơn full service mesh (Istio) nhưng vẫn hưởng performance và feature của Envoy.
+
+> **cert-manager**: Là Kubernetes add-on tự động hoá việc xin và gia hạn TLS certificate. Hỗ trợ nhiều issuer (Let's Encrypt, HashiCorp Vault, Venafi, CA tự ký…) và nhiều giải pháp xác minh sở hữu domain.
+
+> **ACME (Automatic Certificate Management Environment)**: Là giao thức cho phép tự động hoá việc xác minh domain và cấp phát certificate. Let's Encrypt là CA dùng ACME phổ biến nhất hiện nay.
+
+> **DNS-01 challenge**: Là phương thức ACME chứng minh sở hữu domain bằng cách yêu cầu chủ domain tạo một TXT record dạng `_acme-challenge.example.com` với giá trị do CA quy định. Khác với HTTP-01, DNS-01 không cần expose port 80 và là cách **duy nhất** để xin wildcard cert.
+
+> **Wildcard certificate**: Là TLS certificate cover tất cả subdomain cấp 1 của một domain, ví dụ `*.example.com` cover `app.example.com`, `api.example.com`… nhưng **không** cover `app.foo.example.com`.
+
+### Tại sao bộ ba này, mà không phải Ingress + cert-manager?
+
+**Ingress đang dần lỗi thời.** Gateway API có model rõ hơn (tách `Gateway` cluster-ops vs `HTTPRoute` app-ops), spec đa giao thức (HTTP/gRPC/TCP/TLS), và biểu hiện chuẩn cho các tính năng nâng cao (traffic split, header rewrite, redirect…).
+
+**Envoy Gateway** là implementation tham chiếu được CNCF endorse, dùng Envoy làm data plane. Nó nhẹ hơn full Istio nhưng vẫn hưởng performance/feature của Envoy.
+
+**Wildcard cert bắt buộc DNS-01.** Let's Encrypt không cho `*.example.com` qua HTTP-01 vì không xác định được phải gọi subdomain nào để verify. DNS-01 chứng minh sở hữu domain bằng cách tạo TXT record `_acme-challenge.example.com`. Vì vậy cert-manager cần API quyền tạo/xoá DNS record — ở đây dùng Cloudflare API token.
+
+## 3. Kiến trúc
+
+```text
+Client --HTTPS--> LoadBalancer --> Envoy Proxy --> HTTPRoute --> Service --> Pod
+                                       |
+                                       | TLS terminate
+                                       v
+                              Secret wildcard-tls
+                                       ^
+                                       | create / renew
+                                cert-manager --DNS-01--> Cloudflare API
+                                       ^
+                                       | ACME
+                                  Let's Encrypt
+```
+
+Phân tách namespace:
+
+| Namespace | Chứa |
+|---|---|
+| `envoy-gateway-system` | Controller Envoy Gateway + data-plane Envoy pods |
+| `cert-manager` | cert-manager controller + Cloudflare API token Secret |
+| `envoy-gateway` | `Gateway`, wildcard `Certificate`, HTTPRoute hệ thống |
+| `<app>` | App của bạn + HTTPRoute riêng |
+
+## 4. Chuẩn bị
+
+### 4.1. Cluster + tool
+
+```bash
+kubectl version --client          # >= 1.27 ok
+helm version                      # v3.x
+kubectl cluster-info              # phải kết nối được tới cluster
+```
+
+Cluster cần có một mechanism cấp `LoadBalancer` External IP — managed k8s thường có sẵn (cloud LB). Nếu chạy on-prem, cài MetalLB trước.
+
+### 4.2. Cloudflare API token
+
+Trên Cloudflare dashboard → **My Profile → API Tokens → Create Token → Custom token**:
+
+| Permission | Resource |
+|---|---|
+| Zone — **Zone — Read** | Include — Specific zone — `example.com` |
+| Zone — **DNS — Edit** | Include — Specific zone — `example.com` |
+
+**Lưu ý:** dùng API Token, **không** dùng Global API Key. Nếu wildcard là `*.sub.example.com` và Cloudflare zone là `example.com`, scope token vào `example.com` (zone gốc), không phải `sub.example.com`.
+
+## 5. Cài đặt từng bước
+
+### 5.1. Gateway API CRDs
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+```
+
+Verify:
+
+```bash
+kubectl get crd | grep gateway.networking.k8s.io
+# gateways, httproutes, gatewayclasses, grpcroutes, referencegrants
+```
+
+### 5.2. cert-manager
+
+```bash
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace \
+  --version v1.20.2 \
+  --set crds.enabled=true
+```
+
+> **Đừng cài v1.16.x.** Có bug khi cleanup DNS record qua Cloudflare API (sẽ phân tích ở phần Troubleshooting). Dùng v1.17+ hoặc mới hơn.
+
+Verify:
+
+```bash
+kubectl -n cert-manager get pods
+# cert-manager, cert-manager-cainjector, cert-manager-webhook đều Running
+```
+
+### 5.3. Envoy Gateway
+
+```bash
+helm install eg oci://docker.io/envoyproxy/gateway-helm \
+  --version v1.3.0 \
+  --namespace envoy-gateway-system --create-namespace
+```
+
+Verify:
+
+```bash
+kubectl -n envoy-gateway-system get pods
+# envoy-gateway-xxx Running
+```
+
+### 5.4. Cloudflare API token Secret
+
+**Không commit token vào git.** Tạo Secret trực tiếp bằng kubectl:
+
+```bash
+kubectl create secret generic cloudflare-api-token \
+  --namespace cert-manager \
+  --from-literal=api-token='<paste-token-here>'
+```
+
+### 5.5. ClusterIssuer (staging + prod)
+
+Tạo `clusterissuer-staging.yaml`:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    email: you@example.com
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - dns01:
+          cloudflare:
+            apiTokenSecretRef:
+              name: cloudflare-api-token
+              key: api-token
+        selector:
+          dnsZones:
+            - example.com
+```
+
+Và `clusterissuer-prod.yaml` — y hệt nhưng đổi `server` thành `https://acme-v02.api.letsencrypt.org/directory`, đổi `name` thành `letsencrypt-prod`, `privateKeySecretRef.name` thành `letsencrypt-prod-account-key`.
+
+> **Vì sao có cả staging và prod?** Let's Encrypt prod có rate limit: **50 certificates per Registered Domain / tuần** (limit chính), và **5 Duplicate Certificates / tuần** khi cấp đúng cùng tập SAN. Mỗi sai sót (typo token, sai zone, DNS chưa propagate) sẽ ăn vào hạn mức. Staging không rate limit, dùng staging cho đến khi pipeline issue thành công ổn định, rồi mới đổi sang prod.
+
+Apply:
+
+```bash
+kubectl apply -f clusterissuer-staging.yaml -f clusterissuer-prod.yaml
+kubectl get clusterissuer
+# letsencrypt-staging   True
+# letsencrypt-prod      True
+```
+
+### 5.6. GatewayClass + Gateway
+
+`gatewayclass.yaml`:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+```
+
+`gateway.yaml` (chú ý `secretName` ở dưới phải khớp với `Certificate.spec.secretName` mục 5.7):
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: envoy-gateway
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: eg
+  namespace: envoy-gateway
+spec:
+  gatewayClassName: eg
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: "*.example.com"
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.example.com"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: wildcard-example-com-tls
+      allowedRoutes:
+        namespaces:
+          from: All
+```
+
+HTTP→HTTPS redirect — thay vì redirect ở từng app, đặt 1 catch-all HTTPRoute trên listener `http`:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: http-to-https-redirect
+  namespace: envoy-gateway
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: http
+  hostnames:
+    - "*.example.com"
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
+```
+
+Apply:
+
+```bash
+kubectl apply -f gatewayclass.yaml -f gateway.yaml
+```
+
+Lúc này HTTPS listener sẽ chưa programmed vì Secret cert chưa tồn tại — đó là kỳ vọng. Listener HTTP và redirect đã chạy.
+
+```bash
+kubectl -n envoy-gateway describe gateway eg
+# https listener: "Secret envoy-gateway/wildcard-example-com-tls does not exist." — OK
+```
+
+### 5.7. Certificate (wildcard)
+
+`certificate.yaml`:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard-example-com
+  namespace: envoy-gateway
+spec:
+  secretName: wildcard-example-com-tls
+  issuerRef:
+    name: letsencrypt-staging   # đổi sang letsencrypt-prod sau khi verify
+    kind: ClusterIssuer
+  commonName: "*.example.com"
+  dnsNames:
+    - "example.com"
+    - "*.example.com"
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  duration: 2160h    # 90d
+  renewBefore: 360h  # auto-renew ~15d trước hạn
+```
+
+Apply rồi theo dõi:
+
+```bash
+kubectl apply -f certificate.yaml
+
+# Theo dõi tiến trình (1-3 phút)
+kubectl -n envoy-gateway get certificate,certificaterequest,order,challenge
+
+# Khi Ready=True, Secret xuất hiện
+kubectl -n envoy-gateway get secret wildcard-example-com-tls
+```
+
+Flow nội bộ: `Certificate` → cert-manager tạo `CertificateRequest` → tạo `Order` ở ACME → tạo các `Challenge` (1 per dnsName) → present TXT lên Cloudflare → LE verify → cert issued → write Secret.
+
+```text
+Certificate --> CertificateRequest --> Order --> Challenge
+                                                     |
+                                                     | present TXT record
+                                                     v
+                                              Cloudflare DNS
+                                                     ^
+                                                     | verify
+                                                     |
+                                              Let's Encrypt (ACME)
+```
+
+### 5.8. Chuyển sang Let's Encrypt prod
+
+Sau khi staging chạy ổn:
+
+```bash
+# Sửa issuerRef.name: letsencrypt-staging -> letsencrypt-prod
+kubectl apply -f certificate.yaml
+
+# Xoá secret cũ để force re-issue từ prod
+kubectl -n envoy-gateway delete secret wildcard-example-com-tls
+```
+
+cert-manager sẽ tự re-issue, vài chục giây sau verify bằng:
+
+```bash
+kubectl -n envoy-gateway get secret wildcard-example-com-tls -o jsonpath='{.data.tls\.crt}' \
+  | base64 -d | openssl x509 -noout -issuer -dates
+# issuer=C=US, O=Let's Encrypt, CN=...  (intermediate có thể là E5, E7, R10, R11... tuỳ thời điểm; quan trọng là KHÔNG còn "STAGING")
+```
+
+### 5.9. DNS record
+
+Lấy External IP/hostname của LB:
+
+```bash
+kubectl -n envoy-gateway-system get svc \
+  -l gateway.envoyproxy.io/owning-gateway-name=eg
+```
+
+Tạo trên Cloudflare:
+
+```text
+A   *.example.com   <EXTERNAL-IP>   (DNS only - KHONG bat proxy)
+A   example.com     <EXTERNAL-IP>   (neu can root)
+```
+
+> **Tại sao tắt Cloudflare proxy (orange cloud)?** Khi proxy bật, Cloudflare làm TLS termination với cert của Cloudflare; cert LE wildcard chỉ chạy ở chặng origin. Trường hợp đó vẫn dùng được nhưng kiến trúc thay đổi (full strict mode, origin cert riêng…). Mặc định cứ DNS only cho đến khi cần CDN/WAF.
+
+## 6. Deploy app đầu tiên
+
+Mẫu (whoami):
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata: { name: demo }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: whoami, namespace: demo }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: whoami } }
+  template:
+    metadata: { labels: { app: whoami } }
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.10
+          ports: [{ containerPort: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: whoami, namespace: demo }
+spec:
+  selector: { app: whoami }
+  ports: [{ port: 80, targetPort: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: whoami, namespace: demo }
+spec:
+  parentRefs:
+    - name: eg
+      namespace: envoy-gateway
+      sectionName: https
+  hostnames: ["whoami.example.com"]
+  rules:
+    - matches: [{ path: { type: PathPrefix, value: / } }]
+      backendRefs:
+        - { name: whoami, port: 80 }
+```
+
+Tạo CNAME/A `whoami.example.com → <EXTERNAL-IP>`, rồi:
+
+```bash
+curl https://whoami.example.com/
+# Hostname: whoami-xxx ...
+```
+
+Vì `HTTPRoute` nằm khác namespace với `Gateway`, cần `parentRefs.namespace` chỉ rõ — `Gateway.spec.listeners[*].allowedRoutes.namespaces.from: All` đã cho phép.
+
+## 7. Default landing page cho subdomain chưa cấu hình
+
+Pattern: 1 HTTPRoute với hostname **wildcard** `*.example.com`. Gateway API spec đảm bảo hostname **cụ thể** thắng wildcard — không cần config priority.
+
+```text
+                  Request: foo.example.com
+                            |
+                            v
+                  Match HTTPRoute by hostname
+                       /            \
+       specific match /              \ no specific match
+                     v                v
+            whoami.example.com    *.example.com
+              (whoami app)         (landing page)
+```
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata: { name: landing }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: landing-html, namespace: landing }
+data:
+  index.html: |
+    <!doctype html><html><body>
+      <h1>example.com</h1>
+      <p>Subdomain chưa được cấu hình route.</p>
+    </body></html>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: landing, namespace: landing }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: landing } }
+  template:
+    metadata: { labels: { app: landing } }
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports: [{ containerPort: 80 }]
+          volumeMounts:
+            - { name: html, mountPath: /usr/share/nginx/html }
+      volumes:
+        - name: html
+          configMap: { name: landing-html }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: landing, namespace: landing }
+spec:
+  selector: { app: landing }
+  ports: [{ port: 80, targetPort: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: landing, namespace: landing }
+spec:
+  parentRefs:
+    - { name: eg, namespace: envoy-gateway, sectionName: https }
+  hostnames: ["*.example.com"]
+  rules:
+    - matches: [{ path: { type: PathPrefix, value: / } }]
+      backendRefs:
+        - { name: landing, port: 80 }
+```
+
+Test:
+
+```bash
+curl https://whoami.example.com/   # -> whoami (specific match thang)
+curl https://foo.example.com/      # -> landing
+curl https://bar.example.com/      # -> landing
+```
+
+## 8. Verify end-to-end
+
+```bash
+# Cert
+kubectl -n envoy-gateway get secret wildcard-example-com-tls -o jsonpath='{.data.tls\.crt}' \
+  | base64 -d | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+
+# Gateway
+kubectl -n envoy-gateway get gateway eg -o jsonpath='{.status.conditions}' | jq
+
+# HTTPS
+curl -v https://whoami.example.com/
+
+# Redirect
+curl -sI http://whoami.example.com/
+# HTTP/1.1 301 Moved Permanently
+# location: https://whoami.example.com/
+```
+
+## 9. Troubleshooting
+
+### 9.1. Cert kẹt ở `Ready=False`
+
+```bash
+kubectl -n envoy-gateway describe certificate wildcard-example-com
+kubectl -n envoy-gateway describe order $(kubectl -n envoy-gateway get order -o name | head -1)
+kubectl -n envoy-gateway describe challenge $(kubectl -n envoy-gateway get challenge -o name | head -1)
+kubectl -n cert-manager logs deploy/cert-manager --tail=200
+```
+
+### 9.2. Cloudflare API error 7003: `Could not route to /zones//dns_records/<id>`
+
+URL có `//` (zone_id rỗng). Trong môi trường thực tế đã gặp với **cert-manager v1.16.2**: CREATE TXT record thành công, nhưng cleanup DELETE truyền `zone_id=""` → order kẹt sau khi 1 challenge `valid`.
+
+Fix: upgrade lên v1.17+ (đang ổn ở v1.20.x).
+
+```bash
+helm upgrade cert-manager jetstack/cert-manager \
+  -n cert-manager --version v1.20.2 \
+  --set crds.enabled=true
+kubectl -n envoy-gateway delete certificaterequest --all
+kubectl -n envoy-gateway delete order --all
+kubectl -n envoy-gateway delete challenge --all
+# cert-manager tự tạo lại từ Certificate
+```
+
+### 9.3. Challenge ở trạng thái `pending` quá lâu
+
+- Token Cloudflare thiếu `Zone:Read` cho zone tương ứng → cert-manager không tìm được zone_id.
+- `dnsZones` selector trong ClusterIssuer chỉ tới zone con không tồn tại — phải là zone gốc trong Cloudflare (`example.com`, không phải `sub.example.com` trừ khi `sub.example.com` thực sự là 1 zone độc lập đã delegate NS).
+- DNS chưa propagate — DNS-01 phải chờ vài chục giây đến vài phút. Test thủ công:
+
+  ```bash
+  dig TXT _acme-challenge.example.com @1.1.1.1
+  ```
+
+### 9.4. HTTPS listener `Programmed=False` với `InvalidCertificateRef`
+
+```text
+Secret envoy-gateway/wildcard-example-com-tls does not exist.
+```
+
+Tên `Certificate.spec.secretName` không khớp `Gateway.listeners[https].tls.certificateRefs[0].name`. Hoặc cert chưa issue. Hoặc nằm khác namespace với Gateway (cần `ReferenceGrant`).
+
+### 9.5. App trả 404 từ Envoy
+
+```bash
+kubectl -n <app-ns> describe httproute <name>
+```
+
+Check `parentRefs` đúng tên/namespace/sectionName, `hostnames` khớp với host trong request, listener tương ứng có `allowedRoutes.namespaces.from: All` (hoặc dùng `Selector` với label trên namespace).
+
+## 10. Operations
+
+### 10.1. Renew
+
+cert-manager kiểm tra `renewBefore` định kỳ. Với `duration=2160h, renewBefore=360h`, cert sẽ renew khi còn ~15 ngày — không cần làm gì.
+
+Force renew thủ công:
+
+```bash
+# cmctl là binary độc lập của cert-manager (https://cert-manager.io/docs/reference/cmctl/)
+cmctl renew wildcard-example-com -n envoy-gateway
+
+# Hoặc nếu cài làm kubectl plugin:
+# kubectl cm renew wildcard-example-com -n envoy-gateway
+```
+
+### 10.2. Thêm subdomain mới
+
+Chỉ cần:
+
+1. Tạo Service + HTTPRoute mới với `hostnames: [newapp.example.com]`.
+2. Tạo DNS record CNAME/A trên Cloudflare.
+
+Không cần cấp cert mới — wildcard cover tất cả `*.example.com`.
+
+### 10.3. Rotate Cloudflare token
+
+```bash
+kubectl -n cert-manager create secret generic cloudflare-api-token \
+  --from-literal=api-token='<new-token>' \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+cert-manager pick up Secret mới ở lần ACME tiếp theo. Không cần restart.
+
+### 10.4. Backup gì?
+
+- Account key của ACME (`letsencrypt-prod-account-key` Secret trong `cert-manager` ns) — mất key thì phải đăng ký account mới, nhưng không mất quyền issue cert vì cert vẫn ở Secret hiện tại. Tốt nhất là backup.
+- Cloudflare token — quản lý ngoài cluster.
+- Cert Secret — không cần backup; cert-manager tự renew từ ACME.
+
+## 11. Tóm tắt
+
+- Wildcard cert ⇒ DNS-01 ⇒ cần API token DNS provider. Token scope hẹp (chỉ DNS:Edit + Zone:Read trên đúng zone).
+- Staging trước, prod sau — đừng đốt rate limit của LE.
+- Gateway API: hostname specific thắng wildcard — pattern landing page rất gọn.
+- Envoy Gateway nhẹ, đủ cho phần lớn use case mà không cần full service mesh.
+- Bám sát version cert-manager >= 1.17 nếu dùng Cloudflare DNS-01.
+
+Toàn bộ manifests và script kiểm chứng có thể nhóm theo thư mục `manifests/` đánh số theo thứ tự apply, rất tiện cho việc setup lại từ đầu hoặc dựng môi trường mới chỉ bằng `kubectl apply -k`.
+
+## References
+
+- [Gateway API — Kubernetes SIG-Network](https://gateway-api.sigs.k8s.io/)
+- [Envoy Gateway — Official site](https://gateway.envoyproxy.io/)
+- [Envoy Gateway — Quickstart guide](https://gateway.envoyproxy.io/latest/tasks/quickstart/)
+- [cert-manager — Documentation](https://cert-manager.io/docs/)
+- [cert-manager — Cloudflare DNS-01 solver](https://cert-manager.io/docs/configuration/acme/dns01/cloudflare/)
+- [Let's Encrypt — Challenge types](https://letsencrypt.org/docs/challenge-types/)
+- [Let's Encrypt — Rate limits](https://letsencrypt.org/docs/rate-limits/)
+- [ACME RFC 8555](https://datatracker.ietf.org/doc/html/rfc8555)
+- [Cloudflare — Create API token](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
+- [Gateway API — HTTPRoute hostname matching spec](https://gateway-api.sigs.k8s.io/api-types/httproute/#hostnames)
+
+### Related posts
+
+- [Cấu hình TLS Certificate với Nginx Ingress, Cert-Manager và Let's Encrypt](/blog/cert-manager-nginx-letsencrypt) — Cùng cert-manager nhưng với HTTP-01 và Nginx Ingress, dùng cho single-domain.
+- [Configure TLS Certificate with HAProxy Ingress and Cert-Manager](/blog/cert-manager-haproxy-guide) — Lựa chọn HAProxy Ingress thay cho Gateway API.
+- [Kubernetes CNI Overview](/blog/kubernetes-cni-overview) — Hiểu phần mạng phía dưới Gateway/Service.
+- [MetalLB Load Balancer trên Kubernetes](/blog/metallb-load-balancer-kubernetes) — Khi cluster on-prem cần External IP cho LoadBalancer service.
