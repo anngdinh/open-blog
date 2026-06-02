@@ -28,7 +28,7 @@ export const metadata = generateBlogMetadata({
 
 <div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
   <img
-    src="/images/envoy-gateway-cert-manager-cloudflare-wildcard/cover.jpg"
+    src="/images/envoy-gateway-cert-manager-cloudflare-wildcard/cover.png"
     alt="Mạng lưới kết nối trên nền tối, biểu tượng cho edge layer HTTPS của Kubernetes"
     style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
   />
@@ -653,13 +653,140 @@ cert-manager pick up Secret mới ở lần ACME tiếp theo. Không cần resta
 - Cloudflare token — quản lý ngoài cluster.
 - Cert Secret — không cần backup; cert-manager tự renew từ ACME.
 
-## 11. Tóm tắt
+## 11. Lấy real client IP với PROXY protocol
+
+Mặc định cloud LoadBalancer là L4 — packet đến Envoy thì `source IP` là IP của LB node, không phải IP thật của client. Nếu app cần biết IP thật (rate limit, audit log, geo-IP, anti-fraud), phải bật **PROXY protocol**.
+
+> **PROXY protocol**: Là giao thức do HAProxy đề xuất (v1 text, v2 binary), cho phép L4 proxy/LB chèn 1 header ở đầu TCP stream chứa source IP/port + destination IP/port của connection gốc. Backend đọc header này để biết IP thật của client. Khác với HTTP `X-Forwarded-For` (chỉ áp được với HTTP), PROXY protocol làm việc ở tầng TCP nên hoạt động cả với HTTPS pass-through, TLS termination, gRPC, raw TCP...
+
+Bật PROXY protocol cần làm ở **cả 2 chặng**:
+
+1. **LB → Envoy**: LB chèn PROXY header. Đây là setting trên cloud LB, kích hoạt qua annotation trên Service `type: LoadBalancer`.
+2. **Envoy decode header**: Envoy listener phải biết expect PROXY header để parse đúng. Trong Envoy Gateway, dùng `ClientTrafficPolicy`.
+
+Nếu chỉ bật 1 trong 2 chặng, kết nối **sẽ hỏng**: bật ở LB mà Envoy không expect → Envoy thấy junk bytes; bật ở Envoy mà LB không gửi → Envoy timeout chờ header. Vì vậy, apply 2 manifest gần như đồng thời.
+
+```text
+Client (203.0.113.42)
+       |
+       v
+   Cloud LB  ----[ PROXY v2 hdr: 203.0.113.42:54321 ]---->  Envoy listener
+                                                                |
+                                                                v
+                                                        Pod sees X-Forwarded-For: 203.0.113.42
+```
+
+### 11.1. Bật PROXY protocol ở LB (Service annotation)
+
+Envoy Gateway tự tạo Service `type: LoadBalancer` cho Gateway. Để inject annotation lên Service đó, dùng CR `EnvoyProxy` rồi attach vào `GatewayClass`.
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: proxy-config
+  namespace: envoy-gateway-system
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        annotations:
+          # VKS (VNG Cloud) - bat proxy protocol cho moi port
+          vks.vngcloud.vn/enable-proxy-protocol: "*"
+          # AWS NLB:
+          # service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"
+          # GCP (regional ext LB):
+          # cloud.google.com/l4-rbs: "enabled"
+      envoyDeployment:
+        replicas: 2
+```
+
+Gắn `EnvoyProxy` vào `GatewayClass` qua `parametersRef`:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: proxy-config
+    namespace: envoy-gateway-system
+```
+
+Apply, đợi Envoy Gateway reconcile rồi check Service đã có annotation và cloud LB đã enable PROXY protocol:
+
+```bash
+kubectl -n envoy-gateway-system get svc \
+  -l gateway.envoyproxy.io/owning-gateway-name=eg -o yaml | grep -A2 annotations
+```
+
+### 11.2. Bật PROXY protocol ở Envoy listener (ClientTrafficPolicy)
+
+`ClientTrafficPolicy` cho phép tinh chỉnh behaviour ở phía listener — target vào toàn bộ Gateway hoặc 1 listener cụ thể.
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: enable-proxy-protocol
+  namespace: envoy-gateway
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: eg
+  enableProxyProtocol: true
+```
+
+Apply rồi verify status:
+
+```bash
+kubectl -n envoy-gateway describe clienttrafficpolicy enable-proxy-protocol
+# Conditions:
+#   Type: Accepted
+#   Status: True
+```
+
+### 11.3. Verify real IP đã pass-through
+
+Deploy `whoami` (đã có ở mục 6) — nó echo headers, rất tiện để debug. Sau khi bật 2 chặng trên:
+
+```bash
+curl https://whoami.example.com/
+# ...
+# X-Forwarded-For: 203.0.113.42
+# X-Envoy-External-Address: 203.0.113.42
+# X-Real-IP: 203.0.113.42
+```
+
+Envoy tự synthesize `X-Forwarded-For`, `X-Envoy-External-Address` từ PROXY header. App downstream chỉ cần đọc 1 trong các header này.
+
+Nếu chưa thấy IP thật:
+
+- Annotation chưa propagate xuống cloud LB — check raw Service: `kubectl -n envoy-gateway-system get svc <eg-svc> -o yaml`.
+- ClientTrafficPolicy `Accepted=False` — describe sẽ thấy lỗi (sai targetRef, conflict policy…).
+- Cloud LB không hỗ trợ PROXY v2 — check doc của provider. Cloudflare proxy mode không truyền PROXY protocol mặc định, phải dùng Spectrum hoặc bật origin-side khác.
+- TCP connection bị reset ngay khi bật → 1 trong 2 chặng còn chưa đồng bộ (LB gửi header mà listener không expect, hoặc ngược lại). Rollback policy ngay rồi apply lại đồng thời.
+
+### 11.4. Lưu ý vận hành
+
+- **Apply 2 chặng atomic.** Trong production, apply 2 manifest trong 1 lệnh `kubectl apply -f envoyproxy.yaml -f clienttrafficpolicy.yaml` để giảm thời gian connection hỏng.
+- **Trust hops.** Khi có thêm CDN trước cloud LB (Cloudflare proxy, AWS CloudFront), `X-Forwarded-For` sẽ là 1 chuỗi `client, cdn, lb`. Cấu hình `numTrustedHops` trong `ClientTrafficPolicy.spec.clientIPDetection.xForwardedFor` để Envoy biết chọn IP nào làm "client thật".
+- **Overhead** ~28 bytes/connection (PROXY v2 binary) — không đáng kể, nhưng tăng nhẹ với connection ngắn.
+
+## 12. Tóm tắt
 
 - Wildcard cert ⇒ DNS-01 ⇒ cần API token DNS provider. Token scope hẹp (chỉ DNS:Edit + Zone:Read trên đúng zone).
 - Staging trước, prod sau — đừng đốt rate limit của LE.
 - Gateway API: hostname specific thắng wildcard — pattern landing page rất gọn.
 - Envoy Gateway nhẹ, đủ cho phần lớn use case mà không cần full service mesh.
 - Bám sát version cert-manager >= 1.17 nếu dùng Cloudflare DNS-01.
+- Muốn real client IP: bật PROXY protocol ở **cả** LB và Envoy listener (không bao giờ chỉ 1 bên).
 
 Toàn bộ manifests và script kiểm chứng có thể nhóm theo thư mục `manifests/` đánh số theo thứ tự apply, rất tiện cho việc setup lại từ đầu hoặc dựng môi trường mới chỉ bằng `kubectl apply -k`.
 
@@ -675,6 +802,9 @@ Toàn bộ manifests và script kiểm chứng có thể nhóm theo thư mục `
 - [ACME RFC 8555](https://datatracker.ietf.org/doc/html/rfc8555)
 - [Cloudflare — Create API token](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
 - [Gateway API — HTTPRoute hostname matching spec](https://gateway-api.sigs.k8s.io/api-types/httproute/#hostnames)
+- [PROXY protocol — Specification (HAProxy)](https://www.haproxy.org/download/2.8/doc/proxy-protocol.txt)
+- [Envoy Gateway — ClientTrafficPolicy (PROXY protocol)](https://gateway.envoyproxy.io/latest/tasks/traffic/client-traffic-policy/)
+- [Envoy Gateway — Customize Envoy Proxy (EnvoyProxy CR)](https://gateway.envoyproxy.io/latest/tasks/operations/customize-envoyproxy/)
 
 ### Related posts
 
