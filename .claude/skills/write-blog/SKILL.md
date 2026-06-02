@@ -160,37 +160,62 @@ post.
 Every blog post should have a cover image at the top, right after the `<Title>` component.
 This image sets the visual tone for the post and appears in social previews.
 
+**Do NOT construct `https://images.unsplash.com/photo-<ID>?…` URLs from memory.** You cannot
+browse Unsplash, so any photo ID you "recall" is a guess — and guessing leads to the same few
+IDs being reused across posts (duplicate covers). Fetch real candidates through the **Unsplash
+API search endpoint**, then **look at the images with the Read tool and pick the one that
+actually fits** — you cannot judge relevance from the URL alone, and a single random photo is
+often off-topic (a query for an eBPF post returned a JavaScript screenshot once).
+
 **How to find and add a cover image:**
 
-1. **Search for a relevant image** using WebSearch. Search for terms related to the blog topic
-   on free image sources. Good search queries:
-   - `"unsplash" <topic> wallpaper wide`
-   - `"pexels" <topic> technology banner`
-   - `<topic> cover image 1200x630`
+1. **Get the API key.** The key lives in the gitignored `.env` file as `UNSPLASH_ACCESS_KEY`
+   (free key from unsplash.com/developers, 50 req/hr). If it is not set, **stop** and ask the
+   user to set it — do not fall back to constructing URLs by hand.
 
-2. **Use Unsplash as the primary source.** Unsplash images are free to use without attribution
-   (though attribution is appreciated). The direct download URL pattern is:
-   ```
-   https://images.unsplash.com/photo-<ID>?w=1200&h=630&fit=crop
-   ```
-   You can also use Pexels or other free stock photo sites.
+2. **Choose a short query (1–2 words).** Long phrases like `virtual machine sandbox security
+   isolation` often return `No photos found`. Prefer `cybersecurity`, `database`, `kubernetes`,
+   `network switch`. Pick a query whose photos will read clearly at banner size.
 
-3. **Download the image** to `public/images/<slug>/cover.jpg` using curl:
+3. **Download a handful of candidates** to `/tmp` with the search helper (replace `SLUG`/`QUERY`):
+
    ```bash
-   curl -L -o public/images/<slug>/cover.jpg "<image-url>"
+   SLUG="<slug>"; QUERY="<topic keywords>"
+   export $(grep -v '^#' .env | grep UNSPLASH_ACCESS_KEY | xargs)
+   [ -z "$UNSPLASH_ACCESS_KEY" ] && { echo "UNSPLASH_ACCESS_KEY not set — stop and ask the user"; exit 1; }
+   resp=$(curl -s "https://api.unsplash.com/search/photos?query=$(printf %s "$QUERY" | python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.stdin.read()))')&per_page=6&orientation=landscape&content_filter=high" \
+     -H "Authorization: Client-ID $UNSPLASH_ACCESS_KEY")
+   # strict=False: Unsplash JSON can contain raw control chars that break strict json.
+   printf '%s' "$resp" | python3 -c "
+import sys,json
+d=json.loads(sys.stdin.read(), strict=False)
+for i,r in enumerate(d.get('results',[])[:4]):
+    print('\t'.join([str(i), r['urls']['raw'], r['id'], r['user']['name'], r['user']['links']['html']]))" \
+   | while IFS=$'\t' read -r i raw id name link; do
+       curl -sL -o "/tmp/cand-$i.jpg" "${raw}&w=1200&h=630&fit=crop&q=80"
+       echo "#$i | id=$id | author: $name | link: $link"
+     done
    ```
 
-4. **Verify the image** was downloaded and has a reasonable file size (should be >10KB):
+4. **Look at each candidate with the Read tool** (`/tmp/cand-0.jpg`, `-1`, …) and pick the one
+   that genuinely matches the topic and reads well as a banner. Note its `id`, author name, and
+   author link from the printed list. If none fit, rerun step 3 with a different query.
+
+   Then install your pick, enforce uniqueness, and trigger Unsplash download tracking (required
+   by their API terms). Replace `N` with the chosen candidate number and `ID` with its photo id:
+
    ```bash
-   ls -la public/images/<slug>/cover.jpg
+   cp "/tmp/cand-N.jpg" "public/images/$SLUG/cover.jpg"
+   newsum=$(md5sum "public/images/$SLUG/cover.jpg" | cut -d' ' -f1)
+   dup=$(find public/images -name 'cover.*' ! -path "public/images/$SLUG/*" -exec md5sum {} + | grep -c "^$newsum ")
+   [ "$dup" -ne 0 ] && echo "WARNING: this image already covers another post — pick a different candidate"
+   curl -s "https://api.unsplash.com/photos/ID/download" -H "Authorization: Client-ID $UNSPLASH_ACCESS_KEY" >/dev/null
+   rm -f /tmp/cand-*.jpg
+   ls -la "public/images/$SLUG/cover.jpg"   # confirm >10KB
    ```
 
-5. **Target size and ratio**: aim for approximately **1200x630px** (roughly 1.9:1 ratio). This
-   is the Open Graph standard and looks good as a blog banner. The `w=1200&h=630&fit=crop`
-   parameters on Unsplash URLs handle this automatically. If downloading from other sources,
-   the exact dimensions don't need to be perfect — anything in the 16:9 to 2:1 range works.
-
-6. **Place the cover image** in the MDX right after the `<Title>` component:
+5. **Place the cover image + attribution caption** right after the `<Title>` component. Unsplash's
+   API terms require crediting the photographer with the `utm_source`/`utm_medium` params shown:
    ```jsx
    <Title title={metadata.title} date={metadata.date} />
 
@@ -201,11 +226,11 @@ This image sets the visual tone for the post and appears in social previews.
        style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
      />
    </div>
+   <p style={{textAlign: 'center', fontSize: '0.85rem', opacity: 0.7, marginTop: '-1rem'}}>
+     Photo by <a href="<AUTHOR_LINK>?utm_source=open-blog&utm_medium=referral"><AUTHOR_NAME></a> on <a href="https://unsplash.com/?utm_source=open-blog&utm_medium=referral">Unsplash</a>
+   </p>
    ```
-
-7. **Choose images that match the content.** For a Kubernetes post, search for cloud/server
-   imagery. For a Go programming post, search for code/programming visuals. The image should
-   feel relevant — not a random stock photo.
+   Substitute `<AUTHOR_LINK>` and `<AUTHOR_NAME>` with the values the helper printed.
 
 ### Images
 
@@ -335,7 +360,7 @@ Before presenting the post to the user, verify:
 - [ ] Language matches what the user requested
 - [ ] Frontmatter has title, description, date
 - [ ] Imports, metadata export, BlogJsonLd, and Title components are included
-- [ ] Cover image found, downloaded to `public/images/<slug>/cover.jpg`, and placed after Title
+- [ ] Cover image fetched via the Unsplash API (not a memorized URL), unique (no md5 match with another post's cover), downloaded to `public/images/<slug>/cover.jpg`, placed after Title, with the photographer attribution caption underneath
 - [ ] All keyword definitions use the blockquote + bold format
 - [ ] Images from references are downloaded to `public/images/<slug>/`
 - [ ] No reference images were replaced with text diagrams
