@@ -1,0 +1,85 @@
+## Test trở nên dễ đến bất ngờ
+
+Còn nhớ mục tiêu gốc của Cockburn chứ — *"developed and tested in isolation from its eventual run-time devices and databases"*? Đây là chỗ Hexagonal toả sáng. Vì lõi chỉ phụ thuộc vào port, ta test nó bằng cách cắm vào những adapter "giả" (test double) thay cho database và cổng thanh toán thật.
+
+Cái `InMemoryOrderRepository` ở phần trước *chính là* một adapter test sẵn sàng dùng. Ta chỉ cần thêm một cổng thanh toán giả:
+
+```go
+// internal/core/service/order_service_test.go
+package service_test
+
+import (
+    "testing"
+
+    "ecommerce/internal/adapter/repository"
+    "ecommerce/internal/core/service"
+)
+
+// fakeGateway là test double cho secondary port PaymentGateway.
+type fakeGateway struct {
+    charged int64
+}
+
+func (f *fakeGateway) Charge(_ string, amount int64) error {
+    f.charged += amount
+    return nil
+}
+
+func TestPlaceOrder_ChargesThenPersists(t *testing.T) {
+    // Cắm các adapter in-memory vào port — không cần DB, không cần mạng.
+    repo := repository.NewInMemoryOrderRepository()
+    gateway := &fakeGateway{}
+    svc := service.NewOrderService(repo, gateway)
+
+    order, err := svc.PlaceOrder("alice@example.com", 4200)
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+
+    if order.Status != "PAID" {
+        t.Errorf("want status PAID, got %s", order.Status)
+    }
+    if gateway.charged != 4200 {
+        t.Errorf("want 4200 charged, got %d", gateway.charged)
+    }
+
+    // Đơn đã thực sự được lưu chưa?
+    got, err := repo.FindByID(order.ID)
+    if err != nil {
+        t.Fatalf("order was not persisted: %v", err)
+    }
+    if got.ID != order.ID {
+        t.Errorf("persisted order mismatch")
+    }
+}
+```
+
+Test này chạy trong vài mili-giây, không cần Docker, không cần Postgres, không cần khoá API Stripe. Nó kiểm tra đúng *quy tắc nghiệp vụ* (thu tiền trước, rồi đánh dấu PAID, rồi lưu) mà không bị nhiễu bởi hạ tầng. Khi cần kiểm thử adapter Postgres thật, ta viết integration test riêng cho *adapter đó* — chẳng hạn với [Testcontainers](https://testcontainers.com/) — tách bạch khỏi test nghiệp vụ.
+
+Đây cũng là lý do Netflix mô tả Hexagonal giúp họ *"ready for changes"*: trong bài blog kỹ thuật cùng tên, họ chia hệ thống thành ba lớp **Domain / Ports / Adapters**, nhờ đó có thể hoãn quyết định chọn database và tráo nguồn dữ liệu mà không đụng vào logic nghiệp vụ.
+
+## So sánh với Layered và Clean Architecture
+
+Hexagonal không tồn tại trong chân không. Nó là một mắt xích trong họ các kiến trúc "đặt nghiệp vụ ở trung tâm".
+
+| Tiêu chí | Layered (n-tier) | Hexagonal (Ports & Adapters) | Clean Architecture |
+|---|---|---|---|
+| Hình ảnh ẩn dụ | Các tầng xếp chồng | Lõi + nhiều cổng quanh nó | Các vòng tròn đồng tâm |
+| Chiều phụ thuộc | Tầng trên phụ thuộc tầng dưới | Mọi adapter phụ thuộc vào lõi | Vòng ngoài phụ thuộc vòng trong |
+| Vị trí nghiệp vụ | Tầng giữa | Lõi trung tâm | Vòng trong cùng (entities + use cases) |
+| Điểm nhấn riêng | Đơn giản, quen thuộc | Đối xứng driving/driven, port có thể tráo | Phân tầng chi tiết (entity / use case / adapter) |
+| Số "loại" thành phần | Thường 3 tầng | Domain, port, adapter | 4 vòng |
+| Quan hệ với DB | DB ở đáy, dễ dẫn dắt thiết kế | DB chỉ là một driven adapter | DB ở vòng ngoài cùng |
+
+Điểm mấu chốt: **Hexagonal và Clean về cơ bản nói cùng một điều** — đảo ngược phụ thuộc để bảo vệ lõi nghiệp vụ. Clean Architecture của Uncle Bob có thể xem như một cách trình bày Hexagonal với nhiều lớp chi tiết hơn (tách rõ entity và use case). Nếu bạn đã đọc [Clean Architecture in Go](/blog/clean-architecture), bạn sẽ nhận ra cấu trúc thư mục ở đó (`domain`, `usecase`, `delivery`, `infrastructure`) ánh xạ gần như một-một sang `domain`, `service`, driving adapter, và driven adapter ở đây.
+
+## Đánh đổi: khi nào KHÔNG nên dùng
+
+Hexagonal không phải "best practice" áp dụng cho mọi thứ. Như cộng đồng vẫn nhắc: nó *giải quyết một vấn đề trong một bối cảnh, nên đi kèm đánh đổi*.
+
+- **Boilerplate.** Mỗi secondary port là một interface, kèm ít nhất một adapter. Với một CRUD nhỏ hay một script dùng một lần, lớp interface này chỉ làm rối thêm.
+- **Gián tiếp (indirection).** Để lần theo một lời gọi, bạn phải nhảy qua interface tới implementation. IDE giúp được, nhưng người mới đọc code sẽ thấy "vòng vo".
+- **Cám dỗ trừu tượng hoá sớm.** Đừng tạo port cho thứ sẽ *không bao giờ* có adapter thứ hai. Một port chỉ có đúng một implementation và sẽ mãi như vậy thường là dấu hiệu trừu tượng hoá thừa.
+- **Phê bình của Martin Fowler.** Fowler lưu ý hình lục giác làm *mờ đi sự bất đối xứng tự nhiên giữa bên cung cấp dịch vụ và bên tiêu thụ dịch vụ* — điều mà mô hình phân lớp thể hiện rõ hơn. Việc phân biệt primary/secondary chính là để bù lại điểm yếu này, nhưng bạn cần hiểu nó thì sơ đồ mới có ý nghĩa.
+
+Quy tắc ngón tay cái: Hexagonal đáng giá khi ứng dụng **có logic nghiệp vụ thực sự** và **sống đủ lâu** để hạ tầng quanh nó thay đổi (đổi DB, thêm kênh giao tiếp gRPC/CLI, cần test nghiệp vụ độc lập). Với CRUD mỏng hay prototype ngắn hạn, một kiến trúc phân lớp đơn giản thường là lựa chọn tỉnh táo hơn.

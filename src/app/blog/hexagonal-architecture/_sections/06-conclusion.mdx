@@ -1,0 +1,16 @@
+## Kết luận
+
+Hexagonal Architecture không phải một framework, cũng chẳng phải một bộ thư mục bắt buộc. Nó là *một cách suy nghĩ*: tách điều ứng dụng **làm** (nghiệp vụ) khỏi điều ứng dụng **dùng** (công nghệ).
+
+Những điểm cần nhớ:
+
+- **Lõi ở trung tâm, công nghệ ở rìa.** Domain và use case không import framework hay driver database. Mọi thứ bên ngoài đều cắm vào qua port.
+- **Port là interface, adapter là implementation.** Một port có thể có nhiều adapter — Postgres cho production, in-memory cho test, mock cho ví dụ.
+- **Phân biệt primary và secondary.** Driving adapter (HTTP/CLI/test) *gọi* lõi qua primary port. Lõi *gọi* secondary port; driven adapter (DB/payment) *hiện thực* nó. Hai phía, hai chiều quan hệ trái ngược.
+- **Phụ thuộc luôn chỉ vào trong.** Đây là Dependency Inversion. Nhờ nó, đổi adapter chỉ cần sửa đúng một chỗ: composition root.
+- **Test gần như miễn phí.** Cắm adapter in-memory vào port, kiểm thử nghiệp vụ trong vài mili-giây mà không cần hạ tầng thật.
+- **Đừng lạm dụng.** Boilerplate và indirection là cái giá phải trả. Chỉ dùng khi nghiệp vụ đủ phức tạp và ứng dụng đủ sống lâu để xứng đáng.
+
+Bước tiếp theo gợi ý: lấy ví dụ Go ở trên, thử thay `InMemoryOrderRepository` bằng một adapter Postgres thật và viết integration test riêng cho nó — bạn sẽ tận mắt thấy lõi và các test nghiệp vụ *không đổi một dòng nào*. Sau đó, thử thêm một driving adapter thứ hai (ví dụ một lệnh CLI) gọi vào cùng `OrderService` — và cảm nhận tính đối xứng của hình lục giác.
+
+Nếu bạn muốn đào sâu hơn vào cùng triết lý "đặt nghiệp vụ ở trung tâm" nhưng với cách phân tầng chi tiết hơn, hãy đọc tiếp [Clean Architecture in Go](/blog/clean-architecture) — người anh em rất gần của Hexagonal.

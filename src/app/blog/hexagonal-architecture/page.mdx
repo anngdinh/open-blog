@@ -1,0 +1,66 @@
+---
+title: "Hexagonal Architecture (Ports & Adapters)"
+description: "Hiểu Hexagonal Architecture qua ports và adapters, rồi áp dụng bằng Go — thiết kế ứng dụng độc lập với framework, database và dễ test."
+date: 2026-06-13
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+import Introduction from "./_sections/01-introduction.mdx";
+import TheProblem from "./_sections/02-the-problem.mdx";
+import CoreConcepts from "./_sections/03-core-concepts.mdx";
+import HandsOnGo from "./_sections/04-hands-on-go.mdx";
+import TestingTradeoffs from "./_sections/05-testing-tradeoffs.mdx";
+import Conclusion from "./_sections/06-conclusion.mdx";
+
+export const metadata = generateBlogMetadata({
+  title: "Hexagonal Architecture (Ports & Adapters)",
+  description: "Hiểu Hexagonal Architecture qua ports và adapters, rồi áp dụng bằng Go — thiết kế ứng dụng độc lập với framework, database và dễ test.",
+  date: "2026-06-13",
+  slug: "hexagonal-architecture"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/hexagonal-architecture/cover.jpg"
+    alt="Tổ ong hình lục giác xếp khít nhau — ẩn dụ cho kiến trúc hexagonal với nhiều cổng (ports) bao quanh một lõi"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+<p style={{textAlign: 'center', fontSize: '0.85rem', opacity: 0.7, marginTop: '-1rem'}}>
+  Photo by <a href="https://unsplash.com/@ante_kante?utm_source=open-blog&utm_medium=referral">Ante Hamersmit</a> on <a href="https://unsplash.com/?utm_source=open-blog&utm_medium=referral">Unsplash</a>
+</p>
+
+<Introduction />
+<TheProblem />
+<CoreConcepts />
+<HandsOnGo />
+<TestingTradeoffs />
+<Conclusion />
+
+## References
+
+- [Hexagonal architecture — Alistair Cockburn](https://alistair.cockburn.us/hexagonal-architecture) — bài viết gốc định nghĩa pattern và ý đồ thiết kế
+- [Hexagonal architecture (software) — Wikipedia](https://en.wikipedia.org/wiki/Hexagonal_architecture_(software)) — lịch sử, định nghĩa port/adapter và phần phê bình
+- [Ready for changes with Hexagonal Architecture — Netflix Technology Blog](https://netflixtechblog.com/ready-for-changes-with-hexagonal-architecture-b315ec967749) — cách Netflix áp dụng ba lớp Domain / Ports / Adapters
+- [Hexagonal Architecture Explained — Arho Huttunen](https://www.arhohuttunen.com/hexagonal-architecture/) — giải thích primary/secondary port rõ ràng kèm sơ đồ
+- [Hexagonal Architecture — QWAN](https://www.qwan.eu/2020/08/20/hexagonal-architecture.html) — làm rõ ý đồ gốc của Cockburn và các hiểu lầm thường gặp
+- [Hexagonal Architecture / Ports and Adapters using Go — buarki (dev.to)](https://dev.to/buarki/hexagonal-architectureports-and-adapters-clarifying-key-concepts-using-go-14oo) — minh hoạ port/adapter bằng Go
+- [Hexagonal architecture pattern — AWS Prescriptive Guidance](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/hexagonal-architecture.html) — góc nhìn áp dụng trong hệ thống cloud
+
+### Related posts
+
+- [Clean Architecture in Go](/blog/clean-architecture) — người anh em gần gũi của Hexagonal: cùng triết lý "business logic ở trung tâm", nhưng chia thành các vòng tròn đồng tâm với Dependency Rule

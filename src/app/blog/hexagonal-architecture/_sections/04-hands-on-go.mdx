@@ -1,0 +1,385 @@
+## Áp dụng bằng Go: dịch vụ đặt hàng
+
+Lý thuyết đủ rồi — hãy xây một ví dụ chạy được. Go là ngôn ngữ rất hợp với Hexagonal: `interface` ngầm định (implicit) của Go biến port thành thứ tự nhiên, còn việc tiêm phụ thuộc (dependency injection) chỉ là truyền tham số vào constructor.
+
+Ta sẽ xây một **dịch vụ đặt hàng** nhỏ: nhận yêu cầu tạo đơn, thu tiền qua một cổng thanh toán, rồi lưu đơn. Nó có một primary port (use case) và hai secondary port (lưu trữ + thanh toán) — vừa đủ để thấy cả hai phía của hình lục giác.
+
+### Cấu trúc thư mục
+
+```text
+ecommerce/
+├── cmd/
+│   └── api/
+│       └── main.go              # composition root: chọn adapter, ráp mọi thứ
+├── internal/
+│   ├── core/                    # LÕI — không import gì từ bên ngoài
+│   │   ├── domain/
+│   │   │   └── order.go         # entity + quy tắc nghiệp vụ
+│   │   ├── port/
+│   │   │   ├── order_service.go     # primary port (driving)
+│   │   │   ├── order_repository.go  # secondary port (driven)
+│   │   │   └── payment.go           # secondary port (driven)
+│   │   └── service/
+│   │       └── order_service.go     # use case: hiện thực primary port
+│   └── adapter/
+│       ├── handler/
+│       │   └── http.go          # primary adapter (driving)
+│       ├── repository/
+│       │   ├── memory.go        # secondary adapter (driven)
+│       │   └── postgres.go      # secondary adapter (driven)
+│       └── payment/
+│           └── stripe.go        # secondary adapter (driven)
+└── go.mod
+```
+
+Quy ước quan trọng: package dưới `core/` **không bao giờ** import package dưới `adapter/`. Chiều phụ thuộc chỉ một hướng — từ ngoài vào trong.
+
+### Lõi: domain
+
+`domain` chứa thực thể và quy tắc nghiệp vụ thuần tuý. Không `database/sql`, không `net/http`.
+
+```go
+// internal/core/domain/order.go
+package domain
+
+import "errors"
+
+type Status string
+
+const (
+    StatusPending Status = "PENDING"
+    StatusPaid    Status = "PAID"
+)
+
+type Order struct {
+    ID       string
+    Customer string
+    Amount   int64 // số tiền tính bằng cent, tránh sai số dấu phẩy động
+    Status   Status
+}
+
+var ErrInvalidAmount = errors.New("order amount must be positive")
+
+// NewOrder là "factory" thực thi quy tắc nghiệp vụ: một đơn hợp lệ
+// luôn có số tiền dương và khởi đầu ở trạng thái PENDING.
+func NewOrder(id, customer string, amount int64) (*Order, error) {
+    if amount <= 0 {
+        return nil, ErrInvalidAmount
+    }
+    return &Order{
+        ID:       id,
+        Customer: customer,
+        Amount:   amount,
+        Status:   StatusPending,
+    }, nil
+}
+
+// MarkPaid là một chuyển trạng thái nghiệp vụ.
+func (o *Order) MarkPaid() {
+    o.Status = StatusPaid
+}
+```
+
+### Lõi: các port
+
+Tất cả interface đều khai báo *trong* lõi. Đây là điểm khiến Dependency Rule thành hiện thực.
+
+Primary port — use case mà lõi *cung cấp* ra ngoài:
+
+```go
+// internal/core/port/order_service.go
+package port
+
+import "ecommerce/internal/core/domain"
+
+// OrderService là PRIMARY (driving) port.
+// Driving adapter (HTTP, CLI, test) phụ thuộc vào interface này.
+type OrderService interface {
+    PlaceOrder(customer string, amount int64) (*domain.Order, error)
+    GetOrder(id string) (*domain.Order, error)
+}
+```
+
+Secondary port — thứ lõi *cần* từ bên ngoài. Chú ý: chúng được lõi định nghĩa, adapter mới đi hiện thực.
+
+```go
+// internal/core/port/order_repository.go
+package port
+
+import "ecommerce/internal/core/domain"
+
+// OrderRepository là SECONDARY (driven) port cho việc lưu trữ.
+// Lõi GỌI nó; adapter (Postgres, in-memory...) HIỆN THỰC nó.
+type OrderRepository interface {
+    Save(order *domain.Order) error
+    FindByID(id string) (*domain.Order, error)
+}
+```
+
+```go
+// internal/core/port/payment.go
+package port
+
+// PaymentGateway là SECONDARY (driven) port cho việc thu tiền.
+type PaymentGateway interface {
+    Charge(customer string, amount int64) error
+}
+```
+
+### Lõi: use case
+
+Đây là nơi nghiệp vụ sống. Để ý: nó hiện thực `OrderService` (primary port) và chỉ phụ thuộc vào các *interface* secondary port — chưa từng nhắc đến Postgres hay Stripe.
+
+```go
+// internal/core/service/order_service.go
+package service
+
+import (
+    "github.com/google/uuid"
+
+    "ecommerce/internal/core/domain"
+    "ecommerce/internal/core/port"
+)
+
+type orderService struct {
+    repo    port.OrderRepository
+    payment port.PaymentGateway
+}
+
+// NewOrderService nhận các driven port qua tham số — đây chính là
+// dependency injection. Nó trả về kiểu interface port.OrderService.
+func NewOrderService(repo port.OrderRepository, payment port.PaymentGateway) port.OrderService {
+    return &orderService{repo: repo, payment: payment}
+}
+
+func (s *orderService) PlaceOrder(customer string, amount int64) (*domain.Order, error) {
+    order, err := domain.NewOrder(uuid.NewString(), customer, amount)
+    if err != nil {
+        return nil, err
+    }
+
+    // Quy tắc nghiệp vụ: phải thu tiền THÀNH CÔNG trước khi xác nhận đơn.
+    if err := s.payment.Charge(customer, amount); err != nil {
+        return nil, err
+    }
+    order.MarkPaid()
+
+    if err := s.repo.Save(order); err != nil {
+        return nil, err
+    }
+    return order, nil
+}
+
+func (s *orderService) GetOrder(id string) (*domain.Order, error) {
+    return s.repo.FindByID(id)
+}
+```
+
+### Driving adapter: HTTP handler
+
+Adapter này nằm ở phía trái hình lục giác. Nó dịch HTTP request thành lời gọi vào primary port — và nó phụ thuộc vào `port.OrderService`, *không* phụ thuộc vào struct `orderService` cụ thể.
+
+```go
+// internal/adapter/handler/http.go
+package handler
+
+import (
+    "encoding/json"
+    "net/http"
+
+    "ecommerce/internal/core/port"
+)
+
+type OrderHandler struct {
+    svc port.OrderService // phụ thuộc vào PORT, không phải implementation
+}
+
+func NewOrderHandler(svc port.OrderService) *OrderHandler {
+    return &OrderHandler{svc: svc}
+}
+
+type placeOrderRequest struct {
+    Customer string `json:"customer"`
+    Amount   int64  `json:"amount"`
+}
+
+func (h *OrderHandler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
+    var req placeOrderRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, "invalid request body", http.StatusBadRequest)
+        return
+    }
+
+    order, err := h.svc.PlaceOrder(req.Customer, req.Amount)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusCreated)
+    _ = json.NewEncoder(w).Encode(order)
+}
+```
+
+### Driven adapters: lưu trữ và thanh toán
+
+Phía phải hình lục giác. Bắt đầu bằng adapter in-memory — không cần database thật, lý tưởng cho dev và test:
+
+```go
+// internal/adapter/repository/memory.go
+package repository
+
+import (
+    "errors"
+    "sync"
+
+    "ecommerce/internal/core/domain"
+    "ecommerce/internal/core/port"
+)
+
+type InMemoryOrderRepository struct {
+    mu     sync.RWMutex
+    orders map[string]*domain.Order
+}
+
+func NewInMemoryOrderRepository() *InMemoryOrderRepository {
+    return &InMemoryOrderRepository{orders: make(map[string]*domain.Order)}
+}
+
+func (r *InMemoryOrderRepository) Save(order *domain.Order) error {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    r.orders[order.ID] = order
+    return nil
+}
+
+func (r *InMemoryOrderRepository) FindByID(id string) (*domain.Order, error) {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    order, ok := r.orders[id]
+    if !ok {
+        return nil, errors.New("order not found")
+    }
+    return order, nil
+}
+
+// Kiểm tra lúc biên dịch: adapter này thoả mãn secondary port.
+// Nếu thiếu method, code sẽ KHÔNG biên dịch được.
+var _ port.OrderRepository = (*InMemoryOrderRepository)(nil)
+```
+
+Adapter Postgres hiện thực *cùng một port*, nhưng nói chuyện với database thật:
+
+```go
+// internal/adapter/repository/postgres.go
+package repository
+
+import (
+    "database/sql"
+
+    "ecommerce/internal/core/domain"
+    "ecommerce/internal/core/port"
+)
+
+type PostgresOrderRepository struct {
+    db *sql.DB
+}
+
+func NewPostgresOrderRepository(db *sql.DB) *PostgresOrderRepository {
+    return &PostgresOrderRepository{db: db}
+}
+
+func (r *PostgresOrderRepository) Save(order *domain.Order) error {
+    _, err := r.db.Exec(
+        `INSERT INTO orders (id, customer, amount, status)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status`,
+        order.ID, order.Customer, order.Amount, order.Status,
+    )
+    return err
+}
+
+func (r *PostgresOrderRepository) FindByID(id string) (*domain.Order, error) {
+    order := &domain.Order{}
+    err := r.db.QueryRow(
+        `SELECT id, customer, amount, status FROM orders WHERE id = $1`, id,
+    ).Scan(&order.ID, &order.Customer, &order.Amount, &order.Status)
+    if err != nil {
+        return nil, err
+    }
+    return order, nil
+}
+
+var _ port.OrderRepository = (*PostgresOrderRepository)(nil)
+```
+
+Và adapter thanh toán (ở đây giả lập gọi Stripe):
+
+```go
+// internal/adapter/payment/stripe.go
+package payment
+
+import "ecommerce/internal/core/port"
+
+type StripeGateway struct {
+    apiKey string
+}
+
+func NewStripeGateway(apiKey string) *StripeGateway {
+    return &StripeGateway{apiKey: apiKey}
+}
+
+func (g *StripeGateway) Charge(customer string, amount int64) error {
+    // Thực tế: gọi SDK của Stripe ở đây.
+    // Lõi không quan tâm — nó chỉ thấy interface PaymentGateway.
+    return nil
+}
+
+var _ port.PaymentGateway = (*StripeGateway)(nil)
+```
+
+### Composition root: ráp mọi thứ trong main
+
+Chỉ có *một* nơi duy nhất biết về cả port lẫn adapter cụ thể: hàm `main`. Đây gọi là **composition root** — nơi ta quyết định adapter nào cắm vào port nào.
+
+> **Composition Root**: Điểm duy nhất (thường là `main`) nơi toàn bộ đồ thị phụ thuộc được lắp ráp. Mọi nơi khác chỉ làm việc với interface; chỉ riêng composition root mới chạm vào các kiểu cụ thể. Muốn đổi adapter? Sửa đúng một chỗ này.
+
+```go
+// cmd/api/main.go
+package main
+
+import (
+    "log"
+    "net/http"
+
+    "ecommerce/internal/adapter/handler"
+    "ecommerce/internal/adapter/payment"
+    "ecommerce/internal/adapter/repository"
+    "ecommerce/internal/core/service"
+)
+
+func main() {
+    // 1. Chọn các DRIVEN adapter để cắm vào secondary port.
+    //    Muốn chạy production? Đổi dòng dưới sang Postgres:
+    //    repo := repository.NewPostgresOrderRepository(db)
+    repo := repository.NewInMemoryOrderRepository()
+    gateway := payment.NewStripeGateway("sk_test_xxx")
+
+    // 2. Tạo lõi. Lõi chỉ thấy interface — nó KHÔNG biết
+    //    repo là in-memory hay Postgres, gateway là Stripe hay gì khác.
+    orderSvc := service.NewOrderService(repo, gateway)
+
+    // 3. Cắm DRIVING adapter (HTTP) vào primary port.
+    orderHandler := handler.NewOrderHandler(orderSvc)
+
+    // 4. Định tuyến (yêu cầu Go 1.22+ cho cú pháp "POST /orders").
+    mux := http.NewServeMux()
+    mux.HandleFunc("POST /orders", orderHandler.PlaceOrder)
+
+    log.Println("listening on :8080")
+    log.Fatal(http.ListenAndServe(":8080", mux))
+}
+```
+
+Toàn bộ "phép màu" nằm ở đây: dòng `repo := repository.NewInMemoryOrderRepository()` là *thứ duy nhất* phải đổi khi chuyển từ in-memory sang Postgres. Lõi, handler, và mọi test đều không hề hay biết. Đó chính là lời hứa của Hexagonal Architecture, hiện ra dưới dạng code.

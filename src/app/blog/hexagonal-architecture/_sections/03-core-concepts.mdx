@@ -1,0 +1,71 @@
+## Các khái niệm cốt lõi
+
+Hexagonal Architecture xoay quanh ba nhóm khái niệm: **lõi ứng dụng** ở trung tâm, **ports** là các điểm nối, và **adapters** là phần cắm vào các điểm nối đó. Hãy định nghĩa từng cái.
+
+> **Hexagonal Architecture (Ports & Adapters)**: Một pattern kiến trúc đặt logic nghiệp vụ vào một lõi trung tâm, và mọi tương tác với thế giới bên ngoài (UI, database, API, message queue...) đều đi qua các *port* trừu tượng. Các *adapter* cụ thể cắm vào port để hiện thực hoá tương tác đó. Lõi không hề biết adapter nào đang được dùng.
+
+> **Application Core / Domain (lõi ứng dụng)**: Trái tim của hệ thống — chứa các thực thể nghiệp vụ (entities) và use case. Đây là phần *không import* bất kỳ framework, driver database, hay thư viện HTTP nào. Nó chỉ phụ thuộc vào các port mà chính nó định nghĩa.
+
+> **Port (cổng)**: Một *giao diện trừu tượng* mô tả "một cuộc hội thoại có chủ đích" giữa lõi và bên ngoài — Cockburn gọi đó là *"a set of interactions with the outside world that share the same intent"* (một tập hợp các tương tác cùng chung một ý đồ). Trong code, port thường là một `interface`. Quan trọng: port mô tả *cái gì* cần làm, không nói *làm bằng công nghệ nào*.
+
+> **Adapter (bộ chuyển đổi)**: Phần hiện thực cụ thể, "lớp keo dán giữa thành phần và thế giới bên ngoài". Adapter dịch tín hiệu của thế giới bên ngoài (một HTTP request, một dòng trong bảng SQL) sang dạng mà lõi hiểu, và ngược lại. Một port có thể có nhiều adapter — ví dụ cùng một port lưu trữ có thể có adapter Postgres, adapter in-memory, adapter mock cho test.
+
+### Hai phía: driving và driven
+
+Đây là điểm tinh tế nhất và cũng hay bị hiểu sai nhất. Không phải port nào cũng giống port nào. Có hai loại, nằm ở hai phía đối xứng của lõi:
+
+> **Primary / Driving port & adapter (phía trái — "điều khiển")**: Là phía *khởi xướng* tương tác — thế giới bên ngoài gọi vào lõi. *Driving adapter* (HTTP handler, CLI, bộ test) nhận yêu cầu từ ngoài rồi gọi *primary port* (chính là các use case mà lõi cung cấp). Ở đây, adapter **phụ thuộc vào** lõi.
+
+> **Secondary / Driven port & adapter (phía phải — "được điều khiển")**: Là phía *bị* lõi gọi tới — lõi cần một dịch vụ từ bên ngoài. *Secondary port* (ví dụ interface `OrderRepository`) do chính lõi định nghĩa; *driven adapter* (Postgres, Stripe, SMTP) hiện thực interface đó. Ở đây, adapter **hiện thực** một interface của lõi.
+
+Sự bất đối xứng này chính là điều mà kiến trúc phân lớp "trên–dưới" che giấu. Vẽ ra, nó trông như sau:
+
+```text
+        DRIVING SIDE                                  DRIVEN SIDE
+        (primary / left)                              (secondary / right)
+
+   +-------------+                                +-------------+
+   | HTTP        |                                | Postgres    |
+   | handler     |                                | repository  |
+   +-------------+      +------------------+      +-------------+
+                        |                  |
+   +-------------+      |  Application     |      +-------------+
+   | CLI         | ===> |  Core            | ===> | Payment     |
+   | command     |      |  domain + use    |      | gateway     |
+   +-------------+      |  cases           |      +-------------+
+                        |                  |
+   +-------------+      +------------------+      +-------------+
+   | Test        |                                | In-memory   |
+   | harness     |                                | repository  |
+   +-------------+                                +-------------+
+
+   driving adapters CALL the core         core CALLS secondary ports;
+   through primary ports                  driven adapters IMPLEMENT them
+```
+
+Mũi tên ở cả hai phía đều chỉ theo chiều "trái sang phải" theo *luồng điều khiển* (control flow): request đi vào từ trái, lõi xử lý, rồi gọi ra database/dịch vụ ở phải. Nhưng đây mới là mấu chốt — **chiều phụ thuộc (dependency) thì luôn chỉ vào trong**.
+
+### Dependency Rule: phụ thuộc luôn chỉ vào lõi
+
+Nhìn vào sơ đồ trên, dễ tưởng lõi "phụ thuộc" vào database ở bên phải vì nó gọi sang đó. Thực ra không. Lõi gọi qua một *secondary port* — một interface do **chính lõi định nghĩa**. Adapter Postgres mới là kẻ phải đi hiện thực interface đó. Đây chính là **Dependency Inversion** (đảo ngược phụ thuộc) trong hành động:
+
+```text
+   Primary adapter             Secondary adapter
+   (HTTP / CLI / test)         (Postgres / Stripe / SMTP)
+            |                            |
+            | depends on                 | depends on
+            v                            v
+   +-----------------------------------------------+
+   |               Application Core                |
+   |       domain logic  +  port interfaces        |
+   +-----------------------------------------------+
+
+   Both adapters depend on the core's port interfaces.
+   The core depends on NOTHING outside itself.
+```
+
+Mọi mũi tên *phụ thuộc* đều hướng vào trong: lõi không phụ thuộc ra ngoài thứ gì — nó chỉ định nghĩa và sử dụng các port của chính mình. Vì lõi chỉ phụ thuộc vào các interface trừu tượng, ta có thể tráo bất kỳ adapter nào mà lõi không hề hay biết: đổi Postgres sang MongoDB, đổi Stripe sang một cổng thanh toán khác, hay thay database thật bằng một bản in-memory lúc chạy test.
+
+### Tại sao là hình lục giác?
+
+Một hiểu lầm phổ biến: con số "sáu" không có ý nghĩa đặc biệt. Cockburn chọn hình lục giác đơn giản vì nó cho ta *đủ chỗ để vẽ nhiều cổng* quanh lõi — khác với hình chữ nhật chỉ gợi ý "trên/dưới/trái/phải". Lục giác không ám chỉ "phải có đúng sáu port". Nó chỉ là một cách nhắc rằng ứng dụng có *nhiều* mặt tiếp xúc với bên ngoài, và mọi mặt đều bình đẳng.

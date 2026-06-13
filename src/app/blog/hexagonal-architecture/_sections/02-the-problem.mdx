@@ -1,0 +1,29 @@
+## Vấn đề với kiến trúc phân lớp truyền thống
+
+Hầu hết chúng ta đều khởi đầu với một kiến trúc phân lớp (layered/n-tier) quen thuộc: tầng trình bày (UI) ở trên, tầng nghiệp vụ ở giữa, tầng dữ liệu ở dưới. Mỗi tầng gọi xuống tầng ngay bên dưới nó.
+
+```text
+┌─────────────────────────────────────┐
+│         Presentation Layer          │
+│         (controllers, HTTP)         │
+├─────────────────────────────────────┤
+│           Business Layer            │
+│             (services)              │
+├─────────────────────────────────────┤
+│             Data Layer              │
+│              (DB, ORM)              │
+└─────────────────────────────────────┘
+```
+
+Mô hình này trông gọn gàng, nhưng nó giấu một vấn đề sâu xa: **mọi thứ phụ thuộc, trực tiếp hoặc gián tiếp, vào tầng dưới cùng** — thường là database. Khi business layer `import` thẳng package database, hệ quả kéo theo là:
+
+- **Thiết kế bị database dẫn dắt.** Bạn thiết kế bảng trước, rồi nặn nghiệp vụ theo schema, thay vì ngược lại. Cấu trúc dữ liệu lưu trữ rò rỉ ngược lên tầng nghiệp vụ.
+- **Phụ thuộc mong manh.** Một thay đổi nhỏ ở schema hay đổi ORM buộc bạn phải sửa cả logic nghiệp vụ — dù bản thân quy tắc nghiệp vụ không hề thay đổi.
+- **Chi tiết kỹ thuật rò rỉ.** Không có ranh giới nào ngăn `*sql.Rows`, annotation của framework, hay struct request HTTP lọt vào giữa lõi nghiệp vụ.
+- **Khó test.** Muốn test một quy tắc nghiệp vụ ư? Bạn buộc phải dựng database, mock cả tầng web. Test chậm, giòn, và phụ thuộc hạ tầng.
+
+Martin Fowler gọi gốc rễ vấn đề là sự **bất đối xứng** mà mô hình phân lớp không thể hiện được: có những thành phần *điều khiển* ứng dụng (người dùng bấm nút), và có những thành phần *được ứng dụng điều khiển* (database mà ứng dụng ghi vào). Cả hai đều nằm "bên ngoài" lõi nghiệp vụ, nhưng mối quan hệ của chúng với lõi hoàn toàn trái chiều nhau. Vẽ chúng thành "trên" và "dưới" che mất sự khác biệt này.
+
+> **Business logic (logic nghiệp vụ)**: Phần mã thể hiện *quy tắc và quyết định của bài toán* — ví dụ "đơn hàng phải có số tiền dương", "phải thu tiền thành công trước khi xác nhận đơn". Đây là phần có giá trị lâu dài nhất và ít thay đổi nhất; framework, database, giao thức mạng chỉ là phương tiện phục vụ nó.
+
+Câu hỏi đặt ra: làm sao để lõi nghiệp vụ *không biết gì* về database hay framework, mà vẫn dùng được chúng? Câu trả lời của Hexagonal là **đảo ngược chiều phụ thuộc** — và đó là nội dung phần tiếp theo.

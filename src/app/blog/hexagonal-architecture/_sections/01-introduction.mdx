@@ -1,0 +1,22 @@
+## Mở đầu
+
+Hãy thử trả lời nhanh một câu hỏi: nếu sếp yêu cầu bạn đổi từ PostgreSQL sang MongoDB, bạn phải sửa bao nhiêu file? Nếu thay REST API bằng gRPC thì sao? Còn nếu muốn viết test cho phần nghiệp vụ mà *không* cần khởi động database thật?
+
+Trong nhiều codebase, câu trả lời cho cả ba câu hỏi đều là "sửa khắp nơi". Logic nghiệp vụ (business logic) bị trộn lẫn với mã gọi database, mã parse HTTP request, mã gọi API bên thứ ba. Đổi một thứ ở rìa, cả lõi rung lắc theo.
+
+**Hexagonal Architecture** (hay *Ports & Adapters*) là một câu trả lời cho vấn đề đó. Ý tưởng cốt lõi rất đơn giản: đặt logic nghiệp vụ vào trung tâm, và để mọi thứ thuộc về "thế giới bên ngoài" — database, framework web, message queue, email service — chỉ là các thành phần cắm vào qua những điểm nối được định nghĩa rõ ràng. Cắm vào, rút ra, thay thế — mà không động đến lõi.
+
+Pattern này được Alistair Cockburn đề xuất từ giữa những năm 1990, và năm 2005 ông đổi tên chính thức thành *Ports and Adapters*. Mục tiêu mà chính Cockburn phát biểu là:
+
+> *"Allow an application to equally be driven by users, programs, automated test or batch scripts, and to be developed and tested in isolation from its eventual run-time devices and databases."*
+>
+> (Cho phép ứng dụng được điều khiển một cách bình đẳng bởi người dùng, chương trình khác, test tự động hay batch script — và được phát triển, kiểm thử một cách độc lập với các thiết bị, database mà nó sẽ chạy cùng sau này.)
+
+Trong bài này, chúng ta sẽ đi qua:
+
+- **Tại sao** kiến trúc phân lớp (layered) truyền thống dễ dẫn đến phụ thuộc rối rắm — và Hexagonal sửa điều đó như thế nào.
+- **Các khái niệm cốt lõi**: port, adapter, lõi ứng dụng, và sự phân biệt primary/secondary mà nhiều người hay nhầm.
+- **Một ví dụ thực tế bằng Go**: xây dựng một dịch vụ đặt hàng (order service) đầy đủ với domain, ports, và adapters cho HTTP và database.
+- **Test và đánh đổi**: vì sao Hexagonal làm việc test trở nên dễ đến bất ngờ, và khi nào thì *không* nên dùng nó.
+
+Nếu bạn đã đọc bài [Clean Architecture in Go](/blog/clean-architecture) trên blog này, bạn sẽ thấy Hexagonal là một người anh em rất gần — cùng triết lý "đặt nghiệp vụ ở trung tâm, đẩy chi tiết kỹ thuật ra rìa". Chúng ta sẽ làm rõ điểm giống và khác ở cuối bài.
