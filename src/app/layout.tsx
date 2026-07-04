@@ -3,7 +3,7 @@ import "@/styles/globals.css";
 import type { ReactNode } from "react";
 import type { Metadata } from "next";
 import { ViewTransitions } from "next-view-transitions";
-import { Analytics } from "@vercel/analytics/react";
+import { Analytics } from "@vercel/analytics/next";
 
 import { sans } from "@/config/fonts";
 import {
