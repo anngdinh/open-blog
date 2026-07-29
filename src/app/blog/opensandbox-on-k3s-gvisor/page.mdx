@@ -1,0 +1,70 @@
+---
+title: "Chạy code không tin cậy an toàn: OpenSandbox trên k3s + gVisor"
+description: "Hành trình end-to-end dựng một nền tảng sandbox chạy untrusted code trên MacBook Apple Silicon: từ k3s + gVisor, cài OpenSandbox, ingress gateway, routing nhiều app, tới egress control, credential vault và lớp auth Entra OAuth2."
+date: 2026-07-29
+---
+
+import { generateBlogMetadata } from "../../../lib/blog";
+import BlogJsonLd from "../../../components/blog-json-ld";
+import Title from "../../../components/title";
+
+import Introduction from "./_sections/01-introduction.mdx";
+import ClusterSetup from "./_sections/02-cluster-setup.mdx";
+import InstallOpenSandbox from "./_sections/03-install-opensandbox.mdx";
+import IngressRouting from "./_sections/04-ingress-routing.mdx";
+import EgressVault from "./_sections/05-egress-vault.mdx";
+import AuthLayer from "./_sections/06-auth-layer.mdx";
+import Conclusion from "./_sections/07-conclusion.mdx";
+
+export const metadata = generateBlogMetadata({
+  title: "Chạy code không tin cậy an toàn: OpenSandbox trên k3s + gVisor",
+  description: "Hành trình end-to-end dựng một nền tảng sandbox chạy untrusted code trên MacBook Apple Silicon: từ k3s + gVisor, cài OpenSandbox, ingress gateway, routing nhiều app, tới egress control, credential vault và lớp auth Entra OAuth2.",
+  date: "2026-07-29",
+  slug: "opensandbox-on-k3s-gvisor"
+})
+
+<BlogJsonLd
+  url={metadata.openGraph.url}
+  title={metadata.title}
+  description={metadata.description}
+  authorName="Developer"
+  publishDate={new Date(metadata.openGraph.publishedTime).toISOString()}
+  imageUrl={metadata.openGraph.images?.[0]?.url}
+/>
+
+<Title title={metadata.title} date={metadata.date} />
+
+<div style={{display: 'flex', justifyContent: 'center', margin: '2rem 0'}}>
+  <img
+    src="/images/opensandbox-on-k3s-gvisor/cover.jpg"
+    alt="Concentric security layers — auth, egress, and gVisor sandbox — wrapping a code core, over OpenSandbox on k3s + gVisor"
+    style={{maxWidth: '800px', width: '100%', height: 'auto', borderRadius: '8px'}}
+  />
+</div>
+
+<Introduction />
+<ClusterSetup />
+<InstallOpenSandbox />
+<IngressRouting />
+<EgressVault />
+<AuthLayer />
+<Conclusion />
+
+## References
+
+- [gVisor — Kubernetes quick start](https://gvisor.dev/docs/user_guide/quick_start/kubernetes/)
+- [gVisor — containerd quick start](https://gvisor.dev/docs/user_guide/containerd/quick_start/)
+- [gVisor — platforms](https://gvisor.dev/docs/user_guide/platforms/)
+- [gVisor — arm64 compatibility](https://gvisor.dev/docs/user_guide/compatibility/linux/arm64/)
+- [gVisor — performance](https://gvisor.dev/docs/architecture_guide/performance/)
+- [Lima — Kubernetes examples](https://lima-vm.io/docs/examples/containers/kubernetes/)
+- [OpenSandbox trên GitHub](https://github.com/opensandbox-group/OpenSandbox)
+- [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/)
+- [Traefik — Kubernetes IngressRoute & Middleware](https://doc.traefik.io/traefik/routing/providers/kubernetes-crd/)
+- [Microsoft Entra ID — OpenID Connect](https://learn.microsoft.com/en-us/entra/identity-platform/v2-protocols-oidc)
+
+### Related posts
+
+- [gVisor vs Firecracker: Hai triết lý sandbox container](/blog/gvisor-vs-firecracker) — So sánh sâu hai cách tiếp cận isolation, bổ trợ trực tiếp cho lựa chọn runtime trong bài này.
+- [Container Networking from Scratch](/blog/container-networking-from-scratch) — Nền tảng network namespace/veth/bridge giúp hiểu vì sao egress sidecar cần iptables `nat`.
+- [Kubernetes CNI Overview](/blog/kubernetes-cni-overview) — Bức tranh tổng quan về mạng trong Kubernetes.

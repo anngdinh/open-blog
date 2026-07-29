@@ -1,0 +1,164 @@
+## Phần 2 — Cài OpenSandbox lên cluster
+
+Cluster đã sẵn sàng. Giờ ta cài OpenSandbox lên trên và biến cluster thành một dịch vụ tạo
+sandbox theo yêu cầu.
+
+### Mô hình tư duy: hai lớp
+
+Điểm quan trọng nhất cần nắm: OpenSandbox có hai lớp, và **chỉ sandbox pod mới cần gVisor** —
+control plane chạy trên runtime thường (runc):
+
+| Thành phần | Namespace | Runtime | Vai trò |
+|---|---|---|---|
+| **Server** | `opensandbox-system` | runc | REST lifecycle API (tạo/liệt kê/xóa sandbox) |
+| **Controller** (operator) | `opensandbox-system` | runc | Reconcile các CRD `BatchSandbox` / `Pool` / `SandboxSnapshot` |
+| **Sandbox pods** | `opensandbox` | **gvisor / runsc** | Nơi untrusted code của bạn thật sự chạy |
+
+gVisor **không** phải là một cờ bật theo từng request. Bạn set nó một lần trong config của
+server (`[secure_runtime]`), rồi server tự chèn `runtimeClassName: gvisor` vào **mọi** sandbox
+pod nó tạo. SDK/API caller không cần thay đổi gì.
+
+```text
++-------------------- opensandbox-system (runc) --------------------+
+|                                                                   |
+|   [ Server ]  --REST API-->  tao BatchSandbox CR                  |
+|       |                              |                            |
+|       |                              v                            |
+|   [ Controller ] --reconcile--> tao Pod (runtimeClassName=gvisor) |
+|                                       |                           |
++---------------------------------------|---------------------------+
+                                        v
+              +--------- opensandbox (gvisor) ---------+
+              |   [ Sandbox Pod ]  <- untrusted code   |
+              +----------------------------------------+
+```
+
+### Chuẩn bị values file
+
+Chart all-in-one `kubernetes/charts/opensandbox` gói cả controller, server và CRD. Chỉ có
+block `[secure_runtime]` là khác so với mặc định — đó là công tắc bật gVisor:
+
+```yaml
+opensandbox-server:
+  server:
+    replicaCount: 1                    # single node; mặc định chart là 2, thừa
+    resources:
+      requests: { cpu: "250m", memory: 512Mi }
+      limits:   { cpu: "1",    memory: 2Gi }
+
+  configToml: |
+    [server]
+    host = "0.0.0.0"
+    port = 80
+    api_key = "sk-osb-CHANGE-ME"       # client gửi qua header OPEN-SANDBOX-API-KEY
+
+    [runtime]
+    type = "kubernetes"
+    execd_image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.0.20"
+
+    [kubernetes]
+    namespace = "opensandbox"          # nơi sandbox pod được tạo
+    workload_provider = "batchsandbox"
+
+    # >>> Block nay bat gVisor cho MOI sandbox server nay tao ra <<<
+    [secure_runtime]
+    type = "gvisor"
+    k8s_runtime_class = "gvisor"
+
+opensandbox-controller:
+  controller:
+    replicaCount: 1
+    snapshot:
+      # BUG da biet (chart v0.2.0): chart truyen --containerd-socket-path nhung
+      # binary v0.2.0 khong nhan co nay -> CrashLoopBackOff. De rong de bo co.
+      containerdSocketPath: ""
+```
+
+> **Sinh API key:** `echo "sk-osb-$(openssl rand -hex 16)"`. Để `api_key = ""` là tắt auth —
+> ổn cho test nhanh qua port-forward, không ổn cho bất cứ thứ gì expose ra ngoài.
+
+### Cài đặt
+
+```bash
+export KUBECONFIG="/Users/tcx/.lima/k3s/copied-from-guest/kubeconfig.yaml"
+
+kubectl create namespace opensandbox            # namespace cho sandbox workload
+cd OpenSandbox/kubernetes/charts
+helm dependency build opensandbox               # kéo hai sub-chart local
+
+helm install opensandbox ./opensandbox \
+  --namespace opensandbox-system --create-namespace \
+  -f /path/to/opensandbox-gvisor-values.yaml
+```
+
+Kiểm tra control plane và xác nhận server thấy RuntimeClass:
+
+```bash
+kubectl get pods -n opensandbox-system
+# opensandbox-server-...              1/1  Running
+# opensandbox-controller-manager-...  1/1  Running
+
+# Server validate RuntimeClass lúc khởi động và từ chối chạy nếu thiếu:
+kubectl logs -n opensandbox-system deploy/opensandbox-server | grep -i "RuntimeClass"
+# -> "Kubernetes RuntimeClass 'gvisor' is available."
+```
+
+### Smoke-test API
+
+Không có Ingress mặc định, nên port-forward server (đây là control plane chạy runc, không
+phải sandbox gVisor — nên port-forward hoạt động bình thường):
+
+```bash
+kubectl port-forward -n opensandbox-system svc/opensandbox-server 8080:80
+```
+
+```bash
+KEY="sk-osb-CHANGE-ME"
+curl -s http://localhost:8080/health                       # {"status":"healthy"}
+curl -s -o /dev/null -w "%{http_code}\n" \
+     http://localhost:8080/v1/sandboxes                    # 401 (auth được enforce)
+curl -s -H "OPEN-SANDBOX-API-KEY: $KEY" \
+     http://localhost:8080/v1/sandboxes                    # 200 -> {"items":[...]}
+```
+
+Tạo một sandbox và chứng minh nó thật sự chạy gVisor:
+
+```bash
+POD=$(kubectl get pods -n opensandbox -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n opensandbox $POD -c sandbox -- uname -a
+# Linux ... 4.19.0-gvisor ... aarch64   <- Sentry kernel cua gVisor
+```
+
+### Dùng từ Python SDK: cái bẫy `use_server_proxy`
+
+Có một cạm bẫy mạng mà ai chạy trên Mac cũng vấp. IP của sandbox pod (`10.42.x`) nằm **bên
+trong VM k3s và không route được từ máy Mac**. SDK mặc định kết nối thẳng tới sandbox, nên
+sẽ timeout. Giải pháp: route traffic sandbox **qua server** (thứ đang reachable qua
+port-forward):
+
+```python
+from opensandbox.config import ConnectionConfig
+
+config = ConnectionConfig(
+    domain="localhost:8080",
+    api_key="sk-osb-CHANGE-ME",
+    use_server_proxy=True,      # <-- BẮT BUỘC khi nói chuyện với cluster từ laptop
+)
+```
+
+Với cấu hình đó, ví dụ đa ngôn ngữ đi kèm repo (`main.py`) chạy Python, Java, Go và
+TypeScript bên trong sandbox và in kết quả ra — tất cả bên trong pod gVisor, không có dòng
+code nào chạy trên máy bạn hay trên host kernel.
+
+### Bảng cạm bẫy nhanh
+
+| Triệu chứng | Nguyên nhân | Cách xử lý |
+|---|---|---|
+| controller `CrashLoopBackOff`, in ra usage | chart truyền `--containerd-socket-path`, binary từ chối | `controller.snapshot.containerdSocketPath: ""` |
+| create trả `POD_READY_TIMEOUT`, pod biến mất | image lớn không pull kịp trong 60s | pre-pull image trên node rồi tạo lại |
+| SDK `SandboxReadyTimeout`, "cannot reach sandbox" | pod IP không route được từ laptop | `ConnectionConfig(use_server_proxy=True)` |
+| trong sandbox `pip` báo "externally-managed-environment" | Python do uv quản (PEP 668) | thêm `--break-system-packages` |
+| create bị từ chối khi có networkPolicy | egress sidecar dùng NAT DNS, không tương thích gVisor | bỏ `networkPolicy` trên sandbox gVisor |
+
+Dòng cuối cùng của bảng chính là ràng buộc runtime ta đã hứa ở phần mở đầu — và nó sẽ là
+nhân vật chính của Phần 4.

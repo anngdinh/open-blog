@@ -1,0 +1,119 @@
+## Phần 5 — Lớp auth ở edge: Entra OAuth2 + phân quyền theo app
+
+Tới đây, ai gọi được tới Traefik là chạm được vào các app trong sandbox. Với một nền tảng
+thật, ta cần một câu trả lời cho hai câu hỏi: **"Bạn là ai?"** (authentication) và **"Bạn
+được vào app nào?"** (authorization). Phần này thiết kế một lớp auth đặt trước toàn bộ routing
+ở Phần 3 — **không đụng** vào gateway của OpenSandbox hay image của các app.
+
+> Đây là một **spec bản draft**: authz-service đã được deploy và test trên cluster;
+> oauth2-proxy đã dựng khung, còn chờ Entra credentials và TLS. Ta trình bày kiến trúc và
+> quyết định thiết kế, không phải một kết quả đã chạy end-to-end như các phần trước.
+
+> **Microsoft Entra ID**: dịch vụ danh tính đám mây của Microsoft (tên cũ: Azure AD). Ở đây
+> nó đóng vai **OIDC provider** — nơi người dùng đăng nhập, và là nguồn "user thuộc security
+> group nào" để ta ra quyết định phân quyền.
+
+> **oauth2-proxy**: một reverse proxy off-the-shelf lo toàn bộ luồng OAuth2 Authorization
+> Code + OIDC: chuyển hướng người dùng chưa đăng nhập tới Entra, xử lý callback, đặt cookie
+> phiên, và trả lại danh tính (email, group) qua các header `X-Auth-Request-*`.
+
+### Quyết định thiết kế: shared host + path routing
+
+Ta chọn **một host chung** (`https://apps.localhost/<app>/…`) thay vì mỗi app một host.
+Lý do: một origin duy nhất nghĩa là **một** Entra redirect URI (Entra không hỗ trợ wildcard
+redirect URI), **một** cookie phiên (SSO tự động), và một endpoint `/oauth2/` — độ phức tạp
+auth thấp nhất. Đánh đổi chấp nhận: mọi app chung một browser origin (cô lập giữa các app
+yếu hơn), nên mô hình này chỉ dành cho **các app tin cậy**.
+
+### Kiến trúc
+
+```text
+                +------------- Microsoft Entra ID (OIDC) -------------+
+                |  app registration - client secret - groups claim    |
+                +----------------------------^------------------------+
+                                             | Authorization Code + OIDC
+ Browser --HTTPS(443)--> Traefik (host apps.localhost)
+    router(/oauth2/*) --------------------------------------> oauth2-proxy
+    router(/<app>/*)  chuoi middleware:
+         1. mw-auth-signin   loi 401 -> oauth2-proxy /oauth2/sign_in?rd=...
+         2. mw-authn         forwardAuth -> oauth2-proxy /oauth2/auth (set X-Auth-Request-*)
+         3. mw-authz         forwardAuth -> authz-service /check (200/403)
+         4. rewrite-<app>    replacePathRegex -> /<sandbox-name>/<port>/...
+                    |
+                    v
+             OpenSandbox ingress gateway (uri mode) --> BatchSandbox pod (<app>)
+```
+
+> **forwardAuth**: một middleware của Traefik hỏi một service ngoài "request này có được
+> phép không?" trước khi cho đi tiếp. Service trả `2xx` là cho qua, `401/403` là chặn. Đây
+> là cách ta cắm cả xác thực (mw-authn) lẫn phân quyền (mw-authz) vào mà không sửa app.
+
+### Hai thành phần
+
+**oauth2-proxy** (off-the-shelf) lo authentication. Các cờ chính: provider `oidc`, issuer
+`https://login.microsoftonline.com/<tenant>/v2.0`, `--set-xauthrequest` (bơm danh tính ra
+header), `--oidc-groups-claim=groups`, `--cookie-domain=apps.localhost`,
+`--redirect-url=https://apps.localhost/oauth2/callback`.
+
+**authz-service** (mã tự viết — thứ *duy nhất* phải code) lo authorization. Nó là một HTTP
+server stdlib chạy trên `python:3.12-alpine`, script mount từ ConfigMap — **không build
+image**. Hợp đồng forwardAuth của nó rất gọn:
+
+- **Input** (header từ Traefik + mw-authn): `X-Forwarded-Uri`, `X-Auth-Request-Groups` (CSV),
+  `X-Auth-Request-Email`.
+- **Phân giải app:** segment đầu của `X-Forwarded-Uri` (`/httpbin/get` → `httpbin`).
+- **Quyết định:** `200` nếu `group_của_user ∩ policy[app] ≠ ∅`; ngược lại `403`. App lạ →
+  `403` (**default-deny**).
+- **Nguồn policy:** ConfigMap `authz-policy` → `policy.json` (`{app: [groups]}`), đọc mỗi
+  request nên sửa policy có hiệu lực ngay, không cần restart.
+
+### Ba luồng request
+
+```text
+Chua dang nhap:  /nginx/ -> mw-authn goi /oauth2/auth -> 401
+                 -> mw-auth-signin redirect toi Entra login -> callback set cookie
+                 -> replay -> duoc phep
+
+Da dang nhap + duoc phep:  cookie hop le -> mw-authn 202 + header danh tinh
+                 -> mw-authz 200 -> rewrite -> gateway -> nginx pod -> 200
+
+Da dang nhap + KHONG duoc phep:  mw-authn 202 -> mw-authz 403 -> dung lai o Traefik
+```
+
+### Mô hình dữ liệu phân quyền
+
+| Thực thể | Ở đâu | Ví dụ |
+|---|---|---|
+| Định danh app | path prefix của Ingress + tên BatchSandbox | `nginx`, `httpbin` |
+| Principal được phép | ConfigMap `authz-policy` `policy.json` | `{"nginx":["sbx-nginx","admins"]}` |
+| User → groups | security group của Entra (trong `groups` claim) | `sbx-nginx`, `admins` |
+
+Thêm một app mới chỉ tốn: một BatchSandbox, một Ingress rule, **một dòng policy**, và một
+Entra group. Không redeploy app, không sửa gateway.
+
+### Những điểm bảo mật đáng nhớ
+
+- **HTTPS bắt buộc** — cookie OAuth phải `Secure`; redirect phải là https. Terminate TLS ở
+  Traefik (dev dùng mkcert; prod dùng cert-manager/Let's Encrypt).
+- **Same-origin (shared host)** — mọi app chung `apps.localhost`; một app bị chiếm có thể
+  đọc cookie/DOM của app khác. Chỉ chấp nhận cho app **tin cậy**; app không tin cậy/đa
+  tenant cần cô lập theo host riêng.
+- **Trust boundary** — app chỉ được tin `X-Auth-Request-*` vì Traefik/oauth2-proxy đặt
+  chúng; gateway/pod không reachable trực tiếp từ ngoài (chỉ qua Traefik).
+- **Groups claim quá lớn** — membership Entra nhiều có thể làm tràn cookie; nếu vậy bật một
+  session store (Redis) cho oauth2-proxy.
+
+### Tiêu chí nghiệm thu
+
+| # | Kịch bản | Kỳ vọng |
+|---|---|---|
+| A1 | Chưa đăng nhập `GET /nginx/` | 302 → Microsoft login |
+| A2 | User thuộc `sbx-nginx` sau login → `/nginx/` | 200 (trang nginx) |
+| A3 | User không thuộc `sbx-nginx`/`admins` → `/nginx/` | 403 |
+| A4 | Cùng phiên → `/httpbin/get` (user thuộc `sbx-httpbin`) | 200, không login lại (SSO) |
+| A5 | Path không có policy `/secret/` | 403 (default-deny) |
+| A6 | Sửa `policy.json` thêm group → trong ~1 phút | quyết định mới, không restart |
+
+Lớp này khép lại bức tranh: cô lập bằng gVisor bảo vệ host, egress/vault kiểm soát dữ liệu
+ra, và giờ auth kiểm soát ai được vào — một nền tảng có phòng thủ nhiều tầng chứ không chỉ
+một hàng rào.

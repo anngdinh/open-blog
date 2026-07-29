@@ -1,0 +1,55 @@
+## Kết luận
+
+Ta đã đi từ một chiếc MacBook Apple Silicon trắng tới một nền tảng chạy untrusted code có
+phòng thủ nhiều tầng. Nhìn lại toàn bộ ngăn xếp:
+
+```text
++-----------------------------------------------------------------+
+|  Auth      Entra OAuth2 SSO + authz theo app (default-deny)     |
++-----------------------------------------------------------------+
+|  Egress    allowlist FQDN + Credential Vault (bi mat khong vao) |
++-----------------------------------------------------------------+
+|  Routing   nhieu app, path/host de doc qua Traefik              |
++-----------------------------------------------------------------+
+|  Ingress   reverse proxy vao service ben trong sandbox          |
++-----------------------------------------------------------------+
+|  Platform  OpenSandbox: server + controller + sandbox pods      |
++-----------------------------------------------------------------+
+|  Cluster   k3s + gVisor trong Linux VM (Lima, arm64)            |
++-----------------------------------------------------------------+
+```
+
+### Những điều rút ra
+
+- **Cô lập là nhiều tầng, không phải một hàng rào.** gVisor bảo vệ host khỏi sandbox; egress
+  kiểm soát dữ liệu đi ra; vault giữ bí mật khỏi tay code; auth kiểm soát ai được vào. Bỏ
+  bất kỳ tầng nào cũng để lại một lỗ hổng mà các tầng khác không lấp được.
+
+- **Ràng buộc runtime là quyết định kiến trúc, không phải bug.** gVisor cho cô lập mạnh nhất
+  nhưng netstack của nó thiếu bảng iptables `nat`, nên egress sidecar và Credential Vault
+  không chạy trên gVisor — phải dùng runc hoặc kata. Ngược lại, ingress gateway là reverse
+  proxy thuần nên chạy trên mọi runtime. Biết tính năng nào cần gì giúp bạn chọn runtime
+  đúng ngay từ đầu.
+
+- **Trên Mac luôn có "hai lớp".** k3s/gVisor chạy trong Linux VM, còn máy bạn thì không —
+  nên IP pod không route được (cần `use_server_proxy`), `port-forward` chết trên pod gVisor
+  (dùng ingress), và Lima tự forward port `*.localhost` giúp routing "just work". Phần lớn
+  lỗi khó hiểu trên Mac đều bắt nguồn từ ranh giới VM này.
+
+- **Bảo mật tốt nhất là thứ trong suốt với app.** Không một tầng nào trong bài yêu cầu sửa
+  image của app: gVisor set qua RuntimeClass, routing/auth cắm qua Traefik middleware, và
+  Credential Vault inject bí mật ở tầng mạng. App cứ chạy như bình thường; bảo mật bọc quanh
+  nó từ bên ngoài.
+
+### Bước tiếp theo
+
+- Để tránh chọn giữa cô lập và egress control, thử **kata** (microVM) trên hạ tầng có
+  nested virtualization — nó vừa cô lập mạnh vừa có iptables `nat` đầy đủ.
+- Hoàn thiện lớp auth: cấp Entra credentials + TLS thật, rồi chạy hết bộ tiêu chí nghiệm thu
+  ở Phần 5.
+- Bake sẵn dependency vào một custom image `FROM code-interpreter` để sandbox khởi động
+  nhanh, hoặc dùng `Pool` CRD giữ sẵn sandbox pre-warmed.
+
+Nếu bạn muốn hiểu sâu hơn *vì sao* gVisor và microVM đánh đổi khác nhau về attack surface và
+performance — nền tảng cho mọi lựa chọn runtime trong bài này — hãy đọc tiếp bài so sánh
+[gVisor vs Firecracker](/blog/gvisor-vs-firecracker).

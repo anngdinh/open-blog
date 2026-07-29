@@ -1,0 +1,130 @@
+## Phần 4 — Kiểm soát mạng ra: Egress & Credential Vault
+
+Cô lập bằng gVisor bảo vệ *host* khỏi *sandbox*. Nhưng còn chiều ngược lại: làm sao ngăn code
+trong sandbox **gửi dữ liệu ra ngoài** tới nơi ta không cho phép, hoặc **đánh cắp credential**
+mà ta buộc phải cấp cho nó để gọi API? Đó là việc của hai tính năng: egress sidecar và
+Credential Vault.
+
+### Ràng buộc runtime — đọc phần này trước
+
+Đây chính là cái đánh đổi đã hứa từ đầu bài. Cả hai tính năng đều được cài **bên trong egress
+sidecar**, thứ chặn DNS bằng một rule **iptables `nat`-table REDIRECT**. Và:
+
+> ⚠️ **Netstack của gVisor KHÔNG cài đặt bảng `nat`.** Nên trên sandbox gVisor, tạo sandbox
+> có `networkPolicy` sẽ **bị từ chối ngay ở API**:
+> > `networkPolicy is not compatible with runtime 'gvisor': gVisor does not support the iptables nat table required by the egress sidecar.`
+
+| Runtime | Egress sidecar / Credential Vault |
+|---|---|
+| runc | ✅ hỗ trợ |
+| gVisor | ❌ **không** (thiếu bảng iptables `nat`) |
+| Kata (qemu/clh/fc) | ✅ hỗ trợ |
+
+Nói cách khác: **bạn phải chọn.** gVisor cho cô lập kernel mạnh nhất nhưng không có egress
+control; runc/kata có egress control nhưng cô lập yếu hơn (runc) hoặc nặng hơn (kata). Với
+phần này ta tạm chuyển server sang **runc** (kata trên Lima Apple Silicon là nested
+virtualization, thường bất khả thi). Đây là một quyết định kiến trúc, không phải bug.
+
+> **egress sidecar**: một sidecar per-sandbox (chia sẻ network namespace của pod, cần
+> `CAP_NET_ADMIN`) enforce một allowlist chiều ra. Lớp 1 là DNS proxy trả `NXDOMAIN` cho
+> domain bị chặn; lớp 2 (`dns+nft`) thêm IP đã phân giải vào allow-set của nftables để một
+> default-deny giữ vững ở tầng IP.
+
+### Chuyển server sang runc
+
+Runtime bảo mật là setting cấp **server**. Trong values file:
+
+```yaml
+opensandbox-server:
+  configToml: |
+    [secure_runtime]
+    type = ""          # "" = runc (không chèn RuntimeClass). Trước đó là "gvisor".
+    # LUU Y: khi type = "", PHAI bo k8s_runtime_class, khong server crash-loop
+
+    [egress]
+    image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.1.3"
+    mode  = "dns+nft"  # dns+nft BAT BUOC cho Credential Vault (no tu choi DNS-only)
+```
+
+```bash
+helm upgrade opensandbox ./opensandbox -n opensandbox-system -f /path/to/values.yaml
+
+# GOTCHA: config-only change KHONG restart server (mount subPath, khong checksum). Ep no:
+kubectl rollout restart -n opensandbox-system deploy/opensandbox-server
+```
+
+> **GOTCHA** — nếu set `type = ""` nhưng để lại `k8s_runtime_class = "gvisor"`, server
+> crash-loop với: `docker_runtime and k8s_runtime_class must be omitted when
+> secure_runtime.type is empty.`
+
+### Test egress (đã verify)
+
+Tạo một sandbox `default_action="deny"` chỉ cho phép `example.com`, rồi probe từ bên trong,
+rồi hot-patch policy để thêm `www.google.com`:
+
+```python
+policy = NetworkPolicy(default_action="deny",
+                       egress=[NetworkRule(action="allow", target="example.com")])
+sandbox = await Sandbox.create(..., network_policy=policy)
+# ... chay probe ben trong; roi patch policy nong:
+await sandbox.patch_egress_rules([NetworkRule(action="allow", target="www.google.com")])
+```
+
+**Kết quả:**
+
+```text
+-- ALLOWED host (example.com) --          REACHED 200
+-- DENIED host (www.google.com) --        BLOCKED  Name or service not known
+-- www.google.com after patch --          REACHED 200
+```
+
+Host được phép thì tới; host bị chặn fail ngay ở phân giải DNS (NXDOMAIN); và một **policy
+patch lúc runtime có hiệu lực ngay lập tức** mà không cần tạo lại sandbox.
+
+### Credential Vault: bí mật thật không bao giờ vào sandbox
+
+> **Credential Vault**: bí mật thật **không bao giờ đi vào sandbox**. SDK phía host ghi nó
+> vào vault của sidecar; tiến trình trong sandbox chỉ thấy một giá trị giả/rỗng. Khi sandbox
+> gửi một HTTPS request *được phép* khớp một **binding** (scheme/host/port/method/path),
+> sidecar MITM trong suốt sẽ chèn header auth thật vào lúc gói tin đi ra. Đọc vault chỉ trả
+> về metadata đã che (redacted).
+
+Vì MITM ký lại TLS, sandbox phải tin CA của sidecar. OpenSandbox tự export nó ra path chung
+`/opt/opensandbox/mitmproxy-ca-cert.pem` bên trong sandbox — trỏ client của bạn vào đó
+(`SSL_CERT_FILE`, `--cacert`, `NODE_EXTRA_CA_CERTS`) nếu không muốn handshake HTTPS fail.
+
+```text
++--------------------- Sandbox pod (runc) ---------------------+
+|  [ code ]  env DEMO_TOKEN = "fake-token"  (chi thay gia gia) |
+|     |  GET https://httpbingo.org/get                         |
+|     v                                                        |
+|  [ egress sidecar / MITM ]  <- vault giu SECRET that         |
+|     |  khop binding? -> chen header X-Demo-Token: <that>     |
++-----|--------------------------------------------------------+
+      v
+   upstream nhan header voi SECRET that
+```
+
+**Kết quả (đã verify):**
+
+```text
+SANDBOX_ENV_DEMO_TOKEN = fake-token-inside-sandbox    # sandbox khong bao gio giu secret that
+BOUND   GET /get   -> X-Demo-Token = REAL-SECRET-...  # duoc chen tren duong day
+UNBOUND POST /post -> X-Demo-Token = <absent>         # ngoai pham vi binding thi khong chen
+```
+
+Secret thật chỉ tới được upstream **đúng** trên method+path đã bind, trong khi môi trường
+sandbox không giữ gì ngoài giá trị giả. Đây là một pattern rất mạnh cho AI agent: bạn cấp
+cho agent "quyền gọi API X" mà **không hề đưa cho nó API key** — nếu agent bị prompt-inject
+để lộ secret, nó cũng chẳng có gì để lộ.
+
+### Bảng tóm tắt
+
+| Mục | Chi tiết |
+|---|---|
+| Vị trí tính năng | Cả hai nằm trong egress sidecar (per-sandbox, `CAP_NET_ADMIN`) |
+| Hỗ trợ runtime | runc ✅, kata ✅, **gVisor ❌** (thiếu bảng iptables `nat`) |
+| Bật Credential Vault | `[egress].mode="dns+nft"` + `networkPolicy(deny)` + `credentialProxy.enabled=true` |
+| CA MITM trong sandbox | `/opt/opensandbox/mitmproxy-ca-cert.pem` — client phải tin |
+| Cập nhật policy runtime | `patch_egress_rules()` / `osb egress patch` — có hiệu lực ngay |
+| Service in-cluster khi deny | phải allow **cả** FQDN **lẫn** dải ClusterIP CIDR của nó |

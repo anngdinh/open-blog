@@ -1,0 +1,148 @@
+## Phần 3 — Ingress: chạm vào service bên trong sandbox
+
+Sandbox chạy được rồi, nhưng thường ta muốn nhiều hơn là "chạy lệnh và đọc file". Ta muốn
+một **service HTTP chạy bên trong sandbox** (một web app, một API, một notebook) và truy cập
+được từ bên ngoài pod. Đó là việc của ingress gateway.
+
+> **Ingress gateway (của OpenSandbox)**: một reverse proxy HTTP/WebSocket phía cluster
+> (`opensandbox/ingress`, viết bằng Go) định tuyến request từ ngoài vào đúng sandbox. Nó
+> watch các CR `BatchSandbox`, đọc Pod IP từ annotation `sandbox.opensandbox.io/endpoints`,
+> rồi proxy tới `podIP:<port>`.
+
+Điểm mấu chốt — và là lý do ingress khác hẳn egress/vault ở Phần 4:
+
+> ✅ **Ingress gateway chạy trên MỌI runtime.** Nó chỉ là reverse proxy trên Pod IP, **không**
+> đụng iptables `nat` table, nên hoạt động dưới runc, gVisor lẫn kata. Nhớ lại ở Phần 1:
+> `kubectl port-forward` chết trên pod gVisor — ingress gateway chính là cách "đúng" để chạm
+> vào service trong sandbox gVisor.
+
+### Ba chế độ routing
+
+Gateway có ba cách định tuyến (đặt qua `gateway.route.mode`):
+
+| Mode | Hình dạng request | Cần gì |
+|---|---|---|
+| `uri` | `http://<gw>/<sandbox-id>/<port>/<path>` | không cần gì — đơn giản nhất |
+| `header` | header `OpenSandbox-Ingress-To: <id>-<port>` | kiểm soát được header |
+| `wildcard` | `<id>-<port>.<wildcard-domain>` | bản ghi DNS `*.domain` |
+
+Ta dùng **`uri`** — không cần wildcard DNS, không phải nhét header.
+
+### Bật gateway
+
+Thêm block `gateway` dưới `opensandbox-server.server` trong values file:
+
+```yaml
+opensandbox-server:
+  server:
+    gateway:
+      enabled: true
+      host: "localhost:8081"     # địa chỉ được nhúng vào endpoint URL; ta port-forward gw Service ở đây
+      gatewayRouteMode: "uri"    # uri | header | wildcard
+```
+
+Bật `enabled: true` khiến chart (a) ghi `[ingress] mode="gateway"` + `gateway.route.mode`
+vào config server, và (b) deploy Deployment + ClusterIP Service `opensandbox-ingress-gateway`.
+
+```bash
+helm upgrade opensandbox ./opensandbox -n opensandbox-system -f /path/to/values.yaml
+
+# đổi config -> restart server để đọc lại config.toml (mount subPath, không có checksum annotation)
+kubectl rollout restart -n opensandbox-system deploy/opensandbox-server
+
+kubectl port-forward -n opensandbox-system svc/opensandbox-ingress-gateway 8081:80 &
+curl -s http://localhost:8081/status.ok    # gateway health
+```
+
+Với một service chạy trên `:8000` bên trong sandbox, ở `uri` mode bạn chạm vào nó bằng
+`http://localhost:8081/<sandbox-id>/8000/<path>` — không cần auth ở tầng gateway (hãy đặt
+auth của riêng bạn phía trước ở production; ta làm đúng điều đó ở Phần 5).
+
+## Phần 3b — Routing nhiều app bằng path/host dễ đọc
+
+`uri` mode đưa ra URL kiểu `/<sandbox-id>/8000/`, mà `sandbox-id` từ API là một UUID ngẫu
+nhiên — không đọc nổi. Với một nền tảng chạy nhiều app, ta muốn `/<tên-thân-thiện>` hoặc
+`app.localhost`. Hai ý tưởng làm điều đó khả thi:
+
+1. **Tự đặt tên sandbox.** Tạo app bằng `BatchSandbox` CR *trực tiếp* (không qua API server)
+   với một cái tên thân thiện. Gateway phân giải id bằng `BatchSandbox.Name == sandboxId`,
+   nên nó sẽ route `/<tên-thân-thiện>/<port>/`.
+2. **Đặt Traefik trước gateway** (Traefik có sẵn trong k3s) để có path công khai tùy ý và
+   giấu đi đoạn `/<port>`.
+
+> **BatchSandbox**: một Custom Resource (CRD) của OpenSandbox mô tả một sandbox long-lived
+> với pod template inline. Tạo CR này trực tiếp cho phép bạn chọn `metadata.name` — chính
+> cái tên đó trở thành route prefix ở gateway.
+
+> **Traefik**: reverse proxy / ingress controller đi kèm mặc định trong k3s, nghe sẵn ở
+> `:80/:443` của node. Nó dùng các CRD `IngressRoute` và `Middleware` để định tuyến và biến
+> đổi request (ví dụ viết lại path).
+
+```text
+client --/web/...--> Traefik IngressRoute --rewrite--> OpenSandbox gateway --> nginx sandbox pod
+        --/api/...->  (co san trong k3s)               /nginx/80/...           /httpbin/8080/...
+```
+
+### Cách sạch nhất: host-based `*.localhost` (không cần sửa /etc/hosts)
+
+macOS (và hầu hết hệ điều hành) tự phân giải `*.localhost` về `127.0.0.1`, nên mỗi app một
+hostname là lựa chọn gọn gàng nhất. Trên Lima, Mac chạm được Traefik vì Lima **tự forward
+`0.0.0.0:80` của node về `127.0.0.1:80`** — không cần port-forward.
+
+Ta dùng Ingress chuẩn `networking.k8s.io/v1`, gắn một Traefik `AddPrefix` middleware qua
+annotation để chèn `/<name>/<port>` mà gateway cần:
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: { name: prefix-nginx, namespace: opensandbox-system }
+spec: { addPrefix: { prefix: "/nginx/80" } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-nginx
+  namespace: opensandbox-system
+  annotations:
+    # <namespace>-<middleware-name>@kubernetescrd
+    traefik.ingress.kubernetes.io/router.middlewares: opensandbox-system-prefix-nginx@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: nginx.localhost
+      http:
+        paths:
+          - { path: /, pathType: Prefix,
+              backend: { service: { name: opensandbox-ingress-gateway, port: { number: 80 } } } }
+```
+
+```bash
+kubectl apply -f ingress-localhost.yaml
+curl http://nginx.localhost/                 # -> trang welcome cua nginx
+```
+
+### Cái bẫy absolute-link khi route theo path chung
+
+Nếu thay vì mỗi app một host, bạn muốn dùng chung `apps.localhost/nginx`, `apps.localhost/httpbin`,
+sẽ gặp một vấn đề tinh vi. Gateway **luôn strip `/<name>/<port>`**, nên app nhận path sạch
+(`/cache/60`) và **không biết** nó đang sống dưới `/httpbin`. App nào phát ra link/redirect/asset
+**root-absolute** (`/style.css`, `→ /login`) sẽ đẩy browser tới `http://apps.localhost/style.css`
+— mất tiền tố `/httpbin` → 404 hoặc nhầm app.
+
+Để dùng app dưới path prefix chung, **app phải "base-path aware"**: nó phải *tự sinh* URL
+dưới prefix của mình, và ingress phải *giao* prefix đó cho nó. Hai yêu cầu:
+
+1. **Cấu hình base path của app.** Đa số app thật đều có: go-httpbin có `-prefix=/httpbin`;
+   framework có `SCRIPT_NAME`/`ROOT_PATH` (WSGI/FastAPI), `basePath` (Next.js),
+   `--base-href` (Angular), `server.servlet.context-path` (Spring).
+2. **Giao prefix qua gateway.** Vì gateway strip `/<name>/<port>`, rewrite phải chèn lại
+   prefix app — một **double prefix**: `^/httpbin/?(.*)` → `/httpbin/8080/httpbin/$1`.
+   Gateway ăn `/httpbin/8080`; app nhận `/httpbin/...` và link của nó giữ nguyên `/httpbin/...`.
+
+> **Nếu một app không thể "base-path aware", đừng route nó theo path chung — hãy dùng
+> host-based routing** (mỗi app một `*.localhost`), nơi app phục vụ từ `/` và mọi absolute
+> link tự phân giải đúng dưới hostname riêng. Đơn giản nhất và không cần cấu hình app.
+
+Đây là bài học kiến trúc quan trọng: **routing không chỉ là chuyện của proxy — nó là hợp
+đồng giữa proxy và app.** Nắm được điều này giúp bạn chọn đúng kiểu routing ngay từ đầu thay
+vì đập đầu vào những lỗi 404 bí ẩn.

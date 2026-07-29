@@ -1,0 +1,128 @@
+## Phần 1 — Dựng cluster k3s + gVisor trên Apple Silicon
+
+Trước khi có nền tảng sandbox, ta cần một Kubernetes cluster mà pod có thể chạy dưới gVisor.
+Đây là bước gây bối rối nhất trên máy Mac, nên hãy bắt đầu từ ràng buộc cốt lõi.
+
+### Vì sao phải có một Linux VM
+
+**Cả k3s lẫn gVisor đều chỉ chạy Linux.** k3s là một binary Linux cần Linux kernel; `runsc`
+của gVisor cũng đòi host Linux. Không cái nào chạy native trên macOS, nên trên Apple Silicon
+(arm64) bạn buộc phải chạy chúng **bên trong một Linux VM**.
+
+> **k3s**: một bản phân phối Kubernetes nhẹ, đóng gói thành một binary duy nhất, kèm sẵn
+> containerd, Traefik (ingress) và ServiceLB (load balancer). Rất hợp cho single-node và
+> môi trường dev/lab.
+
+Tin tốt cho arm64:
+
+- gVisor **có hỗ trợ arm64** (250/294 syscall được hỗ trợ đầy đủ/một phần).
+- Platform mặc định của nó — **`systrap`** — **không cần `/dev/kvm`**, điều rất quan trọng
+  vì nested KVM thường không có bên trong VM trên Mac.
+
+> ℹ️ Có một hiểu lầm phổ biến rằng "k3s cần VM vì nó đòi systemd/OpenRC". Điều đó **sai** —
+> k3s chạy được không cần systemd. Lý do thật đơn giản là: nó là binary Linux cần Linux
+> kernel. Kết luận (bạn cần một VM) vẫn đúng, chỉ là lý do khác.
+
+### Chọn lớp VM
+
+| Tool | Vai trò | Hợp với k3s + gVisor? |
+|------|---------|------------------------|
+| **Lima** | Linux VM nhẹ; có sẵn template `k3s` | ✅ **Tốt nhất** — k3s thật, full quyền root/containerd |
+| **Colima** | Wrapper của Lima; `--kubernetes` cho k3s | ✅ Ổn — một lệnh, ít quyền cấu hình trực tiếp hơn |
+| **multipass** | VM Ubuntu thuần; tự cài k3s | ✅ Được — thủ công nhất, kiểm soát nhất |
+| **k3d** | k3s **bên trong Docker** | ⚠️ **Tránh cho gVisor** — Docker lồng nhau xung đột việc chỉnh containerd |
+| **Rancher Desktop / UTM** | App VM/desktop đầy đủ | ➖ Nặng; dùng được nhưng thừa |
+
+**Khuyến nghị:** dùng **template k3s có sẵn của Lima** cho con đường nhanh và đúng nhất.
+
+```bash
+brew install lima
+limactl start template:k3s          # cluster k3s single-node trong một Linux VM
+
+# trỏ kubectl (trên host Mac) tới cluster:
+export KUBECONFIG=$(limactl list k3s --format 'unix://{{.Dir}}/copied-from-guest/kubeconfig.yaml')
+kubectl get nodes
+```
+
+### Đăng ký gVisor làm RuntimeClass
+
+Các lệnh dưới đây chạy **bên trong Linux VM**. Trước hết cài `runsc` từ apt repo của gVisor:
+
+```bash
+curl -fsSL https://gvisor.dev/archive.key | \
+  sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | \
+  sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
+
+sudo apt-get update && sudo apt-get install -y runsc
+```
+
+Lệnh này cài `runsc` và shim `containerd-shim-runsc-v1`.
+
+Tiếp theo là bước then chốt: **đăng ký `runsc` vào containerd của k3s**. k3s dùng
+containerd riêng của nó, với config render tại
+`/var/lib/rancher/k3s/agent/etc/containerd/config.toml`.
+
+> ⚠️ **Đừng sửa trực tiếp file đó** — k3s ghi đè nó mỗi lần khởi động lại. Thay vào đó, đặt
+> một file override dạng Go-template cùng thư mục. Với containerd 2.x (k3s gần đây) là
+> `config-v3.toml.tmpl`:
+
+```bash
+sudo tee /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl > /dev/null <<'EOF'
+{{ template "base" . }}
+
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runsc]
+  runtime_type = "io.containerd.runsc.v1"
+EOF
+
+sudo systemctl restart k3s          # k3s re-render config kèm phần bạn thêm
+```
+
+> 💡 **Có thể k3s đã làm hộ bạn.** Các bản k3s gần đây (~v1.30+) **tự dò `runsc` trong
+> `$PATH`** lúc khởi động và tự thêm block runtime lẫn tạo luôn RuntimeClass `gvisor` —
+> miễn là `runsc` được cài *trước khi* k3s khởi động. Kiểm tra trước khi tự tạo:
+> ```bash
+> kubectl get runtimeclass          # tìm dòng: gvisor   runsc
+> ```
+
+Nếu chưa có, tạo RuntimeClass thủ công. `handler` phải khớp **chính xác** tên runtime trong
+containerd:
+
+```yaml
+# gvisor-runtimeclass.yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc        # PHẢI trùng đúng tên runtime ở bước trên
+```
+
+> **RuntimeClass**: một đối tượng Kubernetes cho phép chọn runtime nào sẽ chạy pod. Đặt
+> `runtimeClassName: gvisor` trên pod spec là cách "opt-in" một pod vào sandbox gVisor;
+> pod không khai báo thì vẫn chạy runc như thường.
+
+### Kiểm chứng: pod thật sự đang chạy trong gVisor
+
+```bash
+kubectl run nginx-gvisor --image=nginx \
+  --overrides='{"spec":{"runtimeClassName":"gvisor"}}'
+
+# container chạy trong gVisor sẽ báo Sentry kernel trong dmesg:
+kubectl exec nginx-gvisor -- dmesg | grep -i gvisor
+kubectl exec nginx-gvisor -- uname -a
+# Linux ... 4.19.0-gvisor ... aarch64   <- kernel gVisor, KHONG phai host kernel
+```
+
+Thấy `4.19.0-gvisor` và `Starting gVisor...` trong `dmesg` là bằng chứng pod đang chạy dưới
+sandbox, không phải trực tiếp trên host kernel.
+
+### Một cạm bẫy đáng nhớ: port-forward
+
+> ⚠️ **`kubectl port-forward` KHÔNG hoạt động ổn định với pod gVisor.** Port-forward
+> quay số `localhost:<port>` *bên trong sandbox*, mà netstack cô lập của gVisor từ chối kết
+> nối loopback đó (`connect: connection refused`). Để expose service, dùng NodePort,
+> LoadBalancer hoặc Ingress. Đây là chi tiết ta sẽ gặp lại khi nói về ingress của OpenSandbox.
+
+Tới đây bạn đã có nền móng: một cluster k3s với RuntimeClass `gvisor` sẵn sàng. Toàn bộ
+phần còn lại của bài dựng trên chính cluster này.

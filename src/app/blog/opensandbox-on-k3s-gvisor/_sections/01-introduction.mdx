@@ -1,0 +1,54 @@
+## Vấn đề: chạy code của người lạ mà không mất máy
+
+Hãy tưởng tượng bạn xây một nền tảng cho phép người dùng gửi lên đoạn code bất kỳ — một
+AI agent sinh ra Python, một dịch vụ "code interpreter", một CI chạy script của khách
+hàng. Bạn **không** tin đoạn code đó. Nó có thể cố đọc file của tiến trình khác, escape
+ra host kernel, quét mạng nội bộ, hay lén gửi dữ liệu ra ngoài. Câu hỏi đặt ra không phải
+"làm sao chạy được code" — điều đó dễ — mà là **"làm sao chạy được code mà nếu nó độc hại
+thì thiệt hại vẫn bị nhốt trong một cái hộp"**.
+
+Container thường (runc) chia sẻ chung kernel với host. Một lỗ hổng escape container là đủ
+để kẻ tấn công chạm tới kernel thật. Với untrusted code, ta cần một lớp cô lập mạnh hơn —
+và đó là lúc **sandbox runtime** như gVisor bước vào.
+
+> **Sandbox runtime**: một runtime chạy container nhưng chèn thêm một lớp cô lập giữa
+> workload và host kernel, thay vì để container gọi thẳng system call xuống kernel thật.
+> gVisor làm điều này bằng một "application kernel" chạy trong userspace; Kata/Firecracker
+> làm bằng một microVM. Mục tiêu chung: thu hẹp attack surface xuống mức tối thiểu.
+
+> **gVisor (`runsc`)**: sandbox runtime của Google. Nó chặn mọi system call của
+> container và xử lý chúng bằng một kernel viết lại bằng Go chạy trong userspace (gọi là
+> **Sentry**), nên container gần như không bao giờ chạm trực tiếp vào host kernel. Đổi lại
+> là một chút overhead ở các workload nặng system call.
+
+## Bài viết này dựng gì
+
+Đây là ký sự end-to-end của việc dựng một nền tảng sandbox hoàn chỉnh — **được test thật
+trên một cluster k3s single-node arm64 (Lima) chạy trên MacBook Apple Silicon**, không phải
+lý thuyết suông. Ta sẽ đi từ nền móng lên tới các lớp bảo mật production:
+
+```text
++-----------------------------------------------------------+
+|  1. Cluster    k3s + gVisor trong Linux VM (Apple Silicon)|
+|  2. Platform   OpenSandbox: server + controller + sandbox |
+|  3. Ingress    reverse proxy vao service ben trong sandbox|
+|  4. Routing    nhieu app, path/host tuy chinh (Traefik)   |
+|  5. Egress     allowlist FQDN + Credential Vault (MITM)   |
+|  6. Auth       Entra OAuth2 SSO + authz theo app          |
++-----------------------------------------------------------+
+```
+
+> **OpenSandbox**: một nền tảng mã nguồn mở biến Kubernetes thành một dịch vụ tạo sandbox
+> theo yêu cầu. Bạn gọi REST API "tạo cho tôi một sandbox", nó tạo pod (có thể ép chạy trên
+> gVisor), rồi bạn chạy lệnh / đọc-ghi file / expose service bên trong sandbox đó qua SDK
+> hoặc CLI. Nó gồm một **server** (REST lifecycle API), một **controller** (operator
+> reconcile các CRD), và các **sandbox pod** — nơi code thật sự chạy.
+
+Mỗi phần đều có lệnh chạy được và kết quả đã verify. Đến cuối bài bạn sẽ có bức tranh đầy
+đủ: từ một chiếc MacBook trắng tới một nền tảng chạy untrusted code có kiểm soát mạng ra/vào
+và có đăng nhập SSO trước cửa.
+
+Một lưu ý xuyên suốt: **không phải tính năng nào cũng chạy trên mọi runtime.** gVisor cực
+mạnh về cô lập nhưng netstack của nó thiếu vài thứ (cụ thể là iptables `nat` table), nên có
+những tính năng phải đánh đổi runtime. Ta sẽ chỉ rõ ràng buộc này ở đúng chỗ nó xuất hiện —
+vì hiểu nó là chìa khóa để không mất hàng giờ debug những lỗi khó hiểu.
